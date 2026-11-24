@@ -1,0 +1,386 @@
+"""5sim provider — 接码平台适配层。
+
+API 文档: https://5sim.net/docs
+Base URL: https://5sim.net/v1
+认证: Bearer Token (JWT)
+响应: JSON
+"""
+
+import asyncio
+import logging
+import re
+from typing import Any, Optional
+
+import httpx
+
+from app.providers.base import (
+    BaseSmsProvider,
+    Activation,
+    NoNumbersError,
+    BalanceError,
+    PurchaseUncertainError,
+    SmsCancelledError,
+    SmsExpiredError,
+    SmsTimeoutError,
+    SmsProviderError,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── 常量 ────────────────────────────────────────────────
+
+BASE_URL = "https://5sim.net/v1"
+DEFAULT_PRODUCT = "whatsapp"
+DEFAULT_OPERATOR = "any"
+DEFAULT_TIMEOUT = 30
+
+# ── 国家中文名 ─────────────────────────────────────────
+
+COUNTRY_CN = {
+    "russia": "俄罗斯", "indonesia": "印度尼西亚", "thailand": "泰国",
+    "england": "英国", "usa": "美国", "japan": "日本", "germany": "德国",
+    "vietnam": "越南", "india": "印度", "china": "中国", "brazil": "巴西",
+    "southafrica": "南非", "turkey": "土耳其", "ukraine": "乌克兰",
+    "kazakhstan": "哈萨克斯坦", "philippines": "菲律宾", "myanmar": "缅甸",
+}
+
+COUNTRY_ALIASES = {
+    "ru": "russia", "russianfederation": "russia", "俄罗斯": "russia", "俄罗斯联邦": "russia",
+    "id": "indonesia", "印尼": "indonesia", "印度尼西亚": "indonesia",
+    "th": "thailand", "泰国": "thailand",
+    "gb": "england", "uk": "england", "unitedkingdom": "england", "英国": "england",
+    "us": "usa", "unitedstates": "usa", "america": "usa", "美国": "usa",
+    "jp": "japan", "日本": "japan",
+    "de": "germany", "德国": "germany",
+    "vn": "vietnam", "越南": "vietnam",
+    "in": "india", "印度": "india",
+    "cn": "china", "中国": "china",
+    "br": "brazil", "巴西": "brazil",
+    "za": "southafrica", "southafrica": "southafrica", "南非": "southafrica",
+    "tr": "turkey", "土耳其": "turkey",
+    "ua": "ukraine", "乌克兰": "ukraine",
+    "kz": "kazakhstan", "哈萨克斯坦": "kazakhstan",
+    "ph": "philippines", "菲律宾": "philippines",
+    "mm": "myanmar", "缅甸": "myanmar",
+}
+
+
+def normalize_country_id(value: Any, fallback: str = "") -> str:
+    """归一化国家 ID（纯小写字母数字）。"""
+    raw = str(value or "").strip().lower()
+    alias = COUNTRY_ALIASES.get(raw) or COUNTRY_ALIASES.get(re.sub(r"[^a-z0-9]+", "", raw))
+    if alias:
+        return alias
+    s = re.sub(r"[^a-z0-9_-]+", "", raw)
+    return s or re.sub(r"[^a-z0-9_-]+", "", str(fallback if fallback else "").strip().lower())
+
+
+def format_country_label(country_id: str, english: str = "") -> str:
+    """格式化国家显示名：中文 (English)。"""
+    cn = COUNTRY_CN.get(country_id, "")
+    en = english or country_id
+    if cn and cn.lower() != en.lower():
+        return f"{cn} ({en})"
+    return cn or en
+
+
+def extract_verification_code(text: str) -> str:
+    """从响应中提取验证码（纯数字）。"""
+    return re.sub(r"\D", "", text)
+
+
+class FiveSimProvider(BaseSmsProvider):
+    """5sim API 封装。"""
+
+    provider_id = "5sim"
+
+    def __init__(self, api_key_getter, base_url: str = BASE_URL):
+        self._api_key_getter = api_key_getter
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def _api_key(self) -> str:
+        key = await self._api_key_getter()
+        if not key:
+            raise SmsProviderError("5sim API Key 未配置，请先在配置页设置")
+        return key
+
+    async def _get(self, path: str, require_auth: bool = True) -> Any:
+        """发起 GET 请求并返回 JSON。"""
+        url = f"{self._base_url}{path}"
+        headers = {"Accept": "application/json"}
+        if require_auth:
+            headers["Authorization"] = f"Bearer {await self._api_key()}"
+
+        try:
+            resp = await self._client.get(url, headers=headers)
+        except httpx.TimeoutException:
+            raise SmsProviderError("5sim 请求超时")
+        except httpx.ConnectError:
+            raise SmsProviderError("5sim 连接失败，请检查网络")
+
+        try:
+            payload = resp.json()
+        except Exception:
+            raise SmsProviderError(f"5sim 返回非 JSON: {resp.text[:200]}")
+
+        if not resp.is_success:
+            msg = (payload or {}).get("message") or (payload or {}).get("error") or str(resp.status_code)
+            self._raise_api_error(resp.status_code, msg)
+
+        return payload
+
+    def _raise_api_error(self, status: int, msg: str):
+        """根据状态码和消息抛出统一异常。"""
+        msg_lower = str(msg).lower()
+        if "balance" in msg_lower and ("not enough" in msg_lower or "insufficient" in msg_lower):
+            raise BalanceError(f"5sim 余额不足: {msg}")
+        if "no free" in msg_lower or "no numbers" in msg_lower:
+            raise NoNumbersError(f"5sim 无可用号码: {msg}")
+        if "not found" in msg_lower:
+            raise SmsExpiredError(f"5sim 未找到: {msg}")
+        if status == 429 or "rate limit" in msg_lower:
+            raise SmsProviderError(f"5sim 限流: {msg}")
+        raise SmsProviderError(f"5sim API 错误 ({status}): {msg}")
+
+    # ── 核心接口实现 ──────────────────────────────────
+
+    async def get_balance(self) -> float:
+        payload = await self._get("/user/profile")
+        return float(payload.get("balance", 0))
+
+    async def resolve_country(self, country: str) -> tuple[Any, str]:
+        """5sim 国家 ID 是字符串（如 philippines），不是数字。"""
+        cid = normalize_country_id(country, "")
+        if not cid:
+            raise ValueError(f"无效的 5sim 国家: {country}")
+        label = COUNTRY_CN.get(cid, cid)
+        return cid, label
+
+    async def get_countries(self) -> list[dict]:
+        """获取国家列表，统一格式 {id, name, cc, iso}。"""
+        payload = await self._get("/guest/countries", require_auth=False)
+        countries = []
+        for slug, entry in (payload or {}).items():
+            cid = normalize_country_id(slug, "")
+            if not cid:
+                continue
+            te = (entry or {}).get("text_en", "") if isinstance(entry, dict) else ""
+            name = te or cid
+            # cc 从 prefix 提取
+            prefix = (entry or {}).get("prefix", {}) if isinstance(entry, dict) else {}
+            cc = ""
+            if isinstance(prefix, dict):
+                for k in prefix:
+                    digits = re.sub(r"\D", "", k)
+                    if digits:
+                        cc = digits
+                        break
+            # iso 从国家工具反查
+            iso = ""
+            from app.countries import name_to_iso, cc_to_iso
+            if name:
+                iso = name_to_iso(name)
+            if not iso and cc:
+                iso = cc_to_iso(cc)
+            countries.append({
+                "id": cid,
+                "name": name,
+                "cc": cc if cc else "",
+                "iso": iso,
+            })
+        countries.sort(key=lambda c: c["name"])
+        return countries
+
+    async def get_prices(self, country_id: Any, product: str = DEFAULT_PRODUCT) -> list[dict]:
+        cid = normalize_country_id(country_id, "")
+        if not cid:
+            raise ValueError(f"无效的 5sim 国家: {country_id}")
+        payload = await self._get(f"/guest/prices?country={cid}&product={product}", require_auth=False)
+        prices = []
+        self._collect_prices(payload, prices)
+        return prices
+
+    def _collect_prices(self, payload: Any, entries: list):
+        """递归遍历价格 JSON 树，提取价格条目。"""
+        if isinstance(payload, dict):
+            cost = self._normalize_price(payload.get("cost") or payload.get("Price") or payload.get("price"))
+            if cost is not None:
+                count = float(payload.get("count") or payload.get("Qty") or payload.get("qty") or 0)
+                entries.append({
+                    "cost": cost,
+                    "count": int(count),
+                    "in_stock": count > 0,
+                })
+            for v in payload.values():
+                self._collect_prices(v, entries)
+        elif isinstance(payload, list):
+            for item in payload:
+                self._collect_prices(item, entries)
+
+    def _normalize_price(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            p = float(value)
+            return round(p, 4) if p >= 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    async def request_number(self, country_id: Any, service: str = DEFAULT_PRODUCT,
+                              price_max: Optional[float] = None) -> Activation:
+        cid = normalize_country_id(country_id, "")
+        if not cid:
+            raise ValueError(f"无效的 5sim 国家: {country_id}")
+
+        product = normalize_country_id(service, DEFAULT_PRODUCT)
+        path = f"/user/buy/activation/{cid}/{DEFAULT_OPERATOR}/{product}"
+
+        query = {}
+        if price_max is not None:
+            query["maxPrice"] = str(round(price_max, 4))
+
+        url = f"{self._base_url}{path}"
+        if query:
+            import urllib.parse
+            url += "?" + urllib.parse.urlencode(query)
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {await self._api_key()}",
+        }
+
+        try:
+            resp = await self._client.get(url, headers=headers)
+        except httpx.TimeoutException:
+            raise PurchaseUncertainError("5sim 取号结果未知，已停止自动重试以避免重复扣费")
+        except httpx.ConnectError:
+            raise PurchaseUncertainError("5sim 取号连接中断，结果未知，已停止自动重试以避免重复扣费")
+
+        if not resp.is_success:
+            text = resp.text.strip()
+            msg = text[:100]
+            if "country" in msg.lower() and "incorrect" in msg.lower():
+                raise NoNumbersError(f"5sim 该国家无可用产品: {msg}")
+            self._raise_api_error(resp.status_code, msg)
+
+        # 5sim 有时返回纯文本（如"no free phones"）
+        ct = resp.headers.get("content-type", "")
+        if "application/json" not in ct and not ct.startswith("application/json"):
+            text = resp.text.strip()
+            if not text:
+                raise NoNumbersError("5sim 返回空响应")
+            if "no free" in text.lower() or "no numbers" in text.lower():
+                raise NoNumbersError(f"5sim 无可用号码: {text}")
+            raise SmsProviderError(f"5sim API 异常响应: {text[:200]}")
+
+        payload = resp.json()
+        activation_id = str(payload.get("id", "")).strip()
+        phone = str(payload.get("phone", "")).strip()
+        if not activation_id or not phone:
+            raise NoNumbersError(f"5sim 取号返回空: {resp.text[:200]}")
+
+        raw_price = payload.get("price", payload.get("cost"))
+        actual_price = self._normalize_price(raw_price)
+        return Activation(
+            activation_id=activation_id,
+            phone_number=phone,
+            country_id=cid,
+            country_label=format_country_label(cid, country_id if isinstance(country_id, str) else ""),
+            provider=self.provider_id,
+            price=actual_price if actual_price is not None else price_max,
+            price_is_estimated=actual_price is None and price_max is not None,
+        )
+
+    async def get_sms_code(self, activation_id: str) -> tuple[str, str]:
+        """查码。返回 (status, code_or_empty)。"""
+        payload = await self._get(f"/user/check/{activation_id}")
+        status = (payload or {}).get("status", "").lower()
+        sms_list = (payload or {}).get("sms", []) or []
+
+        # 5sim 返回 sms 数组，取最新的
+        code = ""
+        for sms in reversed(sms_list):
+            code = extract_verification_code(sms.get("text", "") or sms.get("code", "") or "")
+            if code:
+                break
+
+        if code:
+            return ("OK", code)
+        if status == "finish":
+            return ("CANCEL", "")
+        elif status == "cancelled":
+            return ("CANCEL", "")
+        elif status == "receive" or (sms_list and code):
+            return ("OK", code)
+        elif status == "expired":
+            return ("EXPIRED", "")
+        else:
+            return ("WAIT", "")
+
+    async def cancel_activation(self, activation_id: str) -> str:
+        try:
+            payload = await self._get(f"/user/cancel/{activation_id}")
+            return str(payload.get("status", ""))
+        except SmsExpiredError:
+            return "cancelled"
+        except SmsProviderError as e:
+            if "not found" in str(e).lower():
+                return "cancelled"
+            raise
+
+    async def complete_activation(self, activation_id: str) -> str:
+        payload = await self._get(f"/user/finish/{activation_id}")
+        return str(payload.get("status", ""))
+
+    async def poll_sms_code(self, activation_id: str, timeout: int = 180) -> str:
+        """阶梯轮询等码，返回纯数字验证码。"""
+        intervals = [3] * 12 + [5] * 12 + [8] * 15  # 36s + 60s + 120s ≈ 216s
+        start = asyncio.get_running_loop().time()
+
+        for i, delay in enumerate(intervals):
+            # 立即检查（先查码不进 sleep）
+            try:
+                status, code = await self.get_sms_code(activation_id)
+            except SmsExpiredError as e:
+                raise SmsExpiredError(f"5sim 激活已失效: {e}")
+            except SmsCancelledError:
+                raise
+
+            if status == "OK" and code:
+                return code
+            elif status == "CANCEL":
+                raise SmsCancelledError("5sim 激活已被取消")
+            elif status == "EXPIRED":
+                raise SmsExpiredError("5sim 激活已过期")
+
+            elapsed = asyncio.get_running_loop().time() - start
+            if elapsed >= timeout:
+                raise SmsTimeoutError(f"5sim 等码超时 ({timeout}s)")
+
+            await asyncio.sleep(delay)
+
+        raise SmsTimeoutError(f"5sim 等码超时 ({timeout}s)")
+
+    async def normalize_phone(self, raw_phone: str, country_id: Any) -> "PhoneInput":
+        """5sim 号码格式：国际格式直接 + 前缀。"""
+        from app.phone_normalizer import build_phone_input, resolve_country_metadata
+
+        rows = []
+        try:
+            rows = await self.get_countries()
+        except Exception:
+            rows = []
+
+        normalized_country = normalize_country_id(country_id, "")
+        label = COUNTRY_CN.get(normalized_country, normalized_country or str(country_id or ""))
+        meta = resolve_country_metadata(country_id, country_label=label, countries=rows)
+        return build_phone_input(
+            raw_phone,
+            country_calling_code=meta.get("calling_code", ""),
+            country_iso2=meta.get("iso2", ""),
+            country_label=meta.get("name", "") or label,
+        )

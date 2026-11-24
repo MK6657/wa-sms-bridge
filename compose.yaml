@@ -1,0 +1,42 @@
+name: selfhosted-wa-sms-bridge
+
+services:
+  wa-sms-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wa-sms-bridge:source-backup
+    container_name: wa-sms-bridge
+    environment:
+      WA_APP_URL: ${WA_APP_URL:-http://wa-app:8080}
+      WA_APP_AUTH_TYPE: basic
+      WA_APP_API_USERNAME: ${WA_APP_API_USERNAME:-admin}
+      WA_APP_API_PASSWORD: ${WA_APP_API_PASSWORD:?请设置与 wa-app 相同的密码}
+      WA_APP_API_TOKEN: ""
+      WA_ADAPTER: whatsapp_wa
+      SMSBOWER_BASE_URL: ${SMSBOWER_BASE_URL:-https://smsbower.page/stubs/handler_api.php}
+      BRIDGE_SECRET_KEY: ${BRIDGE_SECRET_KEY:?请在本机 .env 中设置长期随机加密密钥}
+      BRIDGE_DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:${BRIDGE_PORT:-9099}:9090"
+    volumes:
+      - wa-sms-bridge-data:/data
+    networks:
+      - wa-shared
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/api/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+networks:
+  wa-shared:
+    name: selfhosted-wa
+    external: true
+
+volumes:
+  wa-sms-bridge-data:
+    name: wa-sms-bridge-data
