@@ -217,6 +217,9 @@ async def api_list_tasks():
 @router.get("/api/providers")
 async def api_providers():
     """返回所有已注册的 provider 名称列表。"""
+    reg = getattr(router, "_registry", None)
+    if reg is not None:
+        return reg.list_providers()
     from app.providers.registry import registry
     return registry.list_providers()
 
@@ -537,14 +540,26 @@ async def api_get_config():
 
 @router.put("/api/config")
 async def api_update_config(cfg: ConfigUpdate):
+    from app.core.url_guard import validate_upstream_base_url, validate_wa_app_url
+    from app.errors import AppError
+
     db = getattr(router, "_db", None)
     if not db:
         raise HTTPException(503, "数据库未初始化")
     try:
+        if cfg.smsbower_base_url is not None and cfg.smsbower_base_url.strip():
+            validate_upstream_base_url("smsbower", cfg.smsbower_base_url)
+        if cfg.hero_sms_base_url is not None and cfg.hero_sms_base_url.strip():
+            validate_upstream_base_url("herosms", cfg.hero_sms_base_url)
+        if cfg.wa_app_url is not None and cfg.wa_app_url.strip():
+            validate_wa_app_url(cfg.wa_app_url)
+    except AppError as e:
+        raise HTTPException(e.status_code, e.message) from e
+    try:
         if cfg.smsbower_api_key is not None:
             await db.set_config("smsbower_api_key", cfg.smsbower_api_key, encrypt=True)
         if cfg.smsbower_base_url is not None:
-            await db.set_config("smsbower_base_url", cfg.smsbower_base_url)
+            await db.set_config("smsbower_base_url", cfg.smsbower_base_url.strip().rstrip("/"))
         if cfg.smsbower_default_country is not None:
             await db.set_config("smsbower_default_country", str(cfg.smsbower_default_country))
         if cfg.five_sim_api_key is not None:
@@ -552,12 +567,13 @@ async def api_update_config(cfg: ConfigUpdate):
         if cfg.hero_sms_api_key is not None:
             await db.set_config("hero_sms_api_key", cfg.hero_sms_api_key, encrypt=True)
         if cfg.hero_sms_base_url is not None:
-            await db.set_config("hero_sms_base_url", cfg.hero_sms_base_url)
+            await db.set_config("hero_sms_base_url", cfg.hero_sms_base_url.strip().rstrip("/"))
         if cfg.wa_app_url is not None:
-            await db.set_config("wa_app_url", cfg.wa_app_url)
+            clean_wa = cfg.wa_app_url.strip().rstrip("/")
+            await db.set_config("wa_app_url", clean_wa)
             waapi = getattr(router, "_waapi", None)
             if waapi:
-                waapi.set_base_url(cfg.wa_app_url)
+                waapi.set_base_url(clean_wa)
     except RuntimeError as e:
         raise HTTPException(500, str(e)) from e
     if any(value is not None for value in (

@@ -740,24 +740,25 @@ class RegisterOrchestrator:
         successes_done = 0
         candidate_index = 0
         service_code = provider_service_code(provider_name, service)
-        max_price = effective_price_max(
-            target_price=target_price,
-            price_max=price_max,
-            price_lock_enabled=price_lock_enabled,
-            price_float_enabled=price_float_enabled,
-            price_float_percent=price_float_percent,
-        )
-        sleep_seconds = polling_interval_seconds(
-            request_interval_enabled=request_interval_enabled,
-            request_interval=request_interval,
-            continuous_poll=continuous_poll,
-        )
-
-        async def _sleep_between_attempts():
-            if sleep_seconds > 0:
-                await asyncio.sleep(sleep_seconds)
 
         try:
+            max_price = effective_price_max(
+                target_price=target_price,
+                price_max=price_max,
+                price_lock_enabled=price_lock_enabled,
+                price_float_enabled=price_float_enabled,
+                price_float_percent=price_float_percent,
+            )
+            sleep_seconds = polling_interval_seconds(
+                request_interval_enabled=request_interval_enabled,
+                request_interval=request_interval,
+                continuous_poll=continuous_poll,
+            )
+
+            async def _sleep_between_attempts():
+                if sleep_seconds > 0:
+                    await asyncio.sleep(sleep_seconds)
+
             while successes_done < success_target:
                 if not continuous_poll and attempts_used >= max_attempts:
                     final_error = final_error or f"已达最大尝试次数 ({max_attempts})"
@@ -1138,6 +1139,16 @@ class RegisterOrchestrator:
                     continue
                 except SmsProviderError as exc:
                     final_error = str(exc)
+                    upper_err = final_error.upper()
+                    is_fatal_provider_err = any(
+                        tok in upper_err
+                        for tok in ("BAD_KEY", "BAD_SERVICE", "BAD_ACTION", "BANNED", "API KEY 未配置", "鉴权失败")
+                    )
+                    if is_fatal_provider_err:
+                        logger.error("[%s] 短信平台配置或鉴权错误，停止重试 (country=%s): %s", task_id, clabel, exc)
+                        if activation:
+                            await compensate_attempt("短信平台异常")
+                        break
                     logger.warning(
                         "[%s] 短信平台暂时异常，稍后重试 (country=%s): %s",
                         task_id,

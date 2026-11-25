@@ -1,11 +1,44 @@
-"""Price and polling policy helpers for registration tasks."""
+"""Price and polling policy helpers for SMS acquisition & registration tasks.
+
+修复 P1-05 & 复核 P1-03：
+1. 明确拒绝非正价格（如 price_max=0 / target_price=0），绝不静默省去价格上限；
+2. 严禁向上四舍五入突破原始 price_max（使用 Decimal ROUND_DOWN 向下截断到 4 位小数）；
+3. target_price > price_max 零容差报错；浮动结果受 price_max 硬顶向下截断约束。
+"""
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Optional
 
 
 PRICE_EPSILON = 0.0001
+_QUANT_4 = Decimal("0.0001")
+
+
+def _parse_decimal(value: Any, *, field_name: str, reject_non_positive: bool = True) -> Optional[Decimal]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        dec = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{field_name} 必须是有效数字") from exc
+    if not dec.is_finite():
+        raise ValueError(f"{field_name} 必须是有限数字")
+    if dec <= 0:
+        if reject_non_positive:
+            raise ValueError(f"{field_name} 必须大于 0（禁止传 0 绕过价格上限）")
+        return None
+    return dec
+
+
+def _floor_4(dec: Decimal, *, field_name: str) -> float:
+    floored = dec.quantize(_QUANT_4, rounding=ROUND_DOWN)
+    if floored <= 0:
+        raise ValueError(f"{field_name} ({dec}) 低于最小支持计价精度 0.0001")
+    return float(floored)
 
 
 def _positive_float(value: Any) -> Optional[float]:
@@ -24,19 +57,30 @@ def effective_price_max(
     price_float_enabled: bool = False,
     price_float_percent: Any = 0,
 ) -> Optional[float]:
-    target = _positive_float(target_price)
-    fallback_max = _positive_float(price_max)
+    target = _parse_decimal(target_price, field_name="target_price", reject_non_positive=True)
+    hard_cap = _parse_decimal(price_max, field_name="price_max", reject_non_positive=True)
+
     if target is None:
-        return round(fallback_max, 4) if fallback_max is not None else None
+        return _floor_4(hard_cap, field_name="price_max") if hard_cap is not None else None
+
+    if hard_cap is not None and target > hard_cap:
+        raise ValueError(f"目标价格 target_price ({target}) 不能高于绝对价格上限 price_max ({hard_cap})")
+
     if price_lock_enabled:
-        return round(target, 4)
-    if price_float_enabled:
+        computed = target
+    elif price_float_enabled:
         try:
-            percent = max(0.0, float(price_float_percent or 0))
-        except (TypeError, ValueError):
-            percent = 0.0
-        return round(target * (1 + percent / 100), 4)
-    return round(target, 4)
+            pct = max(Decimal("0"), Decimal(str(price_float_percent or 0)))
+        except (InvalidOperation, ValueError):
+            pct = Decimal("0")
+        computed = target * (Decimal("1") + pct / Decimal("100"))
+    else:
+        computed = target
+
+    if hard_cap is not None:
+        final_dec = min(computed, hard_cap)
+        return _floor_4(final_dec, field_name="price_max")
+    return _floor_4(computed, field_name="target_price")
 
 
 def locked_price_available(entries: list[dict[str, Any]], target_price: Any) -> tuple[bool, int]:

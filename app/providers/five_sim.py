@@ -9,6 +9,7 @@ Base URL: https://5sim.net/v1
 import asyncio
 import logging
 import re
+import urllib.parse
 from typing import Any, Optional
 
 import httpx
@@ -23,6 +24,7 @@ from app.providers.base import (
     SmsExpiredError,
     SmsTimeoutError,
     SmsProviderError,
+    extract_otp_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,8 +87,14 @@ def format_country_label(country_id: str, english: str = "") -> str:
 
 
 def extract_verification_code(text: str) -> str:
-    """从响应中提取验证码（纯数字）。"""
-    return re.sub(r"\D", "", text)
+    """从响应中提取验证码（智能过滤分钟数、号码与签名哈希）。"""
+    return extract_otp_code(text)
+
+
+def _normalize_product_slug(value: Any, fallback: str = DEFAULT_PRODUCT) -> str:
+    """归一化 5sim 产品标识，绝不套用国家别名映射（防止 in->india, mm->myanmar）。"""
+    s = re.sub(r"[^a-z0-9_-]+", "", str(value or "").strip().lower())
+    return s or re.sub(r"[^a-z0-9_-]+", "", str(fallback or DEFAULT_PRODUCT).strip().lower())
 
 
 class FiveSimProvider(BaseSmsProvider):
@@ -117,19 +125,27 @@ class FiveSimProvider(BaseSmsProvider):
 
         try:
             resp = await self._client.get(url, headers=headers)
-        except httpx.TimeoutException:
-            raise SmsProviderError("5sim 请求超时")
-        except httpx.ConnectError:
-            raise SmsProviderError("5sim 连接失败，请检查网络")
+        except httpx.TimeoutException as exc:
+            raise SmsProviderError("5sim 请求超时") from exc
+        except httpx.RequestError as exc:
+            raise SmsProviderError("5sim 连接失败，请检查网络") from exc
+
+        if not resp.is_success:
+            msg = ""
+            try:
+                err_payload = resp.json()
+                if isinstance(err_payload, dict):
+                    msg = str(err_payload.get("message") or err_payload.get("error") or "")
+            except Exception:
+                pass
+            if not msg:
+                msg = resp.text.strip()[:200] or str(resp.status_code)
+            self._raise_api_error(resp.status_code, msg)
 
         try:
             payload = resp.json()
-        except Exception:
-            raise SmsProviderError(f"5sim 返回非 JSON: {resp.text[:200]}")
-
-        if not resp.is_success:
-            msg = (payload or {}).get("message") or (payload or {}).get("error") or str(resp.status_code)
-            self._raise_api_error(resp.status_code, msg)
+        except Exception as exc:
+            raise SmsProviderError(f"5sim 返回非 JSON: {resp.text[:200]}") from exc
 
         return payload
 
@@ -199,7 +215,9 @@ class FiveSimProvider(BaseSmsProvider):
         cid = normalize_country_id(country_id, "")
         if not cid:
             raise ValueError(f"无效的 5sim 国家: {country_id}")
-        payload = await self._get(f"/guest/prices?country={cid}&product={product}", require_auth=False)
+        prod = _normalize_product_slug(product, DEFAULT_PRODUCT)
+        qs = urllib.parse.urlencode({"country": cid, "product": prod})
+        payload = await self._get(f"/guest/prices?{qs}", require_auth=False)
         prices = []
         self._collect_prices(payload, prices)
         return prices
@@ -207,14 +225,20 @@ class FiveSimProvider(BaseSmsProvider):
     def _collect_prices(self, payload: Any, entries: list):
         """递归遍历价格 JSON 树，提取价格条目。"""
         if isinstance(payload, dict):
-            cost = self._normalize_price(payload.get("cost") or payload.get("Price") or payload.get("price"))
+            raw_cost = next((payload.get(k) for k in ("cost", "Price", "price") if payload.get(k) is not None), None)
+            cost = self._normalize_price(raw_cost)
             if cost is not None:
-                count = float(payload.get("count") or payload.get("Qty") or payload.get("qty") or 0)
+                raw_cnt = next((payload.get(k) for k in ("count", "Qty", "qty", "quantity") if payload.get(k) is not None), 0)
+                try:
+                    count = max(0, int(float(raw_cnt)))
+                except (TypeError, ValueError):
+                    count = 1 if isinstance(raw_cnt, str) and raw_cnt.strip().lower() == "few" else 0
                 entries.append({
                     "cost": cost,
-                    "count": int(count),
+                    "count": count,
                     "in_stock": count > 0,
                 })
+                return
             for v in payload.values():
                 self._collect_prices(v, entries)
         elif isinstance(payload, list):
@@ -226,7 +250,7 @@ class FiveSimProvider(BaseSmsProvider):
             return None
         try:
             p = float(value)
-            return round(p, 4) if p >= 0 else None
+            return round(p, 4) if p > 0 else None
         except (ValueError, TypeError):
             return None
 
@@ -236,7 +260,7 @@ class FiveSimProvider(BaseSmsProvider):
         if not cid:
             raise ValueError(f"无效的 5sim 国家: {country_id}")
 
-        product = normalize_country_id(service, DEFAULT_PRODUCT)
+        product = _normalize_product_slug(service, DEFAULT_PRODUCT)
         path = f"/user/buy/activation/{cid}/{DEFAULT_OPERATOR}/{product}"
 
         query = {}
@@ -255,29 +279,38 @@ class FiveSimProvider(BaseSmsProvider):
 
         try:
             resp = await self._client.get(url, headers=headers)
-        except httpx.TimeoutException:
-            raise PurchaseUncertainError("5sim 取号结果未知，已停止自动重试以避免重复扣费")
-        except httpx.ConnectError:
-            raise PurchaseUncertainError("5sim 取号连接中断，结果未知，已停止自动重试以避免重复扣费")
+        except httpx.TimeoutException as exc:
+            raise PurchaseUncertainError("5sim 取号结果未知，已停止自动重试以避免重复扣费") from exc
+        except httpx.RequestError as exc:
+            raise PurchaseUncertainError(f"5sim 取号连接中断，结果未知，已停止自动重试以避免重复扣费: {exc}") from exc
 
         if not resp.is_success:
             text = resp.text.strip()
             msg = text[:100]
+            if resp.status_code >= 500:
+                raise PurchaseUncertainError(
+                    f"5sim 取号遇到服务端异常 (HTTP {resp.status_code})，结果未知，已停止自动重试以避免重复扣费"
+                )
             if "country" in msg.lower() and "incorrect" in msg.lower():
                 raise NoNumbersError(f"5sim 该国家无可用产品: {msg}")
             self._raise_api_error(resp.status_code, msg)
 
-        # 5sim 有时返回纯文本（如"no free phones"）
+        # 5sim 有时返回纯文本（如"no free phones"）；但空响应或非法 JSON 可能是网关截断，按不确定购买处理防重复扣费！
         ct = resp.headers.get("content-type", "")
         if "application/json" not in ct and not ct.startswith("application/json"):
             text = resp.text.strip()
             if not text:
-                raise NoNumbersError("5sim 返回空响应")
+                raise PurchaseUncertainError("5sim 取号返回空响应，结果未知，已停止自动重试以避免重复扣费")
             if "no free" in text.lower() or "no numbers" in text.lower():
                 raise NoNumbersError(f"5sim 无可用号码: {text}")
             raise SmsProviderError(f"5sim API 异常响应: {text[:200]}")
 
-        payload = resp.json()
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise PurchaseUncertainError(f"5sim 取号响应解析失败，结果未知，已停止自动重试以避免重复扣费: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise PurchaseUncertainError("5sim 取号返回非对象响应，结果未知，已停止自动重试以避免重复扣费")
         activation_id = str(payload.get("id", "")).strip()
         phone = str(payload.get("phone", "")).strip()
         if not activation_id or not phone:
@@ -285,6 +318,13 @@ class FiveSimProvider(BaseSmsProvider):
 
         raw_price = payload.get("price", payload.get("cost"))
         actual_price = self._normalize_price(raw_price)
+        raw_ccy = str(payload.get("currency") or "").strip().upper()
+        if raw_ccy:
+            act_ccy = raw_ccy
+            act_ccy_source = "provider_response"
+        else:
+            act_ccy = "USD"
+            act_ccy_source = "provider_default"
         return Activation(
             activation_id=activation_id,
             phone_number=phone,
@@ -293,44 +333,108 @@ class FiveSimProvider(BaseSmsProvider):
             provider=self.provider_id,
             price=actual_price if actual_price is not None else price_max,
             price_is_estimated=actual_price is None and price_max is not None,
+            currency=act_ccy,
+            currency_source=act_ccy_source,
         )
 
     async def get_sms_code(self, activation_id: str) -> tuple[str, str]:
-        """查码。返回 (status, code_or_empty)。"""
+        """查码。返回 (status, code_or_empty)，严格区分已完成(FINISHED)、取消(CANCEL)与过期(EXPIRED)（修复 v6 复核 P1-04）。"""
         payload = await self._get(f"/user/check/{activation_id}")
-        status = (payload or {}).get("status", "").lower()
+        status = str((payload or {}).get("status", "")).strip().lower()
         sms_list = (payload or {}).get("sms", []) or []
 
-        # 5sim 返回 sms 数组，取最新的
+        # 5sim 返回 sms 数组，优先取上游预解析的 sms["code"]，避免拼接 sms["text"] 中的有效分钟数等无关数字
         code = ""
+        raw_sms_text = ""
         for sms in reversed(sms_list):
-            code = extract_verification_code(sms.get("text", "") or sms.get("code", "") or "")
+            if not isinstance(sms, dict):
+                continue
+            raw_sms_text = str(sms.get("text") or sms.get("code") or "")
+            code = extract_verification_code(str(sms.get("code") or ""))
+            if not code:
+                code = extract_verification_code(str(sms.get("text") or ""))
             if code:
                 break
 
         if code:
+            self.record_raw_sms(activation_id, raw_sms_text or code)
             return ("OK", code)
-        if status == "finish":
+        if status in {"finish", "finished"}:
+            # 5sim FINISH 代表上游已结束而非退款取消，绝不可误报 CANCEL 导致误记已确认退款
+            return ("FINISHED", "")
+        if status in {"cancelled", "canceled"}:
             return ("CANCEL", "")
-        elif status == "cancelled":
-            return ("CANCEL", "")
-        elif status == "receive" or (sms_list and code):
-            return ("OK", code)
-        elif status == "expired":
+        if status in {"expired", "timeout", "banned"}:
             return ("EXPIRED", "")
-        else:
-            return ("WAIT", "")
+        return ("WAIT", "")
 
     async def cancel_activation(self, activation_id: str) -> str:
         try:
             payload = await self._get(f"/user/cancel/{activation_id}")
-            return str(payload.get("status", ""))
+            return str((payload or {}).get("status", ""))
         except SmsExpiredError:
-            return "cancelled"
+            return "EXPIRED"
         except SmsProviderError as e:
             if "not found" in str(e).lower():
-                return "cancelled"
+                return "NOT_FOUND"
             raise
+
+    async def cancel_activation_structured(self, activation_id: str):
+        """5sim 结构化取消：仅上游显式返回 CANCELED/CANCELLED 才确认退款；FINISH/EXPIRED/TIMEOUT/BANNED/NOT_FOUND 绝不误判为退款确认。"""
+        from app.providers.base import CancelOutcome, parse_cancel_outcome
+
+        try:
+            payload = await self._get(f"/user/cancel/{activation_id}")
+        except SmsExpiredError as exc:
+            return CancelOutcome(
+                settled=True,
+                status="not_found_or_expired",
+                retryable=False,
+                raw=str(exc) or "EXPIRED",
+                refund_confirmed=False,
+            )
+        except SmsProviderError as exc:
+            msg = str(exc)
+            if "not found" in msg.lower():
+                return CancelOutcome(
+                    settled=True,
+                    status="not_found_or_expired",
+                    retryable=False,
+                    raw=msg or "NOT_FOUND",
+                    refund_confirmed=False,
+                )
+            return CancelOutcome(settled=False, status="error", retryable=True, raw=msg, refund_confirmed=False)
+        except Exception as exc:
+            return CancelOutcome(settled=False, status="error", retryable=True, raw=str(exc), refund_confirmed=False)
+
+        raw_status = str((payload or {}).get("status", "")).strip()
+        upper = raw_status.upper()
+        if upper in {"CANCELED", "CANCELLED"}:
+            return CancelOutcome(
+                settled=True,
+                status="refund_confirmed",
+                retryable=False,
+                raw=raw_status,
+                refund_confirmed=True,
+                refund_amount=None,
+            )
+        if upper in {"FINISH", "FINISHED"}:
+            return CancelOutcome(
+                settled=True,
+                status="already_completed",
+                retryable=False,
+                raw=raw_status,
+                refund_confirmed=False,
+            )
+        if upper in {"EXPIRED", "TIMEOUT", "BANNED"}:
+            return CancelOutcome(
+                settled=True,
+                status="not_found_or_expired",
+                retryable=False,
+                raw=raw_status,
+                refund_confirmed=False,
+            )
+        return parse_cancel_outcome(raw_status)
 
     async def complete_activation(self, activation_id: str) -> str:
         payload = await self._get(f"/user/finish/{activation_id}")
@@ -354,8 +458,8 @@ class FiveSimProvider(BaseSmsProvider):
                 return code
             elif status == "CANCEL":
                 raise SmsCancelledError("5sim 激活已被取消")
-            elif status == "EXPIRED":
-                raise SmsExpiredError("5sim 激活已过期")
+            elif status in {"EXPIRED", "FINISHED"}:
+                raise SmsExpiredError(f"5sim 激活已结束 ({status})")
 
             elapsed = asyncio.get_running_loop().time() - start
             if elapsed >= timeout:

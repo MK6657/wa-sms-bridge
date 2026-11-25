@@ -41,16 +41,23 @@ def resolve_country_metadata(
 
     key = _text(country_id).lower()
     label = _text(country_label)
+    rows = list(countries or [])
     matched: dict[str, Any] = {}
-    for item in countries or []:
-        item_id = _text(item.get("id")).lower()
-        item_name = _text(item.get("name"))
-        item_iso = _text(item.get("iso")).lower()
-        item_cc = _digits(item.get("cc"))
-        fields = {item_id, item_name.lower(), item_iso, item_cc}
-        if key and key in fields:
-            matched = dict(item)
-            break
+    if key:
+        for item in rows:
+            if _text(item.get("id")).lower() == key:
+                matched = dict(item)
+                break
+    if not matched and key:
+        for item in rows:
+            item_name = _text(item.get("name"))
+            item_zh = _text(item.get("name_zh") or item.get("cn"))
+            item_iso = _text(item.get("iso")).lower()
+            item_cc = _digits(item.get("cc"))
+            fields = {item_name.lower(), item_zh.lower(), item_iso, item_cc} - {""}
+            if key in fields:
+                matched = dict(item)
+                break
 
     name = _text(matched.get("name")) or label
     iso2 = _text(matched.get("iso")).lower()
@@ -80,9 +87,10 @@ def _format_parsed(
     country_iso2: str = "",
 ) -> PhoneInput:
     region = country_iso2.upper() if country_iso2 else phonenumbers.region_code_for_number(parsed) or ""
+    significant = phonenumbers.national_significant_number(parsed) or str(parsed.national_number)
     return PhoneInput(
         region=region,
-        phone=str(parsed.national_number),
+        phone=significant,
         e164_number=phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164),
         country_calling_code=country_calling_code or str(parsed.country_code),
         country_iso2=country_iso2 or region.lower(),
@@ -139,16 +147,34 @@ def build_phone_input(
         )
 
     if cc:
-        if raw_text.startswith("+") or raw_digits.startswith(cc):
-            candidates = [f"+{raw_digits}"]
+        if raw_text.startswith("+"):
+            candidates = [(f"+{raw_digits}", False)]
+            after_cc = raw_digits[len(cc):] if raw_digits.startswith(cc) else ""
+            if after_cc.startswith("0") and after_cc.lstrip("0"):
+                candidates.append((f"+{cc}{after_cc.lstrip('0')}", False))
+        elif raw_digits.startswith(cc):
+            after_cc = raw_digits[len(cc):]
+            candidates = [(f"+{raw_digits}", False)]
+            if after_cc.startswith("0") and after_cc.lstrip("0"):
+                candidates.append((f"+{cc}{after_cc.lstrip('0')}", False))
+            # 仅当补上国家码后构成有效手机号（MOBILE）时才采用二次前缀，防止把带区号的短虚拟号误拼成固话
+            candidates.append((f"+{cc}{raw_digits}", True))
         else:
-            candidates = [f"+{cc}{raw_digits}", f"+{raw_digits}"]
+            candidates = [(f"+{cc}{raw_digits}", False)]
+            if raw_digits.startswith("0") and raw_digits.lstrip("0"):
+                candidates.append((f"+{cc}{raw_digits.lstrip('0')}", False))
+            candidates.append((f"+{raw_digits}", False))
     else:
-        candidates = [f"+{raw_digits}"]
+        candidates = [(f"+{raw_digits}", False)]
 
+    mobile_types = {
+        phonenumbers.PhoneNumberType.MOBILE,
+        phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE,
+    }
     seen: set[str] = set()
+    parsed_candidates: list[tuple[phonenumbers.PhoneNumber, bool]] = []
     first_possible: phonenumbers.PhoneNumber | None = None
-    for candidate in candidates:
+    for candidate, require_mobile in candidates:
         if candidate in seen:
             continue
         seen.add(candidate)
@@ -158,10 +184,21 @@ def build_phone_input(
             continue
         if not _parsed_matches_metadata(parsed, cc, iso2):
             continue
-        if phonenumbers.is_valid_number(parsed):
-            return _format_parsed(parsed, country_calling_code=cc, country_iso2=iso2)
-        if first_possible is None and phonenumbers.is_possible_number(parsed):
+        parsed_candidates.append((parsed, require_mobile))
+        if first_possible is None and not require_mobile and phonenumbers.is_possible_number(parsed):
             first_possible = parsed
+
+    if iso2:
+        for parsed, require_mobile in parsed_candidates:
+            if phonenumbers.is_valid_number_for_region(parsed, iso2.upper()):
+                if require_mobile and phonenumbers.number_type(parsed) not in mobile_types:
+                    continue
+                return _format_parsed(parsed, country_calling_code=cc, country_iso2=iso2)
+    for parsed, require_mobile in parsed_candidates:
+        if phonenumbers.is_valid_number(parsed):
+            if require_mobile and phonenumbers.number_type(parsed) not in mobile_types:
+                continue
+            return _format_parsed(parsed, country_calling_code=cc, country_iso2=iso2)
 
     if first_possible and not cc:
         return _format_parsed(first_possible)
@@ -208,7 +245,7 @@ def validate_phone_input(phone: PhoneInput | dict[str, Any]) -> PhoneInput:
                 errors.append("country_calling_code does not match e164_number")
             if not phonenumbers.is_possible_number(parsed):
                 errors.append("e164_number is not a possible phone number")
-            parsed_national = _digits(parsed.national_number)
+            parsed_national = _digits(phonenumbers.national_significant_number(parsed) or parsed.national_number)
             if parsed_national and national and parsed_national != national:
                 errors.append("national_number does not match e164_number")
         except phonenumbers.NumberParseException:

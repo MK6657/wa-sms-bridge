@@ -27,6 +27,7 @@ from app.providers.base import (
     SmsExpiredError,
     SmsTimeoutError,
     SmsProviderError,
+    extract_otp_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,9 +64,11 @@ HERO_COUNTRY_NAMES = {cid: info["chn"] for cid, info in HERO_COUNTRIES.items()}
 HERO_ALIASES: dict[str, int] = {}
 for _cid, _info in HERO_COUNTRIES.items():
     HERO_ALIASES[str(_cid)] = _cid
-    for _value in (_info["eng"], _info["chn"], _info["iso"], _info["cc"]):
+    for _value in (_info["eng"], _info["chn"], _info["iso"]):
         HERO_ALIASES[_value.strip().lower()] = _cid
     HERO_ALIASES[re.sub(r"[^a-z0-9]+", "", _info["eng"].lower())] = _cid
+for _cid, _info in HERO_COUNTRIES.items():
+    HERO_ALIASES.setdefault(_info["cc"].strip().lower(), _cid)
 HERO_ALIASES.update({
     "usa": 12,
     "america": 12,
@@ -128,10 +131,10 @@ class HeroSmsProvider(BaseSmsProvider):
         try:
             resp = await self._client.get(url, params=params)
             text = resp.text.strip()
-        except httpx.TimeoutException:
-            raise SmsProviderError("HeroSMS 请求超时")
-        except httpx.ConnectError:
-            raise SmsProviderError("HeroSMS 连接失败，请检查网络")
+        except httpx.TimeoutException as exc:
+            raise SmsProviderError("HeroSMS 请求超时") from exc
+        except httpx.RequestError as exc:
+            raise SmsProviderError(f"HeroSMS 连接失败，请检查网络: {exc}") from exc
         duration_ms = int((time.perf_counter() - started) * 1000)
         logger.debug(
             "HeroSMS request action=%s params=%s status=%s duration_ms=%s response_len=%s",
@@ -156,8 +159,8 @@ class HeroSmsProvider(BaseSmsProvider):
         m = re.match(r"^ACCESS_NUMBER:\s*([^:]+):\s*(.+)$", text)
         if m:
             return m.group(1).strip(), m.group(2).strip()
-        if "NO_NUMBERS" in text:
-            raise NoNumbersError("HeroSMS 无可用号码")
+        if "NO_NUMBERS" in text or "WRONG_MAX_PRICE" in text:
+            raise NoNumbersError(f"HeroSMS 无满足条件号码: {text[:100]}")
         if "NO_BALANCE" in text or "BALANCE" in text.upper():
             raise BalanceError("HeroSMS 余额不足")
         raise SmsProviderError(f"HeroSMS 取号异常: {text[:100]}")
@@ -207,7 +210,9 @@ class HeroSmsProvider(BaseSmsProvider):
 
         key = raw.lower()
         compact = re.sub(r"[^a-z0-9]+", "", key)
-        cid = HERO_ALIASES.get(key) or HERO_ALIASES.get(compact)
+        cid = HERO_ALIASES.get(key)
+        if cid is None and compact:
+            cid = HERO_ALIASES.get(compact)
         if cid is not None:
             return cid, _hero_label(cid)
 
@@ -221,14 +226,20 @@ class HeroSmsProvider(BaseSmsProvider):
                 pass
             raise ValueError(f"未知 HeroSMS 国家 ID: {country}")
 
-        for item in _hero_static_rows():
-            fields = [
-                str(item.get("name", "")).lower(),
-                str(item.get("cn", "")).lower(),
-                str(item.get("iso", "")).lower(),
-            ]
-            if key and any(key in field or compact in re.sub(r"[^a-z0-9]+", "", field) for field in fields):
-                return item["id"], _hero_label(item["id"])
+        allow_sub = len(key) >= 4 or any(ord(ch) > 127 for ch in key)
+        if allow_sub:
+            for item in _hero_static_rows():
+                fields = [
+                    str(item.get("name", "")).lower(),
+                    str(item.get("cn", "")).lower(),
+                ]
+                if any(
+                    (key and key in field)
+                    or (len(compact) >= 4 and compact in re.sub(r"[^a-z0-9]+", "", field))
+                    for field in fields
+                    if field
+                ):
+                    return item["id"], _hero_label(item["id"])
 
         try:
             countries = await self.get_countries()
@@ -253,6 +264,14 @@ class HeroSmsProvider(BaseSmsProvider):
             import json
             data = json.loads(text)
             prices = []
+            def _as_count(raw_cnt: Any) -> int:
+                if isinstance(raw_cnt, str) and raw_cnt.strip().lower() == "few":
+                    return 1
+                try:
+                    return max(0, int(float(raw_cnt)))
+                except (TypeError, ValueError):
+                    return 0
+
             def walk(obj):
                 if isinstance(obj, dict):
                     cost = None
@@ -260,13 +279,17 @@ class HeroSmsProvider(BaseSmsProvider):
                         v = obj.get(k)
                         if v is not None:
                             try:
-                                cost = round(float(v), 4)
+                                parsed_cost = round(float(v), 4)
+                                if parsed_cost > 0:
+                                    cost = parsed_cost
                                 break
                             except (ValueError, TypeError):
                                 pass
-                    if cost is not None:
-                        count = int(obj.get("count") or obj.get("Qty") or obj.get("qty") or 0)
+                    if cost is not None and not isinstance(obj.get("providers"), (dict, list)):
+                        raw_cnt = next((obj.get(ck) for ck in ("count", "Qty", "qty", "quantity") if ck in obj), 0)
+                        count = _as_count(raw_cnt)
                         prices.append({"cost": cost, "count": count, "in_stock": count > 0})
+                        return
                     for v in obj.values():
                         if isinstance(v, (dict, list)):
                             walk(v)
@@ -275,8 +298,8 @@ class HeroSmsProvider(BaseSmsProvider):
                         walk(item)
             walk(data)
             return prices
-        except json.JSONDecodeError:
-            return [{"raw": text[:200]}]
+        except json.JSONDecodeError as exc:
+            raise SmsProviderError(f"HeroSMS 价格解析失败: {text[:200]}") from exc
 
     async def request_number(self, country_id: Any, service: str = DEFAULT_SERVICE,
                               price_max: Optional[float] = None) -> Activation:
@@ -287,20 +310,28 @@ class HeroSmsProvider(BaseSmsProvider):
             text = await self._get(**params)
         except SmsProviderError as exc:
             message = str(exc)
-            if "请求超时" in message or "连接失败" in message:
+            if any(token in message for token in (
+                "请求超时",
+                "连接失败",
+                "上游异常 (HTTP 5",
+                "返回空响应",
+            )):
                 raise PurchaseUncertainError(
                     f"HeroSMS 取号结果未知，已停止自动重试以避免重复扣费: {message}"
                 ) from exc
             raise
         activation_id, phone = self._parse_access_number(text)
+        label = _hero_label(int(country_id)) if str(country_id).isdigit() else str(country_id)
         return Activation(
             activation_id=activation_id,
             phone_number=phone,
             country_id=country_id,
-            country_label=f"Country #{country_id}" if isinstance(country_id, int) else str(country_id),
+            country_label=label,
             provider=self.provider_id,
             price=price_max,
             price_is_estimated=price_max is not None,
+            currency="USD",
+            currency_source="provider_default",
         )
 
     async def validate_registration_country(self, country_id: Any):
@@ -319,15 +350,20 @@ class HeroSmsProvider(BaseSmsProvider):
         if text.startswith("STATUS_OK:"):
             parts = text.split(":", 1)
             raw_code = parts[1].strip() if len(parts) > 1 else ""
-            digits = re.sub(r"\D", "", raw_code)
-            if digits:
-                return ("OK", digits)
+            code = extract_otp_code(raw_code)
+            if code:
+                self.record_raw_sms(activation_id, raw_code)
+                return ("OK", code)
             return ("WAIT", "")
-        if text in ("STATUS_WAIT_CODE", "STATUS_WAIT_RETRY"):
+        if (
+            text == "STATUS_WAIT_CODE"
+            or text.startswith("STATUS_WAIT_RETRY")
+            or text.startswith("STATUS_WAIT_RESEND")
+        ):
             return ("WAIT", "")
         if text == "STATUS_CANCEL":
             return ("CANCEL", "")
-        if text == "STATUS_NO_ACTIVATION":
+        if text in ("STATUS_NO_ACTIVATION", "NO_ACTIVATION"):
             return ("EXPIRED", "")
         raise SmsProviderError(f"HeroSMS 查码状态未知: {text[:100]}")
 
@@ -336,12 +372,53 @@ class HeroSmsProvider(BaseSmsProvider):
         text = await self._get(action="setStatus", id=activation_id, status="8")
         if "ACCESS_CANCEL" in text:
             return "cancelled"
-        if "ACCESS_READY" in text:
-            return "ready"
-        if "EARLY_CANCEL_DENIED" in text:
-            logger.warning("HeroSMS 冷却期内取消被拒 (activation=%s): 标记为待补偿，不阻塞任务停止", activation_id)
+        if "ACCESS_READY" in text or "ACCESS_ACTIVATION" in text:
+            return "ACCESS_READY"
+        if "NO_ACTIVATION" in text:
+            return "NO_ACTIVATION"
+        if "EARLY_CANCEL_DENIED" in text or "BAD_STATUS" in text:
+            from app.log_redaction import mask_identifier
+            logger.warning("HeroSMS 冷却期或状态暂拒取消 (activation=%s): 标记为待补偿", mask_identifier(activation_id))
             return "early_cancel_denied"
         raise SmsProviderError(f"HeroSMS 取消失败: {text[:100]}")
+
+    async def cancel_activation_structured(self, activation_id: str):
+        """结构化取消结果：准确识别 ACCESS_READY/ACCESS_ACTIVATION/NO_ACTIVATION 为已完结不可退，绝不陷入无限补偿循环。"""
+        from app.providers.base import CancelOutcome, parse_cancel_outcome
+        try:
+            raw = await self._get(action="setStatus", id=activation_id, status="8")
+        except Exception as exc:
+            return CancelOutcome(settled=False, status="error", retryable=True, raw=str(exc), refund_confirmed=False)
+        if "BAD_STATUS" in str(raw or "").upper():
+            try:
+                st = await self._get(action="getStatus", id=activation_id)
+            except Exception:
+                st = ""
+            if st.startswith("STATUS_OK:"):
+                return CancelOutcome(
+                    settled=True,
+                    status="already_completed",
+                    retryable=False,
+                    raw=f"{raw} (getStatus=STATUS_OK)",
+                    refund_confirmed=False,
+                )
+            if st == "STATUS_CANCEL":
+                return CancelOutcome(
+                    settled=True,
+                    status="refund_confirmed",
+                    retryable=False,
+                    raw=f"{raw} (getStatus=STATUS_CANCEL)",
+                    refund_confirmed=True,
+                )
+            if st in ("STATUS_NO_ACTIVATION", "NO_ACTIVATION"):
+                return CancelOutcome(
+                    settled=True,
+                    status="not_found_or_expired",
+                    retryable=False,
+                    raw=f"{raw} (getStatus={st})",
+                    refund_confirmed=False,
+                )
+        return parse_cancel_outcome(raw)
 
     async def complete_activation(self, activation_id: str) -> str:
         text = await self._get(action="setStatus", id=activation_id, status="6")

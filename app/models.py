@@ -9,8 +9,8 @@ class RegisterRequest(BaseModel):
     country_fallback: list = Field(default_factory=list, description="备用国家 ID/名列表")
     service: str = Field(default="whatsapp", description="服务用途")
     max_attempts: int = Field(default=3, ge=1, le=100, description="最大尝试次数（仅计实际发码）")
-    price_max: Optional[float] = Field(default=None, ge=0, description="价格上限 $")
-    target_price: Optional[float] = Field(default=None, ge=0, description="目标价格 $")
+    price_max: Optional[float] = Field(default=None, gt=0, description="价格上限 $")
+    target_price: Optional[float] = Field(default=None, gt=0, description="目标价格 $")
     price_lock_enabled: bool = Field(default=False, description="锁定目标价格档位")
     price_float_enabled: bool = Field(default=False, description="是否启用价格浮动")
     price_float_percent: float = Field(default=0, ge=0, le=1000, description="价格浮动百分比")
@@ -26,6 +26,8 @@ class RegisterRequest(BaseModel):
     def validate_attempt_budget(self):
         if not self.continuous_poll and self.target_success_count > self.max_attempts:
             raise ValueError("未开启一直轮询时，尝试次数不能小于目标成功次数")
+        if self.target_price is not None and self.price_max is not None and self.target_price > self.price_max:
+            raise ValueError("目标价格不能超过最高价格上限")
         if (self.price_lock_enabled or self.price_float_enabled) and not (
             self.target_price is not None and self.target_price > 0
         ):

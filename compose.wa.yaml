@@ -1,0 +1,20 @@
+# 可选覆盖文件：当需要启用原有 wa-app 自动注册插件时叠加使用
+# 启动命令: docker compose -f compose.yaml -f compose.wa.yaml up -d --build
+
+services:
+  wa-sms-bridge:
+    environment:
+      ENABLE_WA_PLUGIN: "true"
+      WA_APP_URL: ${WA_APP_URL:-http://wa-app:8080}
+      WA_APP_AUTH_TYPE: ${WA_APP_AUTH_TYPE:-basic}
+      WA_APP_API_USERNAME: ${WA_APP_API_USERNAME:-admin}
+      WA_APP_API_PASSWORD: ${WA_APP_API_PASSWORD:?启用 wa-app 插件时请填写 WA_APP_API_PASSWORD}
+      WA_ADAPTER: ${WA_ADAPTER:-whatsapp_wa}
+    networks:
+      - default
+      - wa-shared
+
+networks:
+  wa-shared:
+    name: selfhosted-wa
+    external: true

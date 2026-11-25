@@ -30,6 +30,10 @@ class GlobalCountryIndex:
         self._cache: dict[str, Any] = {}  # iso → {平台名 → {id, name, cc}}
         self._last_fetch: float = 0
         self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_task_forced: bool = False
+
+    def invalidate(self) -> None:
+        self._last_fetch = 0
 
     async def refresh(self, force: bool = False):
         """刷新索引。从所有已注册 provider 拉取实时国家列表。"""
@@ -38,25 +42,33 @@ class GlobalCountryIndex:
 
         running = self._refresh_task
         if running and not running.done():
+            running_was_forced = self._refresh_task_forced
             await asyncio.shield(running)
-            return
+            if not force or running_was_forced:
+                return
 
-        task = asyncio.create_task(self._refresh_once())
+        task = asyncio.create_task(self._refresh_once(force=force))
         self._refresh_task = task
+        self._refresh_task_forced = bool(force)
 
         def clear_refresh_task(done: asyncio.Task):
             if self._refresh_task is done:
                 self._refresh_task = None
+                self._refresh_task_forced = False
+            if not done.cancelled():
+                done.exception()
 
         task.add_done_callback(clear_refresh_task)
         await asyncio.shield(task)
 
-    async def _refresh_once(self):
+    async def _refresh_once(self, *, force: bool = False):
         provider_names = registry.list_providers()
 
         async def fetch_provider(name: str):
             try:
                 prov = registry.get(name)
+                if force and hasattr(prov, "invalidate_countries_cache"):
+                    prov.invalidate_countries_cache()
                 countries = await asyncio.wait_for(prov.get_countries(), timeout=20)
                 return name, countries, None
             except Exception as exc:
@@ -86,7 +98,7 @@ class GlobalCountryIndex:
                         "providers": {},
                     },
                 )
-                entry["providers"][name] = {
+                prov_record = {
                     "id": country.get("id"),
                     "name": country.get("name", ""),
                     "name_zh": country.get("name_zh", ""),
@@ -94,6 +106,10 @@ class GlobalCountryIndex:
                     "aliases": list(country.get("aliases") or []),
                     "available": True,
                 }
+                entry["providers"].setdefault(name, prov_record)
+                variants = entry.setdefault("provider_variants", {}).setdefault(name, [])
+                if not any(str(v.get("id")) == str(prov_record["id"]) for v in variants):
+                    variants.append(prov_record)
                 if not entry["name"] and country.get("name"):
                     entry["name"] = country["name"]
                 if not entry["name_zh"] and country.get("name_zh"):
@@ -120,6 +136,8 @@ class GlobalCountryIndex:
                     },
                 )
                 entry["providers"].setdefault(name, provider_entry)
+                prev_variants = previous.get("provider_variants", {}).get(name) or [provider_entry]
+                entry.setdefault("provider_variants", {}).setdefault(name, list(prev_variants))
 
         if new_cache or not self._cache:
             self._cache = new_cache
@@ -137,25 +155,29 @@ class GlobalCountryIndex:
         )
 
     def get_countries(self, provider: str = "") -> list[dict]:
-        """获取国家列表。provider 指定时只返回该平台有的国家。"""
+        """获取国家列表。provider 指定时只返回该平台有的国家（含同 ISO 多线路 ID，如 US 187 与虚拟号 12）。"""
         if provider:
             result = []
             for iso, entry in self._cache.items():
-                p = entry["providers"].get(provider)
-                if p and p.get("available"):
-                    result.append({
-                        "iso": iso,
-                        "name": entry["name"],
-                        "name_zh": entry.get("name_zh", ""),
-                        "cc": p.get("cc", ""),
-                        "id": p.get("id"),
-                        "aliases": list(dict.fromkeys([
-                            *(entry.get("aliases") or []),
-                            *(p.get("aliases") or []),
-                        ])),
-                        "available": True,
-                    })
-            return sorted(result, key=lambda x: x["name"])
+                variants = entry.get("provider_variants", {}).get(provider)
+                if not variants:
+                    p_single = entry["providers"].get(provider)
+                    variants = [p_single] if p_single else []
+                for p in variants:
+                    if p and p.get("available"):
+                        result.append({
+                            "iso": iso,
+                            "name": p.get("name") or entry["name"],
+                            "name_zh": p.get("name_zh") or entry.get("name_zh", ""),
+                            "cc": p.get("cc", ""),
+                            "id": p.get("id"),
+                            "aliases": list(dict.fromkeys([
+                                *(entry.get("aliases") or []),
+                                *(p.get("aliases") or []),
+                            ])),
+                            "available": True,
+                        })
+            return sorted(result, key=lambda x: (x["name"], str(x["id"])))
         return [{"iso": k, **v} for k, v in sorted(self._cache.items(), key=lambda x: x[1].get("name", ""))]
 
     def search(self, query: str) -> list[dict]:

@@ -1,41 +1,47 @@
-name: selfhosted-wa-sms-bridge
+name: selfhosted-sms-hub
 
 services:
   wa-sms-bridge:
     build:
       context: .
       dockerfile: Dockerfile
-    image: wa-sms-bridge:source-backup
+    image: wa-sms-bridge:v1.0.0
     container_name: wa-sms-bridge
     environment:
-      WA_APP_URL: ${WA_APP_URL:-http://wa-app:8080}
-      WA_APP_AUTH_TYPE: basic
-      WA_APP_API_USERNAME: ${WA_APP_API_USERNAME:-admin}
-      WA_APP_API_PASSWORD: ${WA_APP_API_PASSWORD:?请设置与 wa-app 相同的密码}
-      WA_APP_API_TOKEN: ""
-      WA_ADAPTER: whatsapp_wa
+      ACTIVE_PROVIDERS: ${ACTIVE_PROVIDERS:-smsbower}
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-smsbower}
       SMSBOWER_BASE_URL: ${SMSBOWER_BASE_URL:-https://smsbower.page/stubs/handler_api.php}
+      SMSBOWER_API_KEY: ${SMSBOWER_API_KEY:-}
       BRIDGE_SECRET_KEY: ${BRIDGE_SECRET_KEY:?请在本机 .env 中设置长期随机加密密钥}
       BRIDGE_DATA_DIR: /data
+      # 容器通过端口映射发布时，服务端接收的来源为 Docker 网桥而非回环地址，宿主机登录管理台请务必在 .env 中设置 CONSOLE_ADMIN_PASSWORD
+      CONSOLE_ADMIN_PASSWORD: ${CONSOLE_ADMIN_PASSWORD:-}
+      CONSOLE_ADMIN_TOKEN: ${CONSOLE_ADMIN_TOKEN:-}
+      API_AUTH_REQUIRED: ${API_AUTH_REQUIRED:-false}
+      WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-}
+      WEBHOOK_ALLOW_PRIVATE_NETS: ${WEBHOOK_ALLOW_PRIVATE_NETS:-false}
+      SMS_CODE_RETENTION_HOURS: ${SMS_CODE_RETENTION_HOURS:-24}
+      SMS_CODE_MASK_IN_HISTORY: ${SMS_CODE_MASK_IN_HISTORY:-true}
+      ENABLE_WA_PLUGIN: ${ENABLE_WA_PLUGIN:-false}
+      ENABLE_LEGACY_API: ${ENABLE_LEGACY_API:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "127.0.0.1:${BRIDGE_PORT:-9099}:9090"
     volumes:
       - wa-sms-bridge-data:/data
-    networks:
-      - wa-shared
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/api/health', timeout=3).read()"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, sys, urllib.request; r=urllib.request.urlopen('http://127.0.0.1:9090/api/v1/health', timeout=3); body=json.loads(r.read().decode()); sys.exit(0 if r.status==200 and body.get('ok') is True else 1)",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 15s
     restart: unless-stopped
-
-networks:
-  wa-shared:
-    name: selfhosted-wa
-    external: true
 
 volumes:
   wa-sms-bridge-data:

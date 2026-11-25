@@ -249,6 +249,7 @@ class WhatsappWaAdapter:
                     logger.warning("wa-app API 返回 401: auth_type=%s", self._auth_type)
                 return resp
             except (
+                httpx.TimeoutException,
                 httpx.ConnectError,
                 httpx.RemoteProtocolError,
                 httpx.ReadError,
