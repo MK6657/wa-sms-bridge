@@ -6,8 +6,16 @@ project_id != '' 表示指定项目的私有黑名单，不影响其他项目。
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 from app.db.connection import DatabaseConnection
+
+
+def _phone_lookup_variants(phone: str) -> tuple[str, ...]:
+    raw = str(phone or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    candidates = [c for c in dict.fromkeys((raw, f"+{digits}" if digits else "", digits)) if c]
+    return tuple(candidates) if candidates else (raw,)
 
 
 class BlacklistRepo:
@@ -21,16 +29,18 @@ class BlacklistRepo:
         *,
         project_id: str = "",
     ) -> bool:
-        """检查号码是否在全局黑名单或指定项目私有黑名单中。"""
+        """检查号码是否在全局黑名单或指定项目私有黑名单中（自动兼容 +E.164 与无加号纯数字格式）。"""
+        variants = _phone_lookup_variants(phone)
+        ph = ",".join("?" for _ in variants)
         if project_id:
             row = await self._conn.fetchone(
-                "SELECT 1 AS ok FROM blacklist WHERE phone=? AND provider=? AND project_id IN ('', ?)",
-                (phone, provider, project_id),
+                f"SELECT 1 AS ok FROM blacklist WHERE phone IN ({ph}) AND provider=? AND project_id IN ('', ?)",
+                (*variants, provider, project_id),
             )
         else:
             row = await self._conn.fetchone(
-                "SELECT 1 AS ok FROM blacklist WHERE phone=? AND provider=? AND project_id=''",
-                (phone, provider),
+                f"SELECT 1 AS ok FROM blacklist WHERE phone IN ({ph}) AND provider=? AND project_id=''",
+                (*variants, provider),
             )
         return row is not None
 
@@ -41,11 +51,12 @@ class BlacklistRepo:
         provider: str = "smsbower",
         *,
         project_id: str = "",
-    ) -> None:
-        await self._conn.write(
+    ) -> bool:
+        cur = await self._conn.write(
             "INSERT OR IGNORE INTO blacklist (phone, provider, project_id, reason) VALUES (?, ?, ?, ?)",
             (phone, provider, project_id or "", reason),
         )
+        return int(cur.rowcount or 0) > 0
 
     async def list(
         self,

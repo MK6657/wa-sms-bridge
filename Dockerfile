@@ -10,7 +10,7 @@ RUN npm run build
 # ── Stage 2: 极简 Python 运行时（零 Node.js 进程与残留） ──────────
 FROM python:3.11-slim
 
-LABEL version="1.0.0"
+LABEL version="1.1.0"
 LABEL description="SMS Hub (wa-sms-bridge) — 独立 SMS 接码核心与对外集成 API 服务"
 
 WORKDIR /app

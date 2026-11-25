@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -81,14 +82,17 @@ async def add_blacklist(
     registry: ProviderRegistry = Depends(get_registry),
 ):
     AuthService.ensure_scope(caller, "blacklist:w")
-    phone = req.phone.strip()
-    if not phone:
-        raise AppError("手机号不能为空", status_code=422, code="VALIDATION_ERROR")
+    raw_phone = req.phone.strip()
+    digits = re.sub(r"\D", "", raw_phone)
+    if len(digits) < 5:
+        raise AppError("手机号格式无效（至少包含 5 位数字）", status_code=422, code="VALIDATION_ERROR")
+    phone = f"+{digits}" if raw_phone.startswith("+") else digits
     provider = req.provider.strip() or registry.default_provider
     target_project = _resolve_target_project(caller, req.scope)
-    await db.blacklist.add(phone, reason=req.reason.strip(), provider=provider, project_id=target_project)
+    inserted = await db.blacklist.add(phone, reason=req.reason.strip(), provider=provider, project_id=target_project)
     return {
         "success": True,
+        "added": 1 if inserted else 0,
         "phone": phone,
         "provider": provider,
         "scope": "global" if not target_project else "project",
@@ -108,11 +112,13 @@ async def add_blacklist_batch(
     target_project = _resolve_target_project(caller, req.scope)
     added = 0
     for raw in req.phones:
-        phone = str(raw or "").strip()
-        if not phone:
+        raw_phone = str(raw or "").strip()
+        digits = re.sub(r"\D", "", raw_phone)
+        if len(digits) < 5:
             continue
-        await db.blacklist.add(phone, reason=req.reason.strip(), provider=provider, project_id=target_project)
-        added += 1
+        phone = f"+{digits}" if raw_phone.startswith("+") else digits
+        if await db.blacklist.add(phone, reason=req.reason.strip(), provider=provider, project_id=target_project):
+            added += 1
     return {
         "success": True,
         "added": added,

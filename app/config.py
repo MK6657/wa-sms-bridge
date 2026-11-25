@@ -13,6 +13,8 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+APP_VERSION = "1.1.0"
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)

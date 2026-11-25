@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import v1_router
-from app.config import env
+from app.config import APP_VERSION, env
 from app.core.auth_service import AuthService
 from app.core.event_bus import EventBus
 from app.core.order_service import OrderService
@@ -384,7 +384,7 @@ def create_app(
     application = FastAPI(
         title="SMS Hub API",
         description="独立、轻量、可扩展的 SMS 接码服务与对外集成 API（当前主活平台：SMSBower）",
-        version="1.0.0",
+        version=APP_VERSION,
         lifespan=lifespan,
     )
 

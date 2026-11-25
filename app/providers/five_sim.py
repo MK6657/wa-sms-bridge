@@ -440,6 +440,16 @@ class FiveSimProvider(BaseSmsProvider):
         payload = await self._get(f"/user/finish/{activation_id}")
         return str(payload.get("status", ""))
 
+    async def complete_activation_structured(self, activation_id: str):
+        from app.providers.base import ActionOutcome, parse_complete_outcome
+        try:
+            raw = await self.complete_activation(activation_id)
+            return parse_complete_outcome(raw)
+        except SmsExpiredError as exc:
+            return ActionOutcome(ok=False, status="rejected", retryable=False, raw=str(exc) or "NOT_FOUND")
+        except Exception as exc:
+            return ActionOutcome(ok=False, status="error", retryable=True, raw=str(exc))
+
     async def poll_sms_code(self, activation_id: str, timeout: int = 180) -> str:
         """阶梯轮询等码，返回纯数字验证码。"""
         intervals = [3] * 12 + [5] * 12 + [8] * 15  # 36s + 60s + 120s ≈ 216s

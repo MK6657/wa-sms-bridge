@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Activity,
   AlertCircle,
   ArrowRight,
+  CheckCircle2,
   ChevronDown,
+  Coins,
   Loader2,
   Play,
   RefreshCw,
@@ -22,9 +25,11 @@ import type {
   StatsResponse,
 } from "../../api/types";
 import { CountryCombobox } from "../../components/CountryCombobox";
+import { CustomSelect, type SelectOption } from "../../components/CustomSelect";
 import { PriceTierMatrix } from "../../components/PriceTierMatrix";
 import { useToast } from "../../components/ToastProvider";
-import { formatFinancialSummary, formatMoney } from "../../utils/format";
+import { ToggleSwitch } from "../../components/ToggleSwitch";
+import { formatFinancialSummary, formatMoney, formatPrice } from "../../utils/format";
 import { ActiveOrderCard } from "./ActiveOrderCard";
 import {
   describeOrderSubmitOutcome,
@@ -116,7 +121,7 @@ export function WorkbenchPage({
   const [priceLoading, setPriceLoading] = useState(false);
   const [priceError, setPriceError] = useState("");
 
-  // 高级策略（默认折叠，高频极简；复核 P2-01：严格区分组合绑定价档与手工全局目标价）
+  // 高级策略
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [priceSel, setPriceSel] = useState<PriceSelectionState>(() => ({
     selectedTier: null,
@@ -183,12 +188,10 @@ export function WorkbenchPage({
     };
   }, []);
 
-  // 切换国家 / 服务 / 平台时立即清除旧组合绑定的价档选择（复核 P2-01）
   useEffect(() => {
     setPriceSel((prev) => reconcileComboChange(prev, currentCombo));
   }, [currentCombo]);
 
-  // 保存偏好（仅持久化手工输入的目标价，且未加载完国家列表前绝不把初始兜底 52 覆盖掉用户保存的国家 ID）
   useEffect(() => {
     const savedCountryId = countriesLoadedRef.current
       ? selectedCountry
@@ -231,7 +234,6 @@ export function WorkbenchPage({
     fallbackCountries,
   ]);
 
-  // 加载服务目录与国家列表（遵守服务端默认平台与默认国家，正确处理合法国家 ID 0）
   useEffect(() => {
     let active = true;
     api
@@ -264,15 +266,12 @@ export function WorkbenchPage({
           if (!stillValid) setSelectedCountry(res.countries[0]);
         }
       })
-      .catch(() => {
-        // 未配置 API Key 时静默保留默认内置热门国家列表
-      });
+      .catch(() => {});
     return () => {
       active = false;
     };
   }, [activeProvider, health?.default_country, initialPrefs.countryId, isConfigured]);
 
-  // 查询实时价格档位（修复 P2-02：切换条件立即清旧快照并取消旧请求，按序号抛弃过期响应）
   const loadPrices = useCallback(
     async (force = false) => {
       priceAbortRef.current?.abort();
@@ -348,7 +347,6 @@ export function WorkbenchPage({
       return;
     }
     const { value: parsedTarget, source: priceSource } = resolveEffectiveTargetPrice(priceSel, currentCombo);
-    // 禁止手工输入 0 或负数时静默去掉价格上限导致按市价不限价下单
     if (priceSource === "manual" && priceSel.manualTargetPrice.trim() !== "" && (!parsedTarget || parsedTarget <= 0)) {
       notify("目标/最高价必须大于 0（留空表示不限价）", "error");
       setShowAdvanced(true);
@@ -429,7 +427,6 @@ export function WorkbenchPage({
       const latest = await api.getOrder(targetId);
       if (!mountedRef.current) return;
       onOrderMutated(latest);
-      // v7 复核 P1-06: 仅当返回仍匹配发起查询时的未决尝试 (key, orderId) 时才更新/清除控制器状态，过时回包直接忽略！
       if (idempotencyRef.current.currentKey !== attemptKey) {
         return;
       }
@@ -490,12 +487,38 @@ export function WorkbenchPage({
 
   const popularServices = services.filter((s) => s.popular);
   const otherServices = services.filter((s) => !s.popular);
+  const otherServiceOptions: SelectOption[] = useMemo(
+    () =>
+      otherServices.map((svc) => ({
+        value: svc.id,
+        label: svc.label,
+        badge: svc.code,
+        badgeTone: "slate",
+      })),
+    [otherServices],
+  );
+  const isOtherServiceSelected = !useCustomService && otherServices.some((s) => s.id === selectedService);
+
+  // 高级策略折叠态摘要徽标，避免隐藏生效中的限价或持续抢号状态
+  const activeStrategyBadges: string[] = [];
+  if (resolvedPrice.value && resolvedPrice.value > 0) {
+    activeStrategyBadges.push(`限价 ${formatPrice(resolvedPrice.value)}`);
+  }
+  if (!priceLock && priceFloatEnabled && Number(priceFloatPercent) > 0) {
+    activeStrategyBadges.push(`上浮 +${priceFloatPercent}%`);
+  }
+  if (continuousPoll) {
+    activeStrategyBadges.push("持续抢号");
+  }
+  if (fallbackCountries.trim()) {
+    activeStrategyBadges.push("含备选国家");
+  }
 
   return (
     <div className="space-y-5">
       {/* 首次未配置 API Key 引导横幅 */}
       {showUnconfiguredBanner ? (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3.5 text-sm text-amber-950">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3.5 text-sm text-amber-950 shadow-2xs">
           <div className="flex items-center gap-2.5">
             <AlertCircle className="h-5 w-5 shrink-0 text-amber-600" />
             <div>
@@ -516,80 +539,90 @@ export function WorkbenchPage({
         </div>
       ) : null}
 
-      {/* 精简 KPI 概览条 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
+      {/* 分层高对比 KPI 概览条（基于容器宽度自适应 2 列 / 4 列） */}
+      <div className="grid grid-cols-2 gap-3.5 @3xl:grid-cols-4">
+        <div className="surface-card relative overflow-hidden rounded-2xl p-4">
+          <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-emerald-500 to-teal-400" />
           <div className="flex items-center justify-between text-xs text-slate-500">
-            <span className="inline-flex items-center gap-1.5 font-medium">
-              <Wallet className="h-3.5 w-3.5 text-emerald-600" />
+            <span className="inline-flex items-center gap-1.5 font-medium text-slate-600">
+              <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600 ring-1 ring-inset ring-emerald-200/70">
+                <Wallet className="h-3.5 w-3.5" />
+              </span>
               {activeProviderLabel} 余额
             </span>
             <button
               type="button"
               onClick={onRefreshBalance}
               disabled={balanceLoading}
-              className="cursor-pointer rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+              className="cursor-pointer rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
               title="刷新余额"
             >
-              <RefreshCw className={`h-3.5 w-3.5 ${balanceLoading ? "animate-spin" : ""}`} />
+              <RefreshCw className={`h-3.5 w-3.5 ${balanceLoading ? "animate-spin text-emerald-600" : ""}`} />
             </button>
           </div>
-          <div className="font-mono-code mt-2 text-2xl font-bold text-slate-900">
+          <div className="font-mono-code mt-2.5 text-2xl font-bold tracking-tight text-slate-900">
             {balance !== null ? formatMoney(balance) : "-"}
           </div>
-          <div className="mt-1 truncate text-xs text-slate-400">
-            {balanceError ? balanceError : "主活接码平台 · USD"}
+          <div className="mt-1 truncate text-[11px] text-slate-400">
+            {balanceError ? balanceError : "主活接码账户 · USD"}
           </div>
         </div>
 
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
-          <div className="text-xs font-medium text-slate-500">当前活跃接码</div>
-          <div className="font-mono-code mt-2 text-2xl font-bold text-slate-900">
+        <div className="surface-card relative overflow-hidden rounded-2xl p-4">
+          <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-indigo-500 to-sky-400" />
+          <div className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
+            <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600 ring-1 ring-inset ring-indigo-200/70">
+              <Activity className="h-3.5 w-3.5" />
+            </span>
+            <span>当前活跃接码</span>
+          </div>
+          <div className="font-mono-code mt-2.5 text-2xl font-bold tracking-tight text-slate-900">
             {activeOrders.length}
           </div>
-          <div className="mt-1 text-xs text-slate-400">
-            工作台与外部 API 实时订单
+          <div className="mt-1 truncate text-[11px] text-slate-400">
+            工作台与外部 API 实时并发单
           </div>
         </div>
 
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
-          <div className="text-xs font-medium text-slate-500">今日收到验证码</div>
-          <div className="font-mono-code mt-2 text-2xl font-bold text-emerald-700">
+        <div className="surface-card relative overflow-hidden rounded-2xl p-4">
+          <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-teal-500 to-emerald-400" />
+          <div className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
+            <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-teal-50 text-teal-600 ring-1 ring-inset ring-teal-200/70">
+              <CheckCircle2 className="h-3.5 w-3.5" />
+            </span>
+            <span>今日成功收码</span>
+          </div>
+          <div className="font-mono-code mt-2.5 text-2xl font-bold tracking-tight text-emerald-700">
             {stats?.today.received_count ?? 0}
           </div>
-          <div className="mt-1 text-xs text-slate-400">
-            共取号 {stats?.today.total ?? 0} 次 · 成功率{" "}
+          <div className="mt-1 truncate text-[11px] text-slate-400">
+            共取号 {stats?.today.total ?? 0} 次 · 收码率{" "}
             {stats ? `${Math.round(stats.today.success_rate * 100)}%` : "0%"}
           </div>
         </div>
 
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
-          <div className="text-xs font-medium text-slate-500">今日接码消耗</div>
+        <div className="surface-card relative overflow-hidden rounded-2xl p-4">
+          <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-amber-500 to-orange-400" />
+          <div className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
+            <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-amber-50 text-amber-600 ring-1 ring-inset ring-amber-200/70">
+              <Coins className="h-3.5 w-3.5" />
+            </span>
+            <span>今日净消耗</span>
+          </div>
           {(() => {
             const fin = formatFinancialSummary(stats?.today);
             return (
               <>
-                <div className="font-mono-code mt-2 text-xl font-bold text-slate-900 break-words">
+                <div
+                  className="font-mono-code mt-2.5 truncate text-xl font-bold tracking-tight text-slate-900"
+                  title={fin.lines.join(" | ") || fin.primary}
+                >
                   {fin.primary}
                 </div>
-                {fin.lines.length > 0 ? (
-                  <div className="mt-1 space-y-0.5 text-[11px] text-slate-500">
-                    {fin.lines.map((line) => (
-                      <div key={line} className="truncate" title={line}>
-                        {line}
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                {fin.fxNote ? (
-                  <div className="mt-0.5 text-[11px] font-medium text-indigo-600">{fin.fxNote}</div>
-                ) : fin.isMultiCurrency ? (
-                  <div className="mt-0.5 text-[11px] text-amber-600">多币种未折算（无汇率）</div>
-                ) : null}
-                <div className="mt-1 text-xs text-slate-400">
+                <div className="mt-1 truncate text-[11px] text-slate-400" title={fin.lines.join(" · ")}>
                   确认退款 {stats?.today.refund_confirmed_count ?? stats?.today.refunded_count ?? 0}
                   {(stats?.today.refund_amount_unknown_count ?? 0) > 0
-                    ? ` (金额未知 ${stats?.today.refund_amount_unknown_count})`
+                    ? ` (未知额 ${stats?.today.refund_amount_unknown_count})`
                     : ""}{" "}
                   · 黑名单 {stats?.blacklist_count ?? 0}
                 </div>
@@ -599,31 +632,36 @@ export function WorkbenchPage({
         </div>
       </div>
 
-      {/* 主操作区：左侧快捷取号面板 + 右侧实时接码卡片墙 */}
-      <div className="grid items-start gap-5 lg:grid-cols-[400px_minmax(0,1fr)]">
-        {/* 左侧取号面板 */}
-        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs">
-          <div className="mb-4 flex items-center justify-between">
+      {/* 主操作区：基于容器查询自适应单栏或双栏，侧边栏展开/收起均不拥挤 */}
+      <div className="grid items-start gap-5 @4xl:grid-cols-[372px_minmax(0,1fr)] @6xl:grid-cols-[400px_minmax(0,1fr)]">
+        {/* 左侧取号配置面板 */}
+        <section className="surface-card rounded-2xl">
+          <div className="flex items-center justify-between rounded-t-2xl border-b border-slate-200/75 bg-slate-50/80 px-5 py-3.5">
             <div>
-              <h2 className="text-base font-semibold text-slate-900">快捷取号</h2>
-              <p className="text-xs text-slate-500">选定业务与国家后一键取号，支持并发多开</p>
+              <h2 className="text-sm font-bold text-slate-900">快捷取号台</h2>
+              <p className="mt-0.5 text-xs text-slate-500">选定业务与国家一键取号，支持多单并行</p>
             </div>
-            <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700 ring-1 ring-emerald-200">
+            <span className="font-mono-code rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-200">
               {activeProviderLabel}
             </span>
           </div>
 
-          <div className="space-y-4">
-            {/* 业务服务选择 */}
+          <div className="space-y-4 p-5">
+            {/* 步骤 1：业务服务选择 */}
             <div>
-              <div className="mb-1.5 flex items-center justify-between">
-                <label className="text-xs font-medium text-slate-700">目标业务</label>
+              <div className="mb-2 flex items-center justify-between">
+                <label className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
+                  <span className="font-mono-code flex h-4 w-4 items-center justify-center rounded-full bg-slate-900 text-[10px] font-bold text-white">
+                    1
+                  </span>
+                  目标业务
+                </label>
                 <button
                   type="button"
                   onClick={() => setUseCustomService((v) => !v)}
-                  className="cursor-pointer text-xs font-medium text-indigo-600 hover:text-indigo-700"
+                  className="cursor-pointer text-xs font-medium text-indigo-600 transition hover:text-indigo-700"
                 >
-                  {useCustomService ? "返回常用服务" : "输入自定义服务码"}
+                  {useCustomService ? "返回常用服务" : "自定义服务码"}
                 </button>
               </div>
 
@@ -632,8 +670,8 @@ export function WorkbenchPage({
                   type="text"
                   value={customService}
                   onChange={(e) => setCustomService(e.target.value)}
-                  placeholder="输入 SMSBower 原生服务码，如 wa / tg / go / ot"
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 font-mono-code text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15"
+                  placeholder="输入原生服务码，如 wa / tg / go / ot"
+                  className="input-surface font-mono-code w-full rounded-xl px-3.5 py-2.5 text-sm"
                 />
               ) : (
                 <div className="space-y-2">
@@ -647,44 +685,52 @@ export function WorkbenchPage({
                           { id: "openai", label: "OpenAI", code: "dr", popular: true },
                           { id: "discord", label: "Discord", code: "ds", popular: true },
                         ]
-                    ).map((svc) => (
-                      <button
-                        key={svc.id}
-                        type="button"
-                        onClick={() => setSelectedService(svc.id)}
-                        className={`cursor-pointer rounded-xl border px-3 py-1.5 text-xs font-medium transition ${
-                          selectedService === svc.id
-                            ? "border-emerald-600 bg-emerald-600 text-white shadow-2xs"
-                            : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50"
-                        }`}
-                      >
-                        {svc.label}
-                      </button>
-                    ))}
+                    ).map((svc) => {
+                      const active = selectedService === svc.id;
+                      return (
+                        <button
+                          key={svc.id}
+                          type="button"
+                          onClick={() => setSelectedService(svc.id)}
+                          className={`cursor-pointer rounded-xl border px-3 py-1.5 text-xs font-medium transition ${
+                            active
+                              ? "border-emerald-600 bg-emerald-600 text-white shadow-xs"
+                              : "border-slate-200/95 bg-white text-slate-700 shadow-2xs hover:border-slate-300 hover:bg-slate-50"
+                          }`}
+                        >
+                          {svc.label}
+                        </button>
+                      );
+                    })}
                   </div>
-                  {otherServices.length > 0 ? (
-                    <select
-                      value={otherServices.some((s) => s.id === selectedService) ? selectedService : ""}
-                      onChange={(e) => {
-                        if (e.target.value) setSelectedService(e.target.value);
+
+                  {otherServiceOptions.length > 0 ? (
+                    <CustomSelect
+                      value={isOtherServiceSelected ? selectedService : ""}
+                      onChange={(val) => {
+                        if (val) setSelectedService(val);
                       }}
-                      className="w-full rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2 text-xs text-slate-700 outline-none focus:border-emerald-500"
-                    >
-                      <option value="">更多常用服务（Facebook / TikTok / Apple / 通用 ot...）</option>
-                      {otherServices.map((svc) => (
-                        <option key={svc.id} value={svc.id}>
-                          {svc.label} ({svc.code})
-                        </option>
-                      ))}
-                    </select>
+                      options={otherServiceOptions}
+                      placeholder={`更多常用服务（Facebook / TikTok / Apple / 通用 ot 等 ${otherServiceOptions.length} 项）`}
+                      activeHighlight={isOtherServiceSelected}
+                      footerAction={{
+                        label: "找不到？直接输入自定义服务码 →",
+                        onClick: () => setUseCustomService(true),
+                      }}
+                    />
                   ) : null}
                 </div>
               )}
             </div>
 
-            {/* 国家选择 */}
+            {/* 步骤 2：国家选择 */}
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-slate-700">国家 / 地区</label>
+              <label className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
+                <span className="font-mono-code flex h-4 w-4 items-center justify-center rounded-full bg-slate-900 text-[10px] font-bold text-white">
+                  2
+                </span>
+                国家 / 地区
+              </label>
               <CountryCombobox
                 countries={countries}
                 selected={selectedCountry}
@@ -693,7 +739,7 @@ export function WorkbenchPage({
               />
             </div>
 
-            {/* 实时价格档位矩阵 */}
+            {/* 步骤 3：实时价格档位矩阵 */}
             <PriceTierMatrix
               snapshot={priceSnapshot}
               loading={priceLoading}
@@ -708,165 +754,182 @@ export function WorkbenchPage({
               onRefresh={() => loadPrices(true)}
             />
 
-            {/* 可折叠高级价格与抢号策略 */}
-            <div className="rounded-xl border border-slate-200 bg-white">
+            {/* 可折叠高级价格与抢号策略（折叠时仍显示当前激活策略胶囊） */}
+            <div className="rounded-xl border border-slate-200/90 bg-slate-50/40">
               <button
                 type="button"
                 onClick={() => setShowAdvanced((v) => !v)}
-                className="flex w-full cursor-pointer items-center justify-between px-3.5 py-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-xl px-3.5 py-2.5 text-xs font-medium text-slate-700 transition hover:bg-slate-100/60"
               >
-                <span className="inline-flex items-center gap-1.5">
-                  <SlidersHorizontal className="h-3.5 w-3.5 text-slate-400" />
-                  高级策略（限价 / 目标档上限 / 持续抢号 / 备选国家）
+                <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <SlidersHorizontal className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                  <span className="font-semibold text-slate-700">高级策略</span>
+                  {!showAdvanced && activeStrategyBadges.length > 0 ? (
+                    activeStrategyBadges.map((b) => (
+                      <span
+                        key={b}
+                        className="rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-200"
+                      >
+                        {b}
+                      </span>
+                    ))
+                  ) : !showAdvanced ? (
+                    <span className="text-[11px] font-normal text-slate-400">限价 / 持续抢号 / 备选国家</span>
+                  ) : null}
                 </span>
                 <ChevronDown
-                  className={`h-4 w-4 text-slate-400 transition-transform ${showAdvanced ? "rotate-180" : ""}`}
+                  className={`h-4 w-4 shrink-0 text-slate-400 transition-transform ${showAdvanced ? "rotate-180" : ""}`}
                 />
               </button>
 
               {showAdvanced ? (
-                <div className="space-y-3 border-t border-slate-100 p-3.5 text-xs">
+                <div className="space-y-3 border-t border-slate-200/75 bg-white p-3.5 rounded-b-xl text-xs">
                   <div className="grid grid-cols-2 gap-2.5">
                     <div>
                       <div className="mb-1 flex items-center justify-between gap-1">
-                        <label className="text-slate-500">目标/最高价 ($)</label>
+                        <label className="font-medium text-slate-600">目标/最高价</label>
                         {resolvedPrice.source === "tier" ? (
-                          <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
-                            当前组合价档
+                          <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+                            价档绑定
                           </span>
                         ) : resolvedPrice.source === "manual" ? (
                           <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
-                            手动指定
+                            手动上限
                           </span>
                         ) : null}
                       </div>
-                      <input
-                        type="number"
-                        step="0.01"
-                        min="0.0001"
-                        value={resolvedPrice.displayValue}
-                        onChange={(e) => setPriceSel((prev) => setManualPrice(prev, e.target.value))}
-                        placeholder="留空按市价"
-                        className="font-mono-code w-full rounded-lg border border-slate-200 px-2.5 py-1.5 outline-none focus:border-emerald-500"
-                      />
+                      <div className="relative">
+                        <span className="font-mono-code pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-xs text-slate-400">
+                          $
+                        </span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0.0001"
+                          value={resolvedPrice.displayValue}
+                          onChange={(e) => setPriceSel((prev) => setManualPrice(prev, e.target.value))}
+                          placeholder="留空按市价"
+                          className="input-surface font-mono-code w-full rounded-lg py-1.5 pl-6 pr-2.5 text-xs"
+                        />
+                      </div>
                     </div>
                     <div>
-                      <label className="mb-1 block text-slate-500">等码超时 (秒)</label>
-                      <input
-                        type="number"
-                        min="30"
-                        max="1200"
-                        value={waitTimeout}
-                        onChange={(e) => setWaitTimeout(e.target.value)}
-                        className="font-mono-code w-full rounded-lg border border-slate-200 px-2.5 py-1.5 outline-none focus:border-emerald-500"
-                      />
+                      <label className="mb-1 block font-medium text-slate-600">等码超时</label>
+                      <div className="relative">
+                        <input
+                          type="number"
+                          min="30"
+                          max="1200"
+                          value={waitTimeout}
+                          onChange={(e) => setWaitTimeout(e.target.value)}
+                          className="input-surface font-mono-code w-full rounded-lg py-1.5 pl-2.5 pr-7 text-xs"
+                        />
+                        <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-slate-400">
+                          秒
+                        </span>
+                      </div>
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2">
-                    <label
-                      className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-2.5 py-2 hover:bg-slate-50"
-                      title="检查目标价档库存并按 maxPrice 上限下单（SMSBower 协议为最高价上限语义）"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={priceLock}
-                        onChange={(e) => {
-                          const checked = e.target.checked;
-                          setPriceSel((prev) => ({ ...prev, priceLock: checked }));
-                          if (checked) setPriceFloatEnabled(false);
-                        }}
-                        className="rounded border-slate-300 text-emerald-600"
-                      />
-                      <span className="font-medium text-slate-700">目标档上限 (maxPrice)</span>
-                    </label>
-
-                    <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-2.5 py-2 hover:bg-slate-50">
-                      <input
-                        type="checkbox"
-                        checked={priceFloatEnabled}
-                        disabled={priceLock}
-                        onChange={(e) => setPriceFloatEnabled(e.target.checked)}
-                        className="rounded border-slate-300 text-emerald-600"
-                      />
-                      <span className="font-medium text-slate-700">允许上浮 %</span>
-                    </label>
+                  <div className="surface-well space-y-2.5 rounded-xl p-3">
+                    <ToggleSwitch
+                      checked={priceLock}
+                      onChange={(checked) => {
+                        setPriceSel((prev) => ({ ...prev, priceLock: checked }));
+                        if (checked) setPriceFloatEnabled(false);
+                      }}
+                      label="检查目标价档库存并锁定上限 (maxPrice)"
+                    />
+                    <ToggleSwitch
+                      checked={priceFloatEnabled}
+                      disabled={priceLock}
+                      onChange={setPriceFloatEnabled}
+                      label="目标价无号时允许按比例上浮"
+                    />
+                    {priceFloatEnabled && !priceLock ? (
+                      <div className="flex items-center justify-between gap-2 pt-1">
+                        <span className="text-slate-600">允许上浮比例</span>
+                        <div className="relative w-28">
+                          <input
+                            type="number"
+                            min="0"
+                            max="1000"
+                            value={priceFloatPercent}
+                            onChange={(e) => setPriceFloatPercent(e.target.value)}
+                            className="input-surface font-mono-code w-full rounded-lg py-1 pl-2.5 pr-6 text-xs"
+                          />
+                          <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[11px] text-slate-400">
+                            %
+                          </span>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
-
-                  {priceFloatEnabled && !priceLock ? (
-                    <div>
-                      <label className="mb-1 block text-slate-500">价格上浮比例 (%)</label>
-                      <input
-                        type="number"
-                        min="0"
-                        max="1000"
-                        value={priceFloatPercent}
-                        onChange={(e) => setPriceFloatPercent(e.target.value)}
-                        className="font-mono-code w-full rounded-lg border border-slate-200 px-2.5 py-1.5 outline-none focus:border-emerald-500"
-                      />
-                    </div>
-                  ) : null}
 
                   <div className="grid grid-cols-2 gap-2.5">
                     <div>
-                      <label className="mb-1 block text-slate-500">最多尝试次数</label>
-                      <input
-                        type="number"
-                        min="1"
-                        max="100"
-                        disabled={continuousPoll}
-                        value={maxAttempts}
-                        onChange={(e) => setMaxAttempts(e.target.value)}
-                        className="font-mono-code w-full rounded-lg border border-slate-200 px-2.5 py-1.5 outline-none disabled:bg-slate-100"
-                      />
+                      <label className="mb-1 block font-medium text-slate-600">最多尝试次数</label>
+                      <div className="relative">
+                        <input
+                          type="number"
+                          min="1"
+                          max="100"
+                          disabled={continuousPoll}
+                          value={maxAttempts}
+                          onChange={(e) => setMaxAttempts(e.target.value)}
+                          className="input-surface font-mono-code w-full rounded-lg py-1.5 pl-2.5 pr-7 text-xs disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                        <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-slate-400">
+                          次
+                        </span>
+                      </div>
                     </div>
                     <div>
-                      <label className="mb-1 block text-slate-500">重试间隔 (秒)</label>
-                      <input
-                        type="number"
-                        step="0.5"
-                        min="0.1"
-                        value={requestInterval}
-                        onChange={(e) => setRequestInterval(e.target.value)}
-                        className="font-mono-code w-full rounded-lg border border-slate-200 px-2.5 py-1.5 outline-none"
-                      />
+                      <label className="mb-1 block font-medium text-slate-600">重试间隔</label>
+                      <div className="relative">
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="0.1"
+                          value={requestInterval}
+                          onChange={(e) => setRequestInterval(e.target.value)}
+                          className="input-surface font-mono-code w-full rounded-lg py-1.5 pl-2.5 pr-7 text-xs"
+                        />
+                        <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-slate-400">
+                          秒
+                        </span>
+                      </div>
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap gap-3">
-                    <label className="inline-flex cursor-pointer items-center gap-1.5 text-slate-700">
-                      <input
-                        type="checkbox"
-                        checked={continuousPoll}
-                        onChange={(e) => setContinuousPoll(e.target.checked)}
-                      />
-                      持续轮询抢号（异步）
-                    </label>
-                    <label className="inline-flex cursor-pointer items-center gap-1.5 text-slate-700">
-                      <input
-                        type="checkbox"
-                        checked={skipBlacklisted}
-                        onChange={(e) => setSkipBlacklisted(e.target.checked)}
-                      />
-                      自动跳过黑名单号
-                    </label>
+                  <div className="surface-well space-y-2.5 rounded-xl p-3">
+                    <ToggleSwitch
+                      checked={continuousPoll}
+                      onChange={setContinuousPoll}
+                      label="持续轮询抢号（后台异步蹲号）"
+                    />
+                    <ToggleSwitch
+                      checked={skipBlacklisted}
+                      onChange={setSkipBlacklisted}
+                      label="命中黑名单号码时自动退款跳过"
+                    />
                   </div>
 
                   <div>
-                    <label className="mb-1 block text-slate-500">备选国家（逗号分隔）</label>
+                    <label className="mb-1 block font-medium text-slate-600">备选国家（逗号分隔，主国家无号自动顺延）</label>
                     <input
                       type="text"
                       value={fallbackCountries}
                       onChange={(e) => setFallbackCountries(e.target.value)}
                       placeholder="如 Indonesia, South Africa, 4"
-                      className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 outline-none focus:border-emerald-500"
+                      className="input-surface w-full rounded-lg px-2.5 py-1.5 text-xs"
                     />
                   </div>
                 </div>
               ) : null}
             </div>
 
-            {/* 上次提交结果不确定或失败时的原单查询与新建订单引导（v6 复核 P2-02） */}
+            {/* 上次提交结果不确定时的原单查询与新建订单引导 */}
             {pendingSubmitInfo?.outcomeUncertain ? (
               <div className="rounded-xl border border-amber-200 bg-amber-50/90 p-3 text-xs text-amber-950">
                 <div className="font-medium">
@@ -904,7 +967,7 @@ export function WorkbenchPage({
               type="button"
               onClick={handleAcquire}
               disabled={acquiring || !isConfigured || isCustomEmpty}
-              className="flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-3 text-sm font-semibold text-white shadow-[0_4px_14px_-3px_rgba(16,185,129,0.45)] transition hover:from-emerald-700 hover:to-teal-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
             >
               {acquiring ? (
                 <>
@@ -922,17 +985,17 @@ export function WorkbenchPage({
         </section>
 
         {/* 右侧活跃接码卡片墙 */}
-        <section className="space-y-3.5">
-          <div className="flex flex-wrap items-center justify-between gap-2">
+        <section className="min-w-0 space-y-3.5">
+          <div className="surface-card flex flex-wrap items-center justify-between gap-2 rounded-2xl px-4 py-3">
             <div className="flex items-center gap-2">
-              <h2 className="text-base font-semibold text-slate-900">实时接码看板</h2>
-              <span className="rounded-full bg-slate-200/70 px-2 py-0.5 font-mono-code text-xs font-semibold text-slate-700">
+              <h2 className="text-sm font-bold text-slate-900">实时接码看板</h2>
+              <span className="font-mono-code rounded-full bg-slate-900 px-2 py-0.5 text-xs font-semibold text-white">
                 {filteredActiveOrders.length}
               </span>
             </div>
 
-            <div className="flex items-center gap-2">
-              <div className="inline-flex rounded-xl border border-slate-200 bg-white p-0.5 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex rounded-xl border border-slate-200/90 bg-slate-50 p-0.5 text-xs">
                 {(
                   [
                     ["all", "全部"],
@@ -946,8 +1009,8 @@ export function WorkbenchPage({
                     onClick={() => setSourceFilter(key)}
                     className={`cursor-pointer rounded-lg px-2.5 py-1 font-medium transition ${
                       sourceFilter === key
-                        ? "bg-slate-900 text-white"
-                        : "text-slate-600 hover:text-slate-900"
+                        ? "bg-white text-slate-900 shadow-2xs ring-1 ring-slate-200/80"
+                        : "text-slate-500 hover:text-slate-900"
                     }`}
                   >
                     {label}
@@ -972,8 +1035,8 @@ export function WorkbenchPage({
           </div>
 
           {filteredActiveOrders.length === 0 ? (
-            <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-white/70 px-6 py-16 text-center">
-              <div className="rounded-2xl bg-slate-100 p-3.5 text-slate-400">
+            <div className="surface-card flex flex-col items-center justify-center rounded-2xl px-6 py-16 text-center">
+              <div className="rounded-2xl bg-slate-100 p-3.5 text-slate-400 ring-1 ring-inset ring-slate-200/80">
                 <Smartphone className="h-7 w-7" />
               </div>
               <h3 className="mt-4 text-sm font-semibold text-slate-800">当前没有进行中的接码订单</h3>
@@ -982,7 +1045,7 @@ export function WorkbenchPage({
                 <code className="font-mono-code rounded bg-slate-100 px-1.5 py-0.5 text-slate-700">
                   POST /api/v1/orders
                 </code>{" "}
-                后，号码与验证码都会实时出现在这里。
+                后，号码与验证码都会实时显示在这里。
               </p>
             </div>
           ) : (

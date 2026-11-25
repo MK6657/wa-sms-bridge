@@ -1,8 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Download, Eye, EyeOff, RefreshCw, Search, ShieldOff } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Download,
+  Eye,
+  EyeOff,
+  RefreshCw,
+  Search,
+  ShieldOff,
+  X,
+} from "lucide-react";
 import { api } from "../../api/client";
 import type { ReconciliationActivationItem, ReconciliationResponse, SmsOrder, StatsResponse } from "../../api/types";
+import { ConfirmModal } from "../../components/ConfirmModal";
 import { CopyButton } from "../../components/CopyButton";
+import { CustomSelect, type SelectOption } from "../../components/CustomSelect";
 import { StatusBadge } from "../../components/StatusBadge";
 import { useToast } from "../../components/ToastProvider";
 import { formatDateTime, formatFinancialSummary, formatPrice, maskCode } from "../../utils/format";
@@ -13,6 +25,21 @@ interface OrdersPageProps {
   onOrdersChanged?: () => void;
 }
 
+const ORDER_STATUS_OPTIONS: SelectOption[] = [
+  { value: "", label: "全部订单状态" },
+  { value: "acquiring", label: "取号中", dotColor: "bg-indigo-500", badge: "acquiring", group: "进行中" },
+  { value: "waiting_code", label: "等码中", dotColor: "bg-amber-500", badge: "waiting", group: "进行中" },
+  { value: "code_received", label: "已收到验证码", dotColor: "bg-emerald-500", badge: "received", group: "进行中" },
+  { value: "waiting_next_code", label: "重发等码中", dotColor: "bg-sky-500", badge: "resend", group: "进行中" },
+  { value: "completing", label: "确认完成中", dotColor: "bg-emerald-500", group: "进行中" },
+  { value: "cancelling", label: "取消退款中", dotColor: "bg-amber-500", group: "进行中" },
+  { value: "compensation_pending", label: "退款重试中", dotColor: "bg-amber-500", group: "进行中" },
+  { value: "completed", label: "已完成", dotColor: "bg-emerald-600", badge: "completed", group: "已终结" },
+  { value: "cancelled", label: "已取消", dotColor: "bg-slate-400", badge: "cancelled", group: "已终结" },
+  { value: "expired", label: "已超时", dotColor: "bg-orange-400", badge: "expired", group: "已终结" },
+  { value: "failed", label: "失败", dotColor: "bg-rose-500", badge: "failed", group: "已终结" },
+];
+
 export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPageProps) {
   const { notify } = useToast();
   const [orders, setOrders] = useState<SmsOrder[]>([]);
@@ -21,16 +48,26 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
   const [status, setStatus] = useState("");
   const [projectId, setProjectId] = useState("");
   const [serviceFilter, setServiceFilter] = useState("");
-  const [search, setSearch] = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [reconciliation, setReconciliation] = useState<ReconciliationResponse | null>(null);
   const [resolvingId, setResolvingId] = useState<number | null>(null);
+  const [scrubTargetId, setScrubTargetId] = useState<string | null>(null);
+  const [scrubbingOne, setScrubbingOne] = useState(false);
   const [revealedIds, setRevealedIds] = useState<Set<string>>(new Set());
   const loadSeqRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
 
   const pageSize = 25;
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(searchInput.trim());
+    }, 240);
+    return () => window.clearTimeout(timer);
+  }, [searchInput]);
 
   const loadReconciliation = useCallback(async () => {
     try {
@@ -53,7 +90,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
           status,
           project_id: projectId,
           service: serviceFilter,
-          search,
+          search: debouncedSearch,
           page,
           page_size: pageSize,
         },
@@ -70,7 +107,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
         setLoading(false);
       }
     }
-  }, [status, projectId, serviceFilter, search, page, notify]);
+  }, [status, projectId, serviceFilter, debouncedSearch, page, notify]);
 
   useEffect(() => {
     load();
@@ -89,14 +126,19 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
     });
   };
 
-  const handleScrubOne = async (orderId: string) => {
+  const handleScrubConfirmed = async () => {
+    if (!scrubTargetId) return;
+    setScrubbingOne(true);
     try {
-      await api.scrubOrderCode(orderId);
+      await api.scrubOrderCode(scrubTargetId);
       notify("已立即脱敏清理该条验证码", "success");
+      setScrubTargetId(null);
       load();
       onOrdersChanged?.();
     } catch (err) {
       notify(err instanceof Error ? err.message : "脱敏失败", "error");
+    } finally {
+      setScrubbingOne(false);
     }
   };
 
@@ -130,7 +172,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
           status,
           project_id: projectId,
           service: serviceFilter,
-          search,
+          search: debouncedSearch,
           page: p,
           page_size: 200,
         });
@@ -196,19 +238,25 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
     }
   };
 
-  const pendingActItems: ReconciliationActivationItem[] = [
-    ...(reconciliation?.uncertain_activations || []),
-    ...(reconciliation?.pending_refund_activations || []),
-    ...(reconciliation?.currency_review_activations || []),
-  ].filter((item, idx, arr) => arr.findIndex((x) => x.id === item.id) === idx);
+  const pendingActItems: ReconciliationActivationItem[] = useMemo(
+    () =>
+      [
+        ...(reconciliation?.uncertain_activations || []),
+        ...(reconciliation?.pending_refund_activations || []),
+        ...(reconciliation?.currency_review_activations || []),
+      ].filter((item, idx, arr) => arr.findIndex((x) => x.id === item.id) === idx),
+    [reconciliation],
+  );
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const maxProjectTotal = Math.max(1, ...(stats?.by_project.map((p) => p.total) || [1]));
+  const maxServiceTotal = Math.max(1, ...(stats?.by_service.map((s) => s.total) || [1]));
 
   return (
     <div className="space-y-5">
-      {/* 待人工核销对账队列（仅在存在不确定购买/待退款/历史币种待核对记录时显示） */}
+      {/* 待人工核销对账队列 */}
       {pendingActItems.length > 0 ? (
-        <section className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4 shadow-2xs">
+        <section className="rounded-2xl border border-amber-200 bg-amber-50/75 p-4 shadow-2xs">
           <div className="mb-2.5 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs font-semibold text-amber-950">
               <AlertTriangle className="h-4 w-4 text-amber-600" />
@@ -226,7 +274,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
             {pendingActItems.slice(0, 8).map((act) => (
               <div
                 key={act.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200/80 bg-white px-3 py-2 text-xs"
+                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200/80 bg-white px-3 py-2 text-xs shadow-2xs"
               >
                 <div className="min-w-0">
                   <div className="font-mono-code font-medium text-slate-900">
@@ -269,75 +317,95 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
         </section>
       ) : null}
 
-      {/* 近 7 日按项目 / 按服务汇总 */}
-      <div className="grid gap-4 lg:grid-cols-2">
-        <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
+      {/* 近 7 日按项目 / 按服务汇总（点击行即高亮联动过滤下方列表） */}
+      <div className="grid gap-4 @3xl:grid-cols-2">
+        <section className="surface-card rounded-2xl p-4">
           <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-slate-900">近 7 日接入项目分布</h3>
-            <span className="text-xs text-slate-400">按调用来源归属</span>
+            <h3 className="text-sm font-bold text-slate-900">近 7 日接入项目分布</h3>
+            <span className="text-xs text-slate-400">点击项目可筛选表格</span>
           </div>
           {stats && stats.by_project.length > 0 ? (
             <div className="space-y-2">
-              {stats.by_project.map((item) => (
-                <div
-                  key={item.project_id}
-                  className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-xs"
-                >
+              {stats.by_project.map((item) => {
+                const isSelected = projectId === item.project_id;
+                const pct = Math.max(6, Math.round((item.total / maxProjectTotal) * 100));
+                return (
                   <button
+                    key={item.project_id}
                     type="button"
                     onClick={() => {
-                      setProjectId(item.project_id === projectId ? "" : item.project_id);
+                      setProjectId(isSelected ? "" : item.project_id);
                       setPage(1);
                     }}
-                    className="cursor-pointer font-medium text-slate-800 hover:text-emerald-700"
+                    className={`relative flex w-full cursor-pointer items-center justify-between overflow-hidden rounded-xl border px-3 py-2 text-left text-xs transition ${
+                      isSelected
+                        ? "border-indigo-400 bg-indigo-50/75 ring-1 ring-indigo-400/30"
+                        : "border-slate-200/75 bg-slate-50/70 hover:border-slate-300 hover:bg-white"
+                    }`}
                   >
-                    {item.project_id === "web-console" ? "Web 工作台 (web-console)" : item.project_id}
+                    <span
+                      className="pointer-events-none absolute inset-y-0 left-0 bg-indigo-500/[0.045]"
+                      style={{ width: `${pct}%` }}
+                    />
+                    <span className="relative font-semibold text-slate-800">
+                      {item.project_id === "web-console" ? "Web 工作台 (web-console)" : item.project_id}
+                    </span>
+                    <div className="font-mono-code relative flex items-center gap-3 text-slate-600">
+                      <span>收码 {item.received_count}/{item.total}</span>
+                      <strong className="text-slate-900" title={formatFinancialSummary(item).lines.join(" | ")}>
+                        {formatFinancialSummary(item).primary}
+                      </strong>
+                    </div>
                   </button>
-                  <div className="font-mono-code flex items-center gap-3 text-slate-600">
-                    <span>收码 {item.received_count}/{item.total}</span>
-                    <strong className="text-slate-900" title={formatFinancialSummary(item).lines.join(" | ")}>
-                      {formatFinancialSummary(item).primary}
-                    </strong>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div className="py-6 text-center text-xs text-slate-400">近 7 日暂无订单数据</div>
           )}
         </section>
 
-        <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
+        <section className="surface-card rounded-2xl p-4">
           <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-slate-900">近 7 日业务服务分布</h3>
-            <span className="text-xs text-slate-400">SMSBower 服务维度</span>
+            <h3 className="text-sm font-bold text-slate-900">近 7 日业务服务分布</h3>
+            <span className="text-xs text-slate-400">点击业务可筛选表格</span>
           </div>
           {stats && stats.by_service.length > 0 ? (
             <div className="space-y-2">
-              {stats.by_service.map((item) => (
-                <div
-                  key={`${item.service}-${item.service_code}`}
-                  className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-xs"
-                >
+              {stats.by_service.map((item) => {
+                const isSelected = serviceFilter === item.service;
+                const pct = Math.max(6, Math.round((item.total / maxServiceTotal) * 100));
+                return (
                   <button
+                    key={`${item.service}-${item.service_code}`}
                     type="button"
                     onClick={() => {
-                      setServiceFilter(item.service === serviceFilter ? "" : item.service);
+                      setServiceFilter(isSelected ? "" : item.service);
                       setPage(1);
                     }}
-                    className="cursor-pointer font-medium text-slate-800 hover:text-emerald-700"
+                    className={`relative flex w-full cursor-pointer items-center justify-between overflow-hidden rounded-xl border px-3 py-2 text-left text-xs transition ${
+                      isSelected
+                        ? "border-emerald-400 bg-emerald-50/75 ring-1 ring-emerald-400/30"
+                        : "border-slate-200/75 bg-slate-50/70 hover:border-slate-300 hover:bg-white"
+                    }`}
                   >
-                    {item.service}{" "}
-                    <code className="font-mono-code text-slate-400">({item.service_code})</code>
+                    <span
+                      className="pointer-events-none absolute inset-y-0 left-0 bg-emerald-500/[0.05]"
+                      style={{ width: `${pct}%` }}
+                    />
+                    <span className="relative font-semibold text-slate-800">
+                      {item.service}{" "}
+                      <code className="font-mono-code text-slate-400">({item.service_code})</code>
+                    </span>
+                    <div className="font-mono-code relative flex items-center gap-3 text-slate-600">
+                      <span>收码 {item.received_count}/{item.total}</span>
+                      <strong className="text-slate-900" title={formatFinancialSummary(item).lines.join(" | ")}>
+                        {formatFinancialSummary(item).primary}
+                      </strong>
+                    </div>
                   </button>
-                  <div className="font-mono-code flex items-center gap-3 text-slate-600">
-                    <span>收码 {item.received_count}/{item.total}</span>
-                    <strong className="text-slate-900" title={formatFinancialSummary(item).lines.join(" | ")}>
-                      {formatFinancialSummary(item).primary}
-                    </strong>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div className="py-6 text-center text-xs text-slate-400">近 7 日暂无业务统计</div>
@@ -345,45 +413,49 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
         </section>
       </div>
 
-      {/* 订单检索表格 */}
-      <section className="rounded-2xl border border-slate-200 bg-white shadow-xs">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 p-4">
-          <div className="flex flex-wrap items-center gap-2">
+      {/* 订单检索表格（不设 overflow-hidden 以免裁切自定义状态下拉菜单） */}
+      <section className="surface-card rounded-2xl">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-t-2xl border-b border-slate-200/75 bg-slate-50/70 p-4">
+          <div className="flex flex-wrap items-center gap-2.5">
             <div className="relative">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
               <input
                 type="text"
-                value={search}
+                value={searchInput}
                 onChange={(e) => {
-                  setSearch(e.target.value);
+                  setSearchInput(e.target.value);
                   setPage(1);
                 }}
                 placeholder="搜索手机号 / 订单号 / 国家 / 外部ID"
-                className="w-64 rounded-xl border border-slate-200 py-2 pl-9 pr-3 text-xs outline-none focus:border-emerald-500"
+                className="input-surface w-64 rounded-xl py-2 pl-9 pr-8 text-xs"
               />
+              {searchInput ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchInput("");
+                    setDebouncedSearch("");
+                    setPage(1);
+                  }}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 cursor-pointer rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                  title="清空搜索"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
             </div>
 
-            <select
+            <CustomSelect
               value={status}
-              onChange={(e) => {
-                setStatus(e.target.value);
+              onChange={(val) => {
+                setStatus(val);
                 setPage(1);
               }}
-              className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none focus:border-emerald-500"
-            >
-              <option value="">全部状态</option>
-              <option value="acquiring">取号中</option>
-              <option value="waiting_code">等码中</option>
-              <option value="code_received">已收到验证码</option>
-              <option value="waiting_next_code">重发等码中</option>
-              <option value="completing">确认完成中</option>
-              <option value="cancelling">取消退款中</option>
-              <option value="compensation_pending">退款重试中</option>
-              <option value="completed">已完成</option>
-              <option value="cancelled">已取消</option>
-              <option value="expired">已超时</option>
-              <option value="failed">失败</option>
-            </select>
+              options={ORDER_STATUS_OPTIONS}
+              activeHighlight={Boolean(status)}
+              minMenuWidth={230}
+              className="w-44"
+            />
 
             {projectId ? (
               <button
@@ -392,7 +464,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                   setProjectId("");
                   setPage(1);
                 }}
-                className="cursor-pointer rounded-xl bg-indigo-50 px-2.5 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100"
+                className="cursor-pointer rounded-xl border border-indigo-200 bg-indigo-50 px-2.5 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100"
               >
                 项目: {projectId} ×
               </button>
@@ -405,7 +477,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                   setServiceFilter("");
                   setPage(1);
                 }}
-                className="cursor-pointer rounded-xl bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"
+                className="cursor-pointer rounded-xl border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"
               >
                 业务: {serviceFilter} ×
               </button>
@@ -417,7 +489,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
               type="button"
               onClick={exportCsv}
               disabled={total === 0 || exporting}
-              className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+              className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-slate-200/90 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-2xs transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-40"
             >
               <Download className="h-3.5 w-3.5" />
               {exporting ? "导出中..." : "导出 CSV"}
@@ -429,18 +501,18 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                 loadReconciliation();
               }}
               disabled={loading}
-              className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-slate-200/90 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-2xs transition hover:border-slate-300 hover:bg-slate-50"
             >
-              <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+              <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin text-emerald-600" : ""}`} />
               刷新
             </button>
           </div>
         </div>
 
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[820px] border-collapse text-left text-xs">
+          <table className="w-full min-w-[780px] border-collapse text-left text-xs">
             <thead>
-              <tr className="border-b border-slate-100 bg-slate-50/70 text-slate-500">
+              <tr className="border-b border-slate-100 bg-slate-50/50 text-slate-500">
                 <th className="px-4 py-3 font-medium">时间 / 订单</th>
                 <th className="px-4 py-3 font-medium">来源项目</th>
                 <th className="px-4 py-3 font-medium">业务 / 国家</th>
@@ -462,16 +534,19 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                   const isRevealed = revealedIds.has(order.order_id) || !maskInHistory;
                   const codeVisible = !order.code_scrubbed && Boolean(order.latest_code);
                   return (
-                    <tr key={order.order_id} className="hover:bg-slate-50/60">
-                      <td className="px-4 py-3">
+                    <tr key={order.order_id} className="transition hover:bg-slate-50/70">
+                      <td className="whitespace-nowrap px-4 py-3">
                         <div className="font-mono-code font-medium text-slate-800">
                           {formatDateTime(order.created_at)}
                         </div>
-                        <div className="font-mono-code mt-0.5 text-[11px] text-slate-400">
+                        <div
+                          className="font-mono-code mt-0.5 max-w-[170px] truncate text-[11px] text-slate-400"
+                          title={order.order_id}
+                        >
                           {order.order_id}
                         </div>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="whitespace-nowrap px-4 py-3">
                         <span className="rounded-md bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
                           {order.project_id === "web-console" ? "工作台" : order.project_id}
                         </span>
@@ -481,14 +556,14 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                           </div>
                         ) : null}
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="whitespace-nowrap px-4 py-3">
                         <div className="font-medium text-slate-800">
                           {order.service}{" "}
                           <span className="font-mono-code text-slate-400">({order.service_code})</span>
                         </div>
                         <div className="text-slate-500">{order.country_label || `#${order.country_id}`}</div>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="whitespace-nowrap px-4 py-3">
                         <div className="flex items-center gap-1.5">
                           <span className="font-mono-code font-medium text-slate-800">
                             {order.phone_e164 || order.phone_raw || "-"}
@@ -498,12 +573,12 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                           ) : null}
                         </div>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="whitespace-nowrap px-4 py-3">
                         {order.code_scrubbed ? (
                           <span className="text-slate-400">已脱敏清理</span>
                         ) : codeVisible ? (
                           <div className="flex items-center gap-1.5">
-                            <span className="font-mono-code rounded-md bg-emerald-50 px-2 py-0.5 font-bold text-emerald-800">
+                            <span className="font-mono-code rounded-md bg-emerald-50 px-2 py-0.5 font-bold text-emerald-800 ring-1 ring-inset ring-emerald-200/70">
                               {isRevealed ? order.latest_code : maskCode(order.latest_code)}
                             </span>
                             {maskInHistory ? (
@@ -519,9 +594,9 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                             <CopyButton value={order.latest_code} toastText="已复制验证码" />
                             <button
                               type="button"
-                              onClick={() => handleScrubOne(order.order_id)}
+                              onClick={() => setScrubTargetId(order.order_id)}
                               className="cursor-pointer rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-                              title="立即脱敏抹除该验证码"
+                              title="脱敏抹除该条验证码"
                             >
                               <ShieldOff className="h-3.5 w-3.5" />
                             </button>
@@ -530,15 +605,15 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                           <span className="text-slate-400">-</span>
                         )}
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="whitespace-nowrap px-4 py-3">
                         <StatusBadge status={order.status} refundState={order.refund_state} />
                         {order.error_message ? (
-                          <div className="mt-1 max-w-[200px] truncate text-[11px] text-slate-400" title={order.error_message}>
+                          <div className="mt-1 max-w-[190px] truncate text-[11px] text-slate-400" title={order.error_message}>
                             {order.error_message}
                           </div>
                         ) : null}
                       </td>
-                      <td className="font-mono-code px-4 py-3 text-slate-700">
+                      <td className="font-mono-code whitespace-nowrap px-4 py-3 text-slate-700">
                         {order.cost !== null
                           ? `${formatPrice(order.cost, order.currency)}${order.cost_is_estimated ? " (估)" : ""}`
                           : "-"}
@@ -551,7 +626,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
           </table>
         </div>
 
-        <div className="flex items-center justify-between border-t border-slate-100 px-4 py-3 text-xs text-slate-500">
+        <div className="flex items-center justify-between rounded-b-2xl border-t border-slate-100 px-4 py-3 text-xs text-slate-500">
           <span>
             共 <strong className="font-mono-code text-slate-800">{total}</strong> 条记录
           </span>
@@ -560,7 +635,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
               type="button"
               disabled={page <= 1}
               onClick={() => setPage((p) => Math.max(1, p - 1))}
-              className="cursor-pointer rounded-lg border border-slate-200 px-3 py-1 hover:bg-slate-50 disabled:opacity-40"
+              className="cursor-pointer rounded-lg border border-slate-200 bg-white px-3 py-1 hover:bg-slate-50 disabled:opacity-40"
             >
               上一页
             </button>
@@ -571,13 +646,24 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
               type="button"
               disabled={page >= totalPages}
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              className="cursor-pointer rounded-lg border border-slate-200 px-3 py-1 hover:bg-slate-50 disabled:opacity-40"
+              className="cursor-pointer rounded-lg border border-slate-200 bg-white px-3 py-1 hover:bg-slate-50 disabled:opacity-40"
             >
               下一页
             </button>
           </div>
         </div>
       </section>
+
+      <ConfirmModal
+        open={Boolean(scrubTargetId)}
+        title="确认脱敏抹除该条验证码？"
+        description={`将永久清空订单 ${scrubTargetId || ""} 中保存的短信验证码明文（操作不可撤销，订单金额与账本记录不受影响）。`}
+        confirmLabel="确认抹除"
+        danger
+        loading={scrubbingOne}
+        onConfirm={handleScrubConfirmed}
+        onCancel={() => setScrubTargetId(null)}
+      />
     </div>
   );
 }

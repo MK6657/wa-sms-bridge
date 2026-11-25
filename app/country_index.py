@@ -193,6 +193,12 @@ class GlobalCountryIndex:
                     provider.get("id"), provider.get("name"), provider.get("name_zh"), provider.get("cc"),
                     *(provider.get("aliases") or []),
                 ])
+            for variants in entry.get("provider_variants", {}).values():
+                for v in variants or []:
+                    fields.extend([
+                        v.get("id"), v.get("name"), v.get("name_zh"), v.get("cc"),
+                        *(v.get("aliases") or []),
+                    ])
             normalized = [normalize_name(value) for value in fields if value not in (None, "")]
             if any(q == value or q in value for value in normalized):
                 result.append({"iso": iso, **entry})

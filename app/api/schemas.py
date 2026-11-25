@@ -131,11 +131,45 @@ class AcquireStrategyRequest(BaseModel):
         return self
 
 
+ALLOWED_API_KEY_SCOPES = frozenset({
+    "*",
+    "orders:r",
+    "orders:w",
+    "orders:rw",
+    "prices:r",
+    "blacklist:r",
+    "blacklist:w",
+    "blacklist:rw",
+    "blacklist:global",
+    "events:r",
+    "wa:r",
+    "wa:w",
+    "wa:rw",
+})
+
+
+def _validate_scopes_list(scopes: Optional[list[str]]) -> Optional[list[str]]:
+    if scopes is None:
+        return None
+    cleaned: list[str] = []
+    for raw in scopes:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if "," in s or s not in ALLOWED_API_KEY_SCOPES:
+            raise ValueError(
+                f"无效的权限范围 '{s}'；允许值: {', '.join(sorted(ALLOWED_API_KEY_SCOPES))}"
+            )
+        if s not in cleaned:
+            cleaned.append(s)
+    return cleaned
+
+
 class CreateOrderRequest(BaseModel):
-    provider: str = Field(default="", description="接码平台 ID（省略时自动使用服务端配置的默认平台）")
-    service: str = Field(default="whatsapp", description="服务名（如 whatsapp/telegram/google/openai）或原生服务码")
-    country: str = Field(..., min_length=1, description="国家名（中/英）、ISO2、区号或平台国家 ID")
-    country_fallback: list[str] = Field(default_factory=list, description="备选国家列表")
+    provider: str = Field(default="", max_length=32, description="接码平台 ID（省略时自动使用服务端配置的默认平台）")
+    service: str = Field(default="whatsapp", min_length=1, max_length=64, description="服务名（如 whatsapp/telegram/google/openai）或原生服务码")
+    country: str = Field(..., min_length=1, max_length=64, description="国家名（中/英）、ISO2、区号或平台国家 ID")
+    country_fallback: list[str] = Field(default_factory=list, max_length=20, description="备选国家列表")
     strategy: AcquireStrategyRequest = Field(default_factory=AcquireStrategyRequest, description="价格与抢号策略")
     wait_timeout: int = Field(default=180, ge=30, le=1200, description="等待验证码超时秒数")
     skip_blacklisted: bool = Field(default=True, description="命中黑名单号码时自动退款重取")
@@ -186,6 +220,7 @@ class CreateApiKeyRequest(BaseModel):
         self.name = self.name.strip()
         if not self.name:
             raise ValueError("项目名称不能为空")
+        self.scopes = _validate_scopes_list(self.scopes)
         return self
 
 
@@ -215,6 +250,7 @@ class UpdateApiKeyRequest(BaseModel):
             self.name = self.name.strip()
             if not self.name:
                 raise ValueError("项目名称不能为空")
+        self.scopes = _validate_scopes_list(self.scopes)
         return self
 
 

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { AlertTriangle } from "lucide-react";
 
 interface ConfirmModalProps {
@@ -22,8 +22,11 @@ export function ConfirmModal({
   onConfirm,
   onCancel,
 }: ConfirmModalProps) {
+  const cancelBtnRef = useRef<HTMLButtonElement>(null);
+
   useEffect(() => {
     if (!open) return;
+    cancelBtnRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !loading) {
         onCancel();
@@ -42,7 +45,7 @@ export function ConfirmModal({
       onClick={() => {
         if (!loading) onCancel();
       }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs"
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/45 p-4 backdrop-blur-xs"
     >
       <div
         onClick={(e) => e.stopPropagation()}
@@ -61,6 +64,7 @@ export function ConfirmModal({
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <button
+            ref={cancelBtnRef}
             type="button"
             onClick={onCancel}
             disabled={loading}

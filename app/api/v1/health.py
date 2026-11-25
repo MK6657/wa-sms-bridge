@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
-from app.config import env
+from app.config import APP_VERSION, env
 from app.db import Database
 from app.dependencies import get_db, get_plugin_manager, get_registry
 from app.plugins.base import PluginManager
@@ -49,7 +49,7 @@ async def _build_readiness_response(
     payload = {
         "ok": db_ok,
         "service": "sms-hub",
-        "version": "1.0.0",
+        "version": APP_VERSION,
         "db": db_ok,
         "default_provider": default_provider,
         "default_country": default_country,

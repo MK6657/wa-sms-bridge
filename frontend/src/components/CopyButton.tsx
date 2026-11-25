@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
 import { copyToClipboard } from "../utils/format";
 import { useToast } from "./ToastProvider";
@@ -21,14 +21,22 @@ export function CopyButton({
   className = "",
 }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
   const { notify } = useToast();
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    };
+  }, []);
 
   const handleCopy = async () => {
     const ok = await copyToClipboard(value);
     if (ok) {
       setCopied(true);
       notify(toastText, "success");
-      window.setTimeout(() => setCopied(false), 1600);
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => setCopied(false), 1600);
     } else {
       notify("复制失败，请手动复制", "error");
     }
@@ -55,7 +63,7 @@ export function CopyButton({
       disabled={!value}
       title={label || toastText}
       aria-label={label || toastText}
-      className={`inline-flex cursor-pointer items-center font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${sizeClass} ${variantClass} ${className}`}
+      className={`inline-flex shrink-0 cursor-pointer items-center whitespace-nowrap font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${sizeClass} ${variantClass} ${className}`}
     >
       {copied ? (
         <Check className={size === "lg" ? "h-4 w-4" : "h-3.5 w-3.5"} />

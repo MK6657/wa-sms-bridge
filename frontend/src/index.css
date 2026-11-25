@@ -3,12 +3,65 @@
 @layer base {
   html {
     font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: #f3f5f9;
+    background-image:
+      radial-gradient(ellipse 80% 45% at 50% -12%, rgba(16, 185, 129, 0.065), transparent),
+      radial-gradient(ellipse 60% 35% at 88% 0%, rgba(99, 102, 241, 0.045), transparent);
   }
 
   .font-mono-code {
     font-family: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, Menlo, monospace;
     font-variant-numeric: tabular-nums;
   }
+
+  /* 隐藏原生数字输入框上下微调箭头，避免窄列挤压 */
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type="number"] {
+    -moz-appearance: textfield;
+  }
+}
+
+/* 统一卡片层次感与内嵌槽位 */
+.surface-card {
+  background: #ffffff;
+  border: 1px solid rgba(203, 213, 225, 0.72);
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.035),
+    0 8px 24px -10px rgba(15, 23, 42, 0.065),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.surface-well {
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.92) 0%, rgba(241, 245, 249, 0.65) 100%);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.025);
+}
+
+.input-surface {
+  background-color: #ffffff;
+  border: 1px solid rgba(203, 213, 225, 0.9);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+  transition: border-color 150ms ease, box-shadow 150ms ease, background-color 150ms ease;
+}
+
+.input-surface:hover:not(:disabled) {
+  border-color: #94a3b8;
+}
+
+.input-surface:focus,
+.input-surface:focus-within {
+  border-color: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.14), 0 1px 2px rgba(15, 23, 42, 0.03);
+  outline: none;
 }
 
 /* 精致的细滚动条 */

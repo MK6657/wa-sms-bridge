@@ -2,15 +2,21 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Ban,
   BookOpen,
+  ChevronLeft,
+  ChevronRight,
   ClipboardList,
   Code2,
+  Eye,
+  EyeOff,
   Lock,
   LogOut,
-  Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
   Radio,
+  RefreshCw,
   Settings,
   Smartphone,
-  X,
+  Wallet,
 } from "lucide-react";
 import { api, setUnauthorizedHandler } from "./api/client";
 import type { AuthStatusResponse, HealthResponse, SmsOrder, StatsResponse } from "./api/types";
@@ -25,24 +31,49 @@ import { ACTIVE_STATUSES, formatMoney, playCodeChime } from "./utils/format";
 
 type PageKey = "workbench" | "orders" | "integrations" | "blacklist" | "settings";
 
+const SIDEBAR_STORAGE_KEY = "sms-hub.sidebar.collapsed.v1";
+
 const NAV_ITEMS: Array<{ key: PageKey; label: string; subtitle: string; icon: typeof Smartphone }> = [
-  { key: "workbench", label: "接码工作台", subtitle: "实时取号、接收与复制验证码", icon: Smartphone },
-  { key: "orders", label: "订单与统计", subtitle: "历史接码台账、分项目与业务统计", icon: ClipboardList },
-  { key: "integrations", label: "API 接入中心", subtitle: "签发外部项目密钥、Webhook 与接入示例", icon: Code2 },
-  { key: "blacklist", label: "号码黑名单", subtitle: "自动跳过并退款废号", icon: Ban },
-  { key: "settings", label: "系统配置", subtitle: "SMSBower 平台密钥、留存策略与诊断日志", icon: Settings },
+  { key: "workbench", label: "接码工作台", subtitle: "实时取号、接收与一键复制验证码", icon: Smartphone },
+  { key: "orders", label: "订单与统计", subtitle: "历史接码台账、分项目与多维统计", icon: ClipboardList },
+  { key: "integrations", label: "API 接入中心", subtitle: "外部项目密钥、Webhook 投递与代码示例", icon: Code2 },
+  { key: "blacklist", label: "号码黑名单", subtitle: "自动跳过并退款历史废号", icon: Ban },
+  { key: "settings", label: "系统配置", subtitle: "接码平台密钥、留存脱敏策略与诊断日志", icon: Settings },
 ];
 
 function AppShell() {
   const { notify } = useToast();
   const [page, setPage] = useState<PageKey>("workbench");
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  // 管理员会话认证状态（修复 P0-01 / P1-08）
+  // 常驻可折叠侧边栏状态（支持随时展开/收起并记忆偏好）
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(SIDEBAR_STORAGE_KEY);
+      if (saved === "1" || saved === "0") return saved === "1";
+    } catch {
+      // ignore
+    }
+    return typeof window !== "undefined" ? window.innerWidth < 960 : false;
+  });
+
+  const toggleSidebar = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SIDEBAR_STORAGE_KEY, next ? "1" : "0");
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  };
+
+  // 管理员会话认证状态
   const [authReady, setAuthReady] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [isAdminSession, setIsAdminSession] = useState(false);
   const [loginPassword, setLoginPassword] = useState("");
+  const [showLoginPwd, setShowLoginPwd] = useState(false);
   const [loggingIn, setLoggingIn] = useState(false);
   const [loginError, setLoginError] = useState("");
 
@@ -61,7 +92,6 @@ function AppShell() {
     }
   });
 
-  // 初始化会话：若已设口令则要求登录；若本机直连未设口令则自动向服务端申请 HttpOnly Cookie（覆盖严格模式与 SSE）
   const initSession = useCallback(async () => {
     try {
       const status = await api.getAuthStatus();
@@ -135,20 +165,23 @@ function AppShell() {
     }
   }, []);
 
-  const loadBalance = useCallback(async (providerName?: string) => {
-    const prov = providerName || health?.default_provider || "smsbower";
-    setBalanceLoading(true);
-    setBalanceError("");
-    try {
-      const res = await api.getBalance(prov);
-      setBalance(res.balance);
-    } catch (err) {
-      setBalance(null);
-      setBalanceError(err instanceof Error ? err.message : "余额获取失败");
-    } finally {
-      setBalanceLoading(false);
-    }
-  }, [health?.default_provider]);
+  const loadBalance = useCallback(
+    async (providerName?: string) => {
+      const prov = providerName || health?.default_provider || "smsbower";
+      setBalanceLoading(true);
+      setBalanceError("");
+      try {
+        const res = await api.getBalance(prov);
+        setBalance(res.balance);
+      } catch (err) {
+        setBalance(null);
+        setBalanceError(err instanceof Error ? err.message : "余额获取失败");
+      } finally {
+        setBalanceLoading(false);
+      }
+    },
+    [health?.default_provider],
+  );
 
   const activeOrdersSeqRef = useRef(0);
   const loadActiveOrders = useCallback(async () => {
@@ -240,7 +273,6 @@ function AppShell() {
     [upsertOrder, soundEnabled, notify, loadStats, loadBalance],
   );
 
-  // P1-08 & 复核 P1-05: 会话就绪后建立 SSE，自动携带 last_event_id 续传并在游标过期或重连时刷新快照
   const handleStreamResync = useCallback(() => {
     loadActiveOrders();
     loadStats();
@@ -270,7 +302,7 @@ function AppShell() {
 
   if (!authReady) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-500">
+      <div className="flex min-h-screen items-center justify-center text-sm text-slate-500">
         正在验证控制台会话...
       </div>
     );
@@ -278,10 +310,10 @@ function AppShell() {
 
   if (!isAdminSession) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-50 p-4">
-        <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-lg">
+      <div className="flex min-h-screen items-center justify-center p-4">
+        <div className="surface-card w-full max-w-sm rounded-2xl p-6">
           <div className="mb-5 flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-600 text-white">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-sm">
               <Lock className="h-5 w-5" />
             </div>
             <div>
@@ -297,16 +329,26 @@ function AppShell() {
           {authStatus?.password_required ? (
             <form onSubmit={handleLogin} className="space-y-3.5">
               <div>
-                <label className="mb-1 block text-xs font-medium text-slate-700">管理员口令</label>
-                <input
-                  type="password"
-                  required
-                  autoFocus
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  placeholder="输入管理员口令"
-                  className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15"
-                />
+                <label className="mb-1.5 block text-xs font-medium text-slate-700">管理员口令</label>
+                <div className="relative">
+                  <input
+                    type={showLoginPwd ? "text" : "password"}
+                    required
+                    autoFocus
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    placeholder="输入管理员口令"
+                    className="input-surface w-full rounded-xl py-2.5 pl-3.5 pr-9 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginPwd((v) => !v)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 cursor-pointer rounded p-1 text-slate-400 hover:text-slate-700"
+                    title={showLoginPwd ? "隐藏口令" : "显示口令"}
+                  >
+                    {showLoginPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
               </div>
               {loginError ? (
                 <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
@@ -316,7 +358,7 @@ function AppShell() {
               <button
                 type="submit"
                 disabled={loggingIn}
-                className="w-full cursor-pointer rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-50"
+                className="w-full cursor-pointer rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white shadow-xs transition hover:bg-emerald-700 disabled:opacity-50"
               >
                 {loggingIn ? "验证中..." : "登录控制台"}
               </button>
@@ -334,147 +376,246 @@ function AppShell() {
   }
 
   const currentNav = NAV_ITEMS.find((n) => n.key === page) || NAV_ITEMS[0];
+  const CurrentNavIcon = currentNav.icon;
   const defaultProviderLabel = (health?.default_provider || "smsbower").toUpperCase();
-
-  const renderSidebarContent = () => (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center gap-3 border-b border-slate-800/80 px-4 py-4">
-        <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-emerald-500 font-mono-code text-sm font-black text-slate-950 shadow-sm">
-          SMS
-        </div>
-        <div className="min-w-0">
-          <div className="truncate text-sm font-bold text-white">SMS Hub</div>
-          <div className="truncate text-[11px] text-slate-400">独立接码中心 · v1.0</div>
-        </div>
-      </div>
-
-      <nav className="flex-1 space-y-1 p-3">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const active = page === item.key;
-          return (
-            <button
-              key={item.key}
-              type="button"
-              onClick={() => {
-                setPage(item.key);
-                setMobileMenuOpen(false);
-              }}
-              className={`flex w-full cursor-pointer items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm font-medium transition ${
-                active
-                  ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30"
-                  : "text-slate-300 hover:bg-slate-800/70 hover:text-white"
-              }`}
-            >
-              <span className="flex items-center gap-2.5">
-                <Icon className="h-4 w-4" />
-                <span>{item.label}</span>
-              </span>
-              {item.key === "workbench" && activeOrders.length > 0 ? (
-                <span className="rounded-full bg-emerald-500 px-1.5 py-0.5 font-mono-code text-[10px] font-bold text-slate-950">
-                  {activeOrders.length}
-                </span>
-              ) : null}
-            </button>
-          );
-        })}
-      </nav>
-
-      <div className="space-y-2.5 border-t border-slate-800/80 p-3.5 text-xs">
-        <div className="rounded-xl bg-slate-800/60 p-3">
-          <div className="flex items-center justify-between text-slate-400">
-            <span>默认平台</span>
-            <span className="font-semibold text-emerald-400">{defaultProviderLabel}</span>
-          </div>
-          <div className="mt-1.5 flex items-center justify-between text-slate-400">
-            <span>余额</span>
-            <span className="font-mono-code font-semibold text-white">
-              {balance !== null ? formatMoney(balance) : "-"}
-            </span>
-          </div>
-          <div className="mt-1.5 flex items-center justify-between text-slate-400">
-            <span>实时通道</span>
-            <span className={`inline-flex items-center gap-1 font-medium ${sseConnected ? "text-emerald-400" : "text-amber-400"}`}>
-              <span className={`h-1.5 w-1.5 rounded-full ${sseConnected ? "bg-emerald-400" : "bg-amber-400 animate-pulse"}`} />
-              {sseConnected ? "SSE 在线" : "重连中"}
-            </span>
-          </div>
-        </div>
-
-        <a
-          href="/docs"
-          target="_blank"
-          rel="noreferrer"
-          className="flex items-center justify-center gap-1.5 rounded-xl border border-slate-700/80 px-3 py-2 text-xs font-medium text-slate-300 transition hover:bg-slate-800 hover:text-white"
-        >
-          <BookOpen className="h-3.5 w-3.5" />
-          <span>OpenAPI 接口文档</span>
-        </a>
-
-        {authStatus?.password_required ? (
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-slate-700/80 px-3 py-2 text-xs font-medium text-slate-400 transition hover:bg-slate-800 hover:text-white"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-            <span>退出管理员登录</span>
-          </button>
-        ) : null}
-      </div>
-    </div>
-  );
+  const appVersion = health?.version ? `v${health.version}` : "v1.1.0";
 
   return (
-    <div className="flex min-h-screen bg-slate-50 text-slate-900">
-      <aside className="sticky top-0 hidden h-screen w-60 shrink-0 bg-slate-900 lg:block">
-        {renderSidebarContent()}
+    <div className="flex min-h-screen text-slate-900">
+      {/* 常驻左侧可伸缩导航栏（全视口保留，附悬浮边缘小箭头随时展开/收起） */}
+      <aside
+        className={`relative sticky top-0 z-30 flex h-screen shrink-0 flex-col border-r border-slate-800/90 bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950 text-slate-200 shadow-[4px_0_24px_-12px_rgba(15,23,42,0.45)] transition-[width] duration-200 ease-out ${
+          sidebarCollapsed ? "w-[70px]" : "w-[236px]"
+        }`}
+      >
+        {/* 侧边栏边缘伸缩控制小箭头 */}
+        <button
+          type="button"
+          onClick={toggleSidebar}
+          title={sidebarCollapsed ? "展开侧边导航栏" : "收起侧边导航栏"}
+          aria-label={sidebarCollapsed ? "展开侧边导航栏" : "收起侧边导航栏"}
+          className="absolute -right-3 top-6 z-40 flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border border-slate-700/90 bg-slate-900 text-slate-300 shadow-md transition hover:scale-110 hover:border-emerald-500 hover:bg-slate-800 hover:text-emerald-300"
+        >
+          {sidebarCollapsed ? (
+            <ChevronRight className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronLeft className="h-3.5 w-3.5" />
+          )}
+        </button>
+
+        {/* 品牌区 */}
+        <div
+          className={`flex h-16 shrink-0 items-center border-b border-slate-800/80 ${
+            sidebarCollapsed ? "justify-center px-2" : "gap-3 px-4"
+          }`}
+        >
+          <div
+            onClick={() => setPage("workbench")}
+            title="SMS Hub 独立接码中心"
+            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 to-emerald-600 font-mono-code text-xs font-black tracking-tight text-slate-950 shadow-[0_2px_10px_rgba(16,185,129,0.35)]"
+          >
+            SMS
+          </div>
+          {!sidebarCollapsed ? (
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="truncate text-sm font-bold tracking-tight text-white">SMS Hub</span>
+                <span className="font-mono-code rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400 ring-1 ring-inset ring-slate-700">
+                  {appVersion}
+                </span>
+              </div>
+              <div className="truncate text-[11px] text-slate-400">独立接码与 API 中心</div>
+            </div>
+          ) : null}
+        </div>
+
+        {/* 导航菜单区 */}
+        <nav className="flex-1 space-y-1.5 overflow-y-auto overflow-x-hidden px-2.5 py-3.5">
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            const active = page === item.key;
+            const showBadge = item.key === "workbench" && activeOrders.length > 0;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                title={sidebarCollapsed ? `${item.label} — ${item.subtitle}` : undefined}
+                onClick={() => setPage(item.key)}
+                className={`group relative flex w-full cursor-pointer items-center rounded-xl text-left text-sm font-medium transition ${
+                  sidebarCollapsed ? "justify-center px-0 py-2.5" : "justify-between px-3 py-2.5"
+                } ${
+                  active
+                    ? "bg-emerald-500/15 text-emerald-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] ring-1 ring-inset ring-emerald-500/35"
+                    : "text-slate-300/90 hover:bg-slate-800/75 hover:text-white"
+                }`}
+              >
+                {active ? (
+                  <span className="absolute left-0 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-emerald-400" />
+                ) : null}
+                <span className={`flex items-center ${sidebarCollapsed ? "justify-center" : "gap-2.5"}`}>
+                  <Icon className={`h-4 w-4 shrink-0 ${active ? "text-emerald-400" : "text-slate-400 group-hover:text-slate-200"}`} />
+                  {!sidebarCollapsed ? <span className="truncate">{item.label}</span> : null}
+                </span>
+
+                {showBadge ? (
+                  sidebarCollapsed ? (
+                    <span className="font-mono-code absolute right-1.5 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-500 px-1 text-[9px] font-bold text-slate-950 shadow-xs">
+                      {activeOrders.length}
+                    </span>
+                  ) : (
+                    <span className="font-mono-code rounded-full bg-emerald-500 px-1.5 py-0.5 text-[10px] font-bold text-slate-950">
+                      {activeOrders.length}
+                    </span>
+                  )
+                ) : null}
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* 底部平台状态与快捷入口 */}
+        <div className="shrink-0 space-y-2 border-t border-slate-800/80 p-2.5 text-xs">
+          {sidebarCollapsed ? (
+            <div className="flex flex-col items-center gap-2 py-1">
+              <div
+                title={`${defaultProviderLabel} · 余额 ${balance !== null ? formatMoney(balance) : "-"} · ${sseConnected ? "SSE 在线" : "SSE 重连中"}`}
+                className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-800/70 ring-1 ring-inset ring-slate-700/70"
+              >
+                <span
+                  className={`h-2.5 w-2.5 rounded-full ${
+                    sseConnected
+                      ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.7)]"
+                      : "bg-amber-400 animate-pulse"
+                  }`}
+                />
+              </div>
+              <a
+                href="/docs"
+                target="_blank"
+                rel="noreferrer"
+                title="OpenAPI 接口文档 (/docs)"
+                className="flex h-9 w-9 items-center justify-center rounded-xl border border-slate-800 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              >
+                <BookOpen className="h-4 w-4" />
+              </a>
+              {authStatus?.password_required ? (
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  title="退出管理员登录"
+                  className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-xl border border-slate-800 text-slate-400 transition hover:bg-rose-500/15 hover:text-rose-300"
+                >
+                  <LogOut className="h-4 w-4" />
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            <>
+              <div className="rounded-xl bg-slate-800/65 p-3 ring-1 ring-inset ring-slate-700/60">
+                <div className="flex items-center justify-between text-slate-400">
+                  <span>主活平台</span>
+                  <span className="font-mono-code font-semibold text-emerald-400">{defaultProviderLabel}</span>
+                </div>
+                <div className="mt-1.5 flex items-center justify-between text-slate-400">
+                  <span>可用余额</span>
+                  <span className="font-mono-code font-semibold text-white">
+                    {balance !== null ? formatMoney(balance) : "-"}
+                  </span>
+                </div>
+                <div className="mt-1.5 flex items-center justify-between text-slate-400">
+                  <span>推码通道</span>
+                  <span className={`inline-flex items-center gap-1.5 font-medium ${sseConnected ? "text-emerald-400" : "text-amber-400"}`}>
+                    <span className={`h-1.5 w-1.5 rounded-full ${sseConnected ? "bg-emerald-400" : "bg-amber-400 animate-pulse"}`} />
+                    {sseConnected ? "SSE 在线" : "重连中"}
+                  </span>
+                </div>
+              </div>
+
+              <a
+                href="/docs"
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-slate-700/80 bg-slate-900/60 px-3 py-2 text-xs font-medium text-slate-300 transition hover:border-slate-600 hover:bg-slate-800 hover:text-white"
+              >
+                <BookOpen className="h-3.5 w-3.5" />
+                <span>OpenAPI 接口文档</span>
+              </a>
+
+              {authStatus?.password_required ? (
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-slate-800 px-3 py-2 text-xs font-medium text-slate-400 transition hover:border-rose-500/30 hover:bg-rose-500/10 hover:text-rose-300"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  <span>退出管理员登录</span>
+                </button>
+              ) : null}
+            </>
+          )}
+        </div>
       </aside>
 
-      {mobileMenuOpen ? (
-        <div className="fixed inset-0 z-50 flex lg:hidden">
-          <div className="w-64 bg-slate-900 shadow-2xl">{renderSidebarContent()}</div>
-          <button
-            type="button"
-            className="flex-1 bg-slate-950/50 backdrop-blur-xs"
-            onClick={() => setMobileMenuOpen(false)}
-            aria-label="关闭菜单"
-          />
-        </div>
-      ) : null}
-
+      {/* 右侧主视图区域 */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-20 flex items-center justify-between gap-3 border-b border-slate-200 bg-white/90 px-4 py-3.5 backdrop-blur-md lg:px-7">
-          <div className="flex items-center gap-3">
+        <header className="sticky top-0 z-20 flex h-16 items-center justify-between gap-3 border-b border-slate-200/85 bg-white/85 px-4 shadow-[0_1px_2px_rgba(15,23,42,0.03)] backdrop-blur-md sm:px-6 lg:px-7">
+          <div className="flex min-w-0 items-center gap-3">
             <button
               type="button"
-              onClick={() => setMobileMenuOpen((v) => !v)}
-              className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-50 lg:hidden"
-              aria-label="菜单"
+              onClick={toggleSidebar}
+              title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+              className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-slate-200/90 bg-white text-slate-500 shadow-2xs transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-800"
             >
-              {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+              {sidebarCollapsed ? (
+                <PanelLeftOpen className="h-4 w-4" />
+              ) : (
+                <PanelLeftClose className="h-4 w-4" />
+              )}
             </button>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight text-slate-900">{currentNav.label}</h1>
-              <p className="text-xs text-slate-500">{currentNav.subtitle}</p>
+            <div className="hidden h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600 ring-1 ring-inset ring-emerald-200/70 sm:flex">
+              <CurrentNavIcon className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <h1 className="truncate text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                {currentNav.label}
+              </h1>
+              <p className="hidden truncate text-xs text-slate-500 sm:block">{currentNav.subtitle}</p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
+            {/* 顶栏快捷余额胶囊（侧边栏收起时也能随时查看并刷新余额） */}
+            <div className="inline-flex items-center gap-1.5 rounded-full border border-slate-200/90 bg-slate-50/90 px-2.5 py-1 text-xs shadow-2xs">
+              <Wallet className="h-3.5 w-3.5 text-emerald-600" />
+              <span className="hidden text-slate-500 md:inline">{defaultProviderLabel}</span>
+              <span className="font-mono-code font-semibold text-slate-900">
+                {balance !== null ? formatMoney(balance) : "-"}
+              </span>
+              <button
+                type="button"
+                onClick={() => loadBalance()}
+                disabled={balanceLoading}
+                title="刷新平台余额"
+                className="cursor-pointer rounded-full p-0.5 text-slate-400 transition hover:bg-white hover:text-slate-700 disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3 w-3 ${balanceLoading ? "animate-spin text-emerald-600" : ""}`} />
+              </button>
+            </div>
+
             <span
-              className={`hidden items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium sm:inline-flex ${
+              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium shadow-2xs ${
                 sseConnected
-                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                  : "border-amber-200 bg-amber-50 text-amber-700"
+                  ? "border-emerald-200/90 bg-emerald-50/90 text-emerald-700"
+                  : "border-amber-200/90 bg-amber-50/90 text-amber-700"
               }`}
             >
               <Radio className="h-3.5 w-3.5" />
-              {sseConnected ? "实时推码已连接" : "SSE 重连中"}
+              <span className="hidden sm:inline">{sseConnected ? "实时推码在线" : "SSE 重连中"}</span>
             </span>
           </div>
         </header>
 
-        <main className="mx-auto w-full max-w-7xl flex-1 p-4 lg:p-7">
+        <main className="@container mx-auto w-full max-w-[1360px] flex-1 p-4 sm:p-5 lg:p-7">
           <div className={page === "workbench" ? "block" : "hidden"}>
             <WorkbenchPage
               health={health}
@@ -496,7 +637,7 @@ function AppShell() {
             <OrdersPage stats={stats} maskInHistory={maskInHistory} onOrdersChanged={refreshCoreData} />
           ) : null}
           <div className={page === "integrations" ? "block" : "hidden"}>
-            <IntegrationsPage />
+            <IntegrationsPage active={page === "integrations"} />
           </div>
           {page === "blacklist" ? <BlacklistPage defaultProvider={health?.default_provider || "smsbower"} /> : null}
           {page === "settings" ? <SettingsPage onSettingsUpdated={refreshCoreData} /> : null}

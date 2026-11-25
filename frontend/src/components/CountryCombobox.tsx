@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, Search } from "lucide-react";
+import { Check, ChevronDown, Search } from "lucide-react";
 import type { CountryOption } from "../api/types";
 import { normCountryQuery } from "../utils/format";
+
+export { normCountryQuery };
 
 const POPULAR_ISO_ORDER = ["th", "id", "za", "ph", "vn", "in", "my", "us", "gb", "ru"];
 
@@ -26,8 +28,6 @@ interface CountryComboboxProps {
   placeholder?: string;
 }
 
-export { normCountryQuery };
-
 export function formatCountryDisplay(country: CountryOption | null): string {
   if (!country) return "";
   const primary = country.name_zh || country.name;
@@ -41,13 +41,14 @@ export function CountryCombobox({
   selected,
   onSelect,
   provider = "smsbower",
-  placeholder = "搜索国家（中文 / 英文 / ISO / 区号 / ID）",
+  placeholder = "搜索国家（中文 / 英文 / ISO / +区号 / #ID）",
 }: CountryComboboxProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [activeIdx, setActiveIdx] = useState(0);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const list = useMemo(() => {
     const merged = new Map<string, CountryOption>();
@@ -102,6 +103,12 @@ export function CountryCombobox({
   }, [query, open]);
 
   useEffect(() => {
+    if (open && itemRefs.current[activeIdx]) {
+      itemRefs.current[activeIdx]?.scrollIntoView({ block: "nearest" });
+    }
+  }, [open, activeIdx]);
+
+  useEffect(() => {
     const handleOutside = (e: MouseEvent) => {
       if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
         setOpen(false);
@@ -119,10 +126,27 @@ export function CountryCombobox({
     inputRef.current?.blur();
   };
 
+  const selectedIso = (selected?.iso || "").toUpperCase();
+
   return (
-    <div ref={wrapperRef} className="relative">
+    <div
+      ref={wrapperRef}
+      className="relative"
+      onBlur={(e) => {
+        if (open && !wrapperRef.current?.contains(e.relatedTarget as Node)) {
+          setOpen(false);
+          setQuery("");
+        }
+      }}
+    >
       <div className="relative">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+        {!open && selectedIso ? (
+          <span className="font-mono-code pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-600 ring-1 ring-inset ring-slate-200/80">
+            {selectedIso}
+          </span>
+        ) : (
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+        )}
         <input
           ref={inputRef}
           type="text"
@@ -146,6 +170,9 @@ export function CountryCombobox({
               setOpen(false);
               setQuery("");
               inputRef.current?.blur();
+            } else if (e.key === "Tab") {
+              setOpen(false);
+              setQuery("");
             } else if (e.key === "ArrowDown") {
               e.preventDefault();
               setActiveIdx((i) => Math.min(i + 1, Math.max(0, matches.length - 1)));
@@ -157,54 +184,66 @@ export function CountryCombobox({
               pick(matches[activeIdx]);
             }
           }}
-          placeholder={placeholder}
-          className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-9 text-sm text-slate-900 shadow-2xs outline-none transition placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15"
+          placeholder={open && selected ? `当前：${formatCountryDisplay(selected)}（输入关键字检索）` : placeholder}
+          className={`input-surface w-full rounded-xl py-2.5 pr-9 text-sm font-medium text-slate-900 placeholder:font-normal placeholder:text-slate-400 ${
+            !open && selectedIso ? "pl-11" : "pl-9"
+          }`}
         />
         <ChevronDown
-          className={`pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400 transition-transform ${open ? "rotate-180" : ""}`}
+          className={`pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400 transition-transform ${open ? "rotate-180 text-emerald-600" : ""}`}
         />
       </div>
 
       {open && (
-        <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-30 max-h-72 overflow-y-auto rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl">
+        <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-40 max-h-72 overflow-y-auto rounded-xl border border-slate-200/95 bg-white p-1.5 shadow-[0_12px_32px_-8px_rgba(15,23,42,0.18),0_2px_6px_rgba(15,23,42,0.06)]">
           {matches.length === 0 ? (
             <div className="px-3 py-6 text-center text-xs text-slate-400">
-              未找到匹配国家，支持输入中文、英文、ISO 或 SMSBower ID
+              未找到匹配国家，支持输入中文、英文、ISO、+区号 或 #ID
             </div>
           ) : (
             matches.map((c, idx) => {
-              const isSelected = selected && String(selected.id) === String(c.id);
+              const isSelected = Boolean(selected && String(selected.id) === String(c.id));
               const isActive = idx === activeIdx;
+              const iso = (c.iso || "").toUpperCase();
               return (
                 <button
                   key={`${c.id}-${c.iso}`}
+                  ref={(el) => {
+                    itemRefs.current[idx] = el;
+                  }}
                   type="button"
                   onMouseDown={(e) => {
                     e.preventDefault();
                     pick(c);
                   }}
                   onMouseEnter={() => setActiveIdx(idx)}
-                  className={`flex w-full cursor-pointer items-center justify-between rounded-lg px-2.5 py-2 text-left text-sm transition ${
+                  className={`flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${
                     isActive
-                      ? "bg-emerald-50 text-emerald-950"
+                      ? "bg-emerald-50/90 text-emerald-950"
                       : isSelected
-                        ? "bg-slate-50 text-slate-900"
+                        ? "bg-slate-50 font-semibold text-slate-900"
                         : "text-slate-700 hover:bg-slate-50"
                   }`}
                 >
-                  <div className="min-w-0">
-                    <div className="truncate font-medium">
-                      {c.name_zh || c.name}
+                  <div className="flex min-w-0 items-center gap-2">
+                    {iso ? (
+                      <span className="font-mono-code shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-600">
+                        {iso}
+                      </span>
+                    ) : null}
+                    <div className="min-w-0 truncate">
+                      <span className="font-medium text-slate-900">{c.name_zh || c.name}</span>
                       {c.name_zh && c.name && c.name_zh !== c.name ? (
-                        <span className="ml-1.5 text-xs font-normal text-slate-400">{c.name}</span>
+                        <span className="ml-1.5 text-[11px] font-normal text-slate-400">{c.name}</span>
                       ) : null}
                     </div>
                   </div>
-                  <div className="ml-2 flex shrink-0 items-center gap-1.5 font-mono-code text-xs text-slate-500">
+                  <div className="flex shrink-0 items-center gap-1.5 font-mono-code text-[11px] text-slate-500">
                     {c.cc ? <span>+{c.cc}</span> : null}
-                    <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">
+                    <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
                       #{c.id}
                     </span>
+                    {isSelected ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : null}
                   </div>
                 </button>
               );

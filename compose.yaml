@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: wa-sms-bridge:v1.0.0
+    image: wa-sms-bridge:v1.1.0
     container_name: wa-sms-bridge
     environment:
       ACTIVE_PROVIDERS: ${ACTIVE_PROVIDERS:-smsbower}

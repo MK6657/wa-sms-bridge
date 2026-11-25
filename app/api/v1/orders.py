@@ -38,7 +38,7 @@ ORDER_CREATE_RESPONSES = {
 async def create_order(
     req: CreateOrderRequest,
     response: Response,
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
     caller: CallerContext = Depends(get_caller),
     order_service: OrderService = Depends(get_order_service),
 ):

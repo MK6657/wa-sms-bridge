@@ -426,6 +426,14 @@ class HeroSmsProvider(BaseSmsProvider):
             return "completed"
         raise SmsProviderError(f"HeroSMS 完成失败: {text[:100]}")
 
+    async def complete_activation_structured(self, activation_id: str):
+        from app.providers.base import ActionOutcome, parse_complete_outcome
+        try:
+            raw = await self._get(action="setStatus", id=activation_id, status="6")
+            return parse_complete_outcome(raw)
+        except Exception as exc:
+            return ActionOutcome(ok=False, status="error", retryable=True, raw=str(exc))
+
     async def poll_sms_code(self, activation_id: str, timeout: int = 180) -> str:
         intervals = [3] * 12 + [5] * 12 + [8] * 15
         start = asyncio.get_running_loop().time()

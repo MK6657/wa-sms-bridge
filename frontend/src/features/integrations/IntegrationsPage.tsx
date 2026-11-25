@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   BookOpen,
+  Check,
   Code2,
   Edit3,
   ExternalLink,
+  Eye,
+  EyeOff,
   KeyRound,
   Plus,
   RefreshCw,
@@ -17,13 +20,29 @@ import { api } from "../../api/client";
 import type { ProjectApiKey, WebhookDeliveryItem } from "../../api/types";
 import { ConfirmModal } from "../../components/ConfirmModal";
 import { CopyButton } from "../../components/CopyButton";
+import { CustomSelect, type SelectOption } from "../../components/CustomSelect";
 import { useToast } from "../../components/ToastProvider";
 import { formatDateTime, formatFinancialSummary } from "../../utils/format";
 
 type CodeTab = "curl" | "python" | "node" | "sse";
-const ALL_SCOPES = ["orders:rw", "prices:r", "blacklist:rw", "events:r"] as const;
 
-export function IntegrationsPage() {
+const SCOPE_META: Array<{ id: string; label: string }> = [
+  { id: "orders:rw", label: "订单读写" },
+  { id: "prices:r", label: "价格查询" },
+  { id: "blacklist:rw", label: "私有黑名单" },
+  { id: "events:r", label: "SSE 实时流" },
+];
+
+const DELIVERY_STATUS_OPTIONS: SelectOption[] = [
+  { value: "", label: "全部投递状态" },
+  { value: "delivered", label: "已送达 (delivered)", dotColor: "bg-emerald-500" },
+  { value: "pending", label: "等待重试 (pending)", dotColor: "bg-amber-500" },
+  { value: "delivering", label: "投递中 (delivering)", dotColor: "bg-sky-500" },
+  { value: "failed", label: "投递失败 (failed)", dotColor: "bg-rose-500" },
+  { value: "scrubbed", label: "已脱敏取消 (scrubbed)", dotColor: "bg-slate-400" },
+];
+
+export function IntegrationsPage({ active = true }: { active?: boolean }) {
   const { notify } = useToast();
   const [keys, setKeys] = useState<ProjectApiKey[]>([]);
   const [authRequired, setAuthRequired] = useState(false);
@@ -35,6 +54,7 @@ export function IntegrationsPage() {
   const [newProjectId, setNewProjectId] = useState("");
   const [newWebhookUrl, setNewWebhookUrl] = useState("");
   const [newWebhookSecret, setNewWebhookSecret] = useState("");
+  const [showNewSecret, setShowNewSecret] = useState(false);
   const [creating, setCreating] = useState(false);
   const [justCreatedKey, setJustCreatedKey] = useState<{ project_id: string; name: string; api_key: string } | null>(null);
 
@@ -43,6 +63,7 @@ export function IntegrationsPage() {
   const [editName, setEditName] = useState("");
   const [editWebhookUrl, setEditWebhookUrl] = useState("");
   const [editWebhookSecret, setEditWebhookSecret] = useState("");
+  const [showEditSecret, setShowEditSecret] = useState(false);
   const [editScopes, setEditScopes] = useState<string[]>([]);
   const [savingEdit, setSavingEdit] = useState(false);
 
@@ -54,6 +75,7 @@ export function IntegrationsPage() {
 
   // Webhook Outbox 投递日志
   const [deliveries, setDeliveries] = useState<WebhookDeliveryItem[]>([]);
+  const [deliveryStatus, setDeliveryStatus] = useState("");
   const [loadingDeliveries, setLoadingDeliveries] = useState(false);
 
   const [codeTab, setCodeTab] = useState<CodeTab>("python");
@@ -64,14 +86,14 @@ export function IntegrationsPage() {
   const loadDeliveries = useCallback(async () => {
     setLoadingDeliveries(true);
     try {
-      const res = await api.listWebhookDeliveries({ limit: 30 });
+      const res = await api.listWebhookDeliveries({ status: deliveryStatus || undefined, limit: 30 });
       setDeliveries(res.items);
     } catch {
       // ignore initial error
     } finally {
       setLoadingDeliveries(false);
     }
-  }, []);
+  }, [deliveryStatus]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -87,9 +109,11 @@ export function IntegrationsPage() {
   }, [notify]);
 
   useEffect(() => {
-    load();
-    loadDeliveries();
-  }, [load, loadDeliveries]);
+    if (active) {
+      load();
+      loadDeliveries();
+    }
+  }, [active, load, loadDeliveries]);
 
   const toggleAuthMode = async () => {
     const next = !authRequired;
@@ -146,11 +170,13 @@ export function IntegrationsPage() {
   };
 
   const startEdit = (item: ProjectApiKey) => {
+    setShowCreate(false);
     setEditingItem(item);
     setEditName(item.name);
     setEditWebhookUrl(item.default_webhook_url || "");
     setEditWebhookSecret("");
-    setEditScopes(Array.isArray(item.scopes) ? [...item.scopes] : [...ALL_SCOPES]);
+    setShowEditSecret(false);
+    setEditScopes(Array.isArray(item.scopes) ? [...item.scopes] : SCOPE_META.map((s) => s.id));
   };
 
   const handleSaveEdit = async (e: React.FormEvent) => {
@@ -332,36 +358,47 @@ es.addEventListener("order.expired", (ev) => {
   return (
     <div className="space-y-5">
       {/* 顶部鉴权开关与 Swagger 入口 */}
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
-        <section className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-2xs">
-          <div className="flex items-start gap-3">
-            <div className="rounded-xl bg-indigo-50 p-2.5 text-indigo-600">
+      <div className="grid gap-4 @4xl:grid-cols-[minmax(0,1fr)_300px]">
+        <section className="surface-card flex flex-wrap items-center justify-between gap-4 rounded-2xl p-5">
+          <div className="flex min-w-0 flex-1 items-start gap-3">
+            <div className="rounded-xl bg-indigo-50 p-2.5 text-indigo-600 ring-1 ring-inset ring-indigo-200/70">
               <Shield className="h-5 w-5" />
             </div>
-            <div>
-              <h2 className="text-sm font-semibold text-slate-900">对外 API 鉴权策略</h2>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-sm font-bold text-slate-900">对外 API 鉴权策略</h2>
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1 ring-inset ${
+                    authRequired
+                      ? "bg-indigo-50 text-indigo-700 ring-indigo-200"
+                      : "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                  }`}
+                >
+                  {authRequired ? "严格鉴权已开启" : "本机宽松调试"}
+                </span>
+              </div>
               <p className="mt-1 text-xs leading-relaxed text-slate-500">
                 {authRequired
-                  ? "严格模式：外部调用 /api/v1/* 必须携带合法项目 X-API-Key 或 Bearer Token（Web 工作台不受影响）。"
-                  : "宽松模式：本机或内网可直接免密调试；携带项目 API Key 时自动按项目归属隔离订单并统计消费。"}
+                  ? "外部调用 /api/v1/* 必须携带合法项目 X-API-Key 或 Bearer Token（Web 工作台不受影响）。"
+                  : "本机回环可直接免密调试；携带项目 API Key 时自动按项目归属隔离订单并独立记账。"}
               </p>
             </div>
           </div>
           <button
             type="button"
             onClick={toggleAuthMode}
-            className={`cursor-pointer rounded-xl px-4 py-2 text-xs font-semibold transition ${
+            className={`shrink-0 cursor-pointer rounded-xl px-4 py-2 text-xs font-semibold transition ${
               authRequired
-                ? "bg-indigo-600 text-white hover:bg-indigo-700"
-                : "border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100"
+                ? "border border-slate-200 bg-white text-slate-700 shadow-2xs hover:bg-slate-50"
+                : "bg-indigo-600 text-white shadow-xs hover:bg-indigo-700"
             }`}
           >
-            {authRequired ? "当前：严格模式（点击切换）" : "当前：宽松模式（点击开启严格鉴权）"}
+            {authRequired ? "切回宽松模式" : "开启严格鉴权"}
           </button>
         </section>
 
-        <section className="flex flex-col justify-between rounded-2xl border border-slate-200 bg-white p-5 shadow-2xs">
-          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+        <section className="surface-card flex flex-col justify-between rounded-2xl p-5">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
             <BookOpen className="h-4 w-4 text-emerald-600" />
             <span>OpenAPI 3.1 交互文档</span>
           </div>
@@ -380,11 +417,11 @@ es.addEventListener("order.expired", (ev) => {
         </section>
       </div>
 
-      {/* 新创建密钥的一次性明文提示框 */}
+      {/* 新创建或轮转密钥的一次性明文提示框 */}
       {justCreatedKey ? (
         <div className="rounded-2xl border border-emerald-300 bg-emerald-50 p-4 shadow-xs">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
+            <div className="min-w-0 flex-1">
               <div className="text-xs font-semibold text-emerald-800">
                 项目「{justCreatedKey.name}」({justCreatedKey.project_id}) 密钥已生成 — 明文仅此一次展示，请立即保存！
               </div>
@@ -392,12 +429,12 @@ es.addEventListener("order.expired", (ev) => {
                 {justCreatedKey.api_key}
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <CopyButton value={justCreatedKey.api_key} label="复制密钥" variant="emerald" size="md" />
               <button
                 type="button"
                 onClick={() => setJustCreatedKey(null)}
-                className="cursor-pointer rounded-lg border border-emerald-200 bg-white px-3 py-1.5 text-xs text-emerald-800 hover:bg-emerald-100"
+                className="cursor-pointer rounded-lg border border-emerald-200 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
               >
                 我已保存
               </button>
@@ -407,19 +444,22 @@ es.addEventListener("order.expired", (ev) => {
       ) : null}
 
       {/* 项目 API Key 列表 */}
-      <section className="rounded-2xl border border-slate-200 bg-white shadow-xs">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 p-4">
+      <section className="surface-card rounded-2xl">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-t-2xl border-b border-slate-200/75 bg-slate-50/70 p-4">
           <div className="flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-indigo-600" />
-            <h2 className="text-sm font-semibold text-slate-900">已接入项目与密钥</h2>
-            <span className="rounded-full bg-slate-100 px-2 py-0.5 font-mono-code text-xs text-slate-600">
+            <h2 className="text-sm font-bold text-slate-900">已接入项目与密钥</h2>
+            <span className="font-mono-code rounded-full bg-slate-200/80 px-2 py-0.5 text-xs font-semibold text-slate-700">
               {keys.length}
             </span>
           </div>
           <button
             type="button"
-            onClick={() => setShowCreate((v) => !v)}
-            className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-indigo-700"
+            onClick={() => {
+              setEditingItem(null);
+              setShowCreate((v) => !v);
+            }}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white shadow-xs transition hover:bg-indigo-700"
           >
             <Plus className="h-3.5 w-3.5" />
             <span>新建接入项目密钥</span>
@@ -427,8 +467,8 @@ es.addEventListener("order.expired", (ev) => {
         </div>
 
         {showCreate ? (
-          <form onSubmit={handleCreate} className="border-b border-slate-100 bg-slate-50/70 p-4">
-            <div className="grid gap-3 sm:grid-cols-2">
+          <form onSubmit={handleCreate} className="border-b border-slate-200/75 bg-slate-50/60 p-4">
+            <div className="grid gap-3 @2xl:grid-cols-2">
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-700">项目名称 *</label>
                 <input
@@ -437,7 +477,7 @@ es.addEventListener("order.expired", (ev) => {
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
                   placeholder="例如：Telegram 注册机 / Google 自动化"
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-indigo-500"
+                  className="input-surface w-full rounded-xl px-3 py-2 text-xs"
                 />
               </div>
               <div>
@@ -447,7 +487,7 @@ es.addEventListener("order.expired", (ev) => {
                   value={newProjectId}
                   onChange={(e) => setNewProjectId(e.target.value)}
                   placeholder="留空自动生成，如 tg_bot"
-                  className="font-mono-code w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-indigo-500"
+                  className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
                 />
               </div>
               <div>
@@ -457,18 +497,27 @@ es.addEventListener("order.expired", (ev) => {
                   value={newWebhookUrl}
                   onChange={(e) => setNewWebhookUrl(e.target.value)}
                   placeholder="https://hooks.example.com/sms"
-                  className="font-mono-code w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-indigo-500"
+                  className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
                 />
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-700">Webhook 签名密钥（可选 HMAC-SHA256）</label>
-                <input
-                  type="text"
-                  value={newWebhookSecret}
-                  onChange={(e) => setNewWebhookSecret(e.target.value)}
-                  placeholder="用于校验 X-SMS-Signature 请求头"
-                  className="font-mono-code w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-indigo-500"
-                />
+                <div className="relative">
+                  <input
+                    type={showNewSecret ? "text" : "password"}
+                    value={newWebhookSecret}
+                    onChange={(e) => setNewWebhookSecret(e.target.value)}
+                    placeholder="用于校验 X-SMS-Signature 请求头"
+                    className="input-surface font-mono-code w-full rounded-xl py-2 pl-3 pr-9 text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowNewSecret((v) => !v)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 cursor-pointer rounded p-0.5 text-slate-400 hover:text-slate-700"
+                  >
+                    {showNewSecret ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
               </div>
             </div>
             <div className="mt-3 flex justify-end gap-2">
@@ -491,11 +540,11 @@ es.addEventListener("order.expired", (ev) => {
         ) : null}
 
         {editingItem ? (
-          <form onSubmit={handleSaveEdit} className="border-b border-indigo-100 bg-indigo-50/40 p-4">
-            <div className="mb-2 text-xs font-semibold text-indigo-900">
+          <form onSubmit={handleSaveEdit} className="border-b border-indigo-100 bg-indigo-50/45 p-4">
+            <div className="mb-2.5 text-xs font-semibold text-indigo-950">
               编辑项目「{editingItem.name}」({editingItem.project_id})
             </div>
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-3 @3xl:grid-cols-3">
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-700">项目名称</label>
                 <input
@@ -503,7 +552,7 @@ es.addEventListener("order.expired", (ev) => {
                   required
                   value={editName}
                   onChange={(e) => setEditName(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-indigo-500"
+                  className="input-surface w-full rounded-xl px-3 py-2 text-xs"
                 />
               </div>
               <div>
@@ -513,40 +562,55 @@ es.addEventListener("order.expired", (ev) => {
                   value={editWebhookUrl}
                   onChange={(e) => setEditWebhookUrl(e.target.value)}
                   placeholder="https://hooks.example.com/sms"
-                  className="font-mono-code w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-indigo-500"
+                  className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
                 />
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-700">更换签名密钥（留空保持不变）</label>
-                <input
-                  type="text"
-                  value={editWebhookSecret}
-                  onChange={(e) => setEditWebhookSecret(e.target.value)}
-                  placeholder={editingItem.has_webhook_secret ? "已设置签名密钥，留空保持不变" : "可选 HMAC-SHA256 密钥"}
-                  className="font-mono-code w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs outline-none focus:border-indigo-500"
-                />
+                <div className="relative">
+                  <input
+                    type={showEditSecret ? "text" : "password"}
+                    value={editWebhookSecret}
+                    onChange={(e) => setEditWebhookSecret(e.target.value)}
+                    placeholder={editingItem.has_webhook_secret ? "已设置签名密钥，留空保持不变" : "可选 HMAC-SHA256 密钥"}
+                    className="input-surface font-mono-code w-full rounded-xl py-2 pl-3 pr-9 text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowEditSecret((v) => !v)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 cursor-pointer rounded p-0.5 text-slate-400 hover:text-slate-700"
+                  >
+                    {showEditSecret ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
               </div>
             </div>
             <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-2 text-xs">
+              <div className="flex flex-wrap items-center gap-1.5 text-xs">
                 <span className="font-medium text-slate-600">接口权限：</span>
-                {ALL_SCOPES.map((sc) => {
-                  const checked = editScopes.includes(sc);
+                {SCOPE_META.map((sc) => {
+                  const checked = editScopes.includes(sc.id);
                   return (
-                    <label key={sc} className="inline-flex cursor-pointer items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setEditScopes((prev) => [...new Set([...prev, sc])]);
-                          } else {
-                            setEditScopes((prev) => prev.filter((x) => x !== sc));
-                          }
-                        }}
-                      />
-                      <span className="font-mono-code text-[11px]">{sc}</span>
-                    </label>
+                    <button
+                      key={sc.id}
+                      type="button"
+                      onClick={() => {
+                        if (checked) {
+                          setEditScopes((prev) => prev.filter((x) => x !== sc.id));
+                        } else {
+                          setEditScopes((prev) => [...new Set([...prev, sc.id])]);
+                        }
+                      }}
+                      className={`inline-flex cursor-pointer items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition ${
+                        checked
+                          ? "border-emerald-500 bg-emerald-50 text-emerald-800 shadow-2xs"
+                          : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                      }`}
+                    >
+                      {checked ? <Check className="h-3 w-3 text-emerald-600" /> : null}
+                      <span>{sc.label}</span>
+                      <span className="font-mono-code text-[10px] opacity-70">({sc.id})</span>
+                    </button>
                   );
                 })}
               </div>
@@ -573,8 +637,8 @@ es.addEventListener("order.expired", (ev) => {
         <div className="overflow-x-auto">
           <table className="w-full min-w-[760px] border-collapse text-left text-xs">
             <thead>
-              <tr className="border-b border-slate-100 bg-slate-50/70 text-slate-500">
-                <th className="px-4 py-3 font-medium">项目</th>
+              <tr className="border-b border-slate-100 bg-slate-50/50 text-slate-500">
+                <th className="px-4 py-3 font-medium">项目 / 权限</th>
                 <th className="px-4 py-3 font-medium">密钥前缀</th>
                 <th className="px-4 py-3 font-medium">默认 Webhook</th>
                 <th className="px-4 py-3 font-medium">累计调用 / 消费</th>
@@ -592,28 +656,49 @@ es.addEventListener("order.expired", (ev) => {
                 </tr>
               ) : (
                 keys.map((item) => (
-                  <tr key={item.project_id} className="hover:bg-slate-50/60">
+                  <tr key={item.project_id} className="transition hover:bg-slate-50/70">
                     <td className="px-4 py-3">
                       <div className="font-semibold text-slate-900">{item.name}</div>
                       <div className="font-mono-code text-[11px] text-slate-400">{item.project_id}</div>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {item.scopes && item.scopes.length > 0 ? (
+                          item.scopes.map((sc) => (
+                            <span
+                              key={sc}
+                              className="font-mono-code rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600"
+                            >
+                              {sc}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="rounded bg-rose-50 px-1.5 py-0.5 text-[10px] text-rose-600">无权限</span>
+                        )}
+                      </div>
                     </td>
-                    <td className="font-mono-code px-4 py-3 text-slate-700">{item.key_prefix}••••</td>
+                    <td className="font-mono-code whitespace-nowrap px-4 py-3 text-slate-700">{item.key_prefix}••••</td>
                     <td className="px-4 py-3">
                       {item.default_webhook_url ? (
-                        <div className="flex items-center gap-1.5">
-                          <Webhook className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                          <span className="font-mono-code max-w-[200px] truncate text-slate-600" title={item.default_webhook_url}>
-                            {item.default_webhook_url}
-                          </span>
-                          <button
-                            type="button"
-                            disabled={testingWebhookId === item.project_id}
-                            onClick={() => handleTestWebhook(item)}
-                            className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-slate-200 px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-100"
-                          >
-                            <Send className="h-3 w-3" />
-                            测试
-                          </button>
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-1.5">
+                            <Webhook className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                            <span className="font-mono-code max-w-[190px] truncate text-slate-600" title={item.default_webhook_url}>
+                              {item.default_webhook_url}
+                            </span>
+                            <button
+                              type="button"
+                              disabled={testingWebhookId === item.project_id}
+                              onClick={() => handleTestWebhook(item)}
+                              className="inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-100"
+                            >
+                              <Send className="h-3 w-3" />
+                              测试
+                            </button>
+                          </div>
+                          {item.has_webhook_secret ? (
+                            <span className="inline-block rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-200/70">
+                              HMAC 签名已配
+                            </span>
+                          ) : null}
                         </div>
                       ) : (
                         <span className="text-slate-400">未配置</span>
@@ -624,7 +709,7 @@ es.addEventListener("order.expired", (ev) => {
                         const fin = formatFinancialSummary(item);
                         return (
                           <div>
-                            <div>
+                            <div className="whitespace-nowrap">
                               收码 {item.received_count ?? 0}/{item.order_count ?? 0} ·{" "}
                               <strong>{fin.primary}</strong>
                             </div>
@@ -642,10 +727,10 @@ es.addEventListener("order.expired", (ev) => {
                         );
                       })()}
                     </td>
-                    <td className="font-mono-code px-4 py-3 text-slate-500">
+                    <td className="font-mono-code whitespace-nowrap px-4 py-3 text-slate-500">
                       {item.last_used_at ? formatDateTime(item.last_used_at) : "尚未使用"}
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="whitespace-nowrap px-4 py-3">
                       <button
                         type="button"
                         onClick={() => handleToggleEnabled(item)}
@@ -658,7 +743,7 @@ es.addEventListener("order.expired", (ev) => {
                         {item.enabled ? "已启用" : "已停用"}
                       </button>
                     </td>
-                    <td className="px-4 py-3 text-right">
+                    <td className="whitespace-nowrap px-4 py-3 text-right">
                       <div className="inline-flex items-center gap-1">
                         <button
                           type="button"
@@ -695,13 +780,13 @@ es.addEventListener("order.expired", (ev) => {
       </section>
 
       {/* 即拷即用接入代码示例 */}
-      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs">
+      <section className="surface-card rounded-2xl p-5">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <Code2 className="h-4 w-4 text-emerald-600" />
-            <h2 className="text-sm font-semibold text-slate-900">新项目接入代码模板</h2>
+            <h2 className="text-sm font-bold text-slate-900">新项目接入代码模板</h2>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <div className="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-0.5 text-xs">
               {(
                 [
@@ -727,73 +812,94 @@ es.addEventListener("order.expired", (ev) => {
           </div>
         </div>
 
-        <pre className="font-mono-code overflow-x-auto rounded-xl bg-slate-900 p-4 text-xs leading-relaxed text-slate-100">
+        <pre className="font-mono-code overflow-x-auto rounded-xl bg-slate-900 p-4 text-xs leading-relaxed text-slate-100 shadow-inner">
           <code>{snippets[codeTab]}</code>
         </pre>
       </section>
 
       {/* Webhook Outbox 投递状态 */}
-      <section className="rounded-2xl border border-slate-200 bg-white shadow-xs">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 p-4">
+      <section className="surface-card rounded-2xl">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-t-2xl border-b border-slate-200/75 bg-slate-50/70 p-4">
           <div className="flex items-center gap-2">
             <Webhook className="h-4 w-4 text-indigo-600" />
-            <h2 className="text-sm font-semibold text-slate-900">最近 Webhook 投递记录</h2>
-            <span className="rounded-full bg-slate-100 px-2 py-0.5 font-mono-code text-xs text-slate-600">
+            <h2 className="text-sm font-bold text-slate-900">最近 Webhook 投递记录</h2>
+            <span className="font-mono-code rounded-full bg-slate-200/80 px-2 py-0.5 text-xs font-semibold text-slate-700">
               {deliveries.length}
             </span>
           </div>
-          <button
-            type="button"
-            onClick={loadDeliveries}
-            disabled={loadingDeliveries}
-            className="inline-flex cursor-pointer items-center gap-1 rounded-xl border border-slate-200 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loadingDeliveries ? "animate-spin" : ""}`} />
-            刷新投递状态
-          </button>
+          <div className="flex items-center gap-2">
+            <CustomSelect
+              value={deliveryStatus}
+              onChange={setDeliveryStatus}
+              options={DELIVERY_STATUS_OPTIONS}
+              size="sm"
+              align="right"
+              activeHighlight={Boolean(deliveryStatus)}
+              minMenuWidth={210}
+              className="w-44"
+            />
+            <button
+              type="button"
+              onClick={loadDeliveries}
+              disabled={loadingDeliveries}
+              className="inline-flex cursor-pointer items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-2xs hover:bg-slate-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${loadingDeliveries ? "animate-spin text-emerald-600" : ""}`} />
+              刷新
+            </button>
+          </div>
         </div>
         {deliveries.length === 0 ? (
-          <div className="px-4 py-6 text-center text-xs text-slate-400">
-            {loadingDeliveries ? "加载中..." : "暂无 Webhook 回调投递记录"}
+          <div className="px-4 py-8 text-center text-xs text-slate-400">
+            {loadingDeliveries ? "加载中..." : "暂无匹配的 Webhook 回调投递记录"}
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[680px] border-collapse text-left text-xs">
               <thead>
-                <tr className="border-b border-slate-100 bg-slate-50/70 text-slate-500">
+                <tr className="border-b border-slate-100 bg-slate-50/50 text-slate-500">
                   <th className="px-4 py-2.5 font-medium">时间</th>
                   <th className="px-4 py-2.5 font-medium">项目 / 订单</th>
                   <th className="px-4 py-2.5 font-medium">事件</th>
                   <th className="px-4 py-2.5 font-medium">目标 URL</th>
-                  <th className="px-4 py-2.5 font-medium">状态 / 重试</th>
+                  <th className="px-4 py-2.5 font-medium">状态 / HTTP / 重试</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {deliveries.map((d) => (
                   <tr key={d.delivery_id} className="hover:bg-slate-50/60">
-                    <td className="font-mono-code px-4 py-2.5 text-slate-500">{formatDateTime(d.updated_at || d.created_at)}</td>
-                    <td className="font-mono-code px-4 py-2.5 text-slate-700">
+                    <td className="font-mono-code whitespace-nowrap px-4 py-2.5 text-slate-500">
+                      {formatDateTime(d.updated_at || d.created_at)}
+                    </td>
+                    <td className="font-mono-code whitespace-nowrap px-4 py-2.5 text-slate-700">
                       <div>{d.project_id || "web-console"}</div>
                       <div className="text-[11px] text-slate-400">{d.order_id}</div>
                     </td>
-                    <td className="font-mono-code px-4 py-2.5 text-slate-800">{d.event_type}</td>
+                    <td className="font-mono-code whitespace-nowrap px-4 py-2.5 text-slate-800">{d.event_type}</td>
                     <td className="font-mono-code max-w-[220px] truncate px-4 py-2.5 text-slate-500" title={d.target_url}>
                       {d.target_url}
                     </td>
-                    <td className="px-4 py-2.5">
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
-                          d.status === "delivered"
-                            ? "bg-emerald-50 text-emerald-700"
-                            : d.status === "failed"
-                              ? "bg-rose-50 text-rose-700"
-                              : "bg-slate-100 text-slate-600"
-                        }`}
-                      >
-                        {d.status} ({d.attempts}/{d.max_attempts})
-                      </span>
+                    <td className="whitespace-nowrap px-4 py-2.5">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                            d.status === "delivered"
+                              ? "bg-emerald-50 text-emerald-700"
+                              : d.status === "failed"
+                                ? "bg-rose-50 text-rose-700"
+                                : "bg-slate-100 text-slate-600"
+                          }`}
+                        >
+                          {d.status} ({d.attempts}/{d.max_attempts})
+                        </span>
+                        {d.last_status_code > 0 ? (
+                          <span className="font-mono-code rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+                            HTTP {d.last_status_code}
+                          </span>
+                        ) : null}
+                      </div>
                       {d.last_error ? (
-                        <div className="mt-0.5 max-w-[200px] truncate text-[11px] text-rose-600" title={d.last_error}>
+                        <div className="mt-0.5 max-w-[220px] truncate text-[11px] text-rose-600" title={d.last_error}>
                           {d.last_error}
                         </div>
                       ) : null}

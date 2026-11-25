@@ -104,6 +104,8 @@ class PricingService:
             result = await asyncio.shield(existing)
             return dict(result, cached=True)
 
+        if force:
+            self._generation += 1
         gen = self._generation
 
         async def _fetch() -> dict[str, Any]:

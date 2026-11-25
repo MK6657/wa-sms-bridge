@@ -149,12 +149,14 @@ class SmsBowerProvider(BaseSmsProvider):
         self._countries_cache: list[dict] = []
         self._countries_by_id: dict[int, dict] = {}
         self._countries_fetched_at: float = 0.0
+        self._countries_generation: int = 0
         self._countries_lock = asyncio.Lock()
 
     async def close(self):
         await self._client.aclose()
 
     def invalidate_countries_cache(self) -> None:
+        self._countries_generation += 1
         self._countries_cache = []
         self._countries_by_id = {}
         self._countries_fetched_at = 0.0
@@ -203,21 +205,43 @@ class SmsBowerProvider(BaseSmsProvider):
                     return cid, item.get("name") or str(cid)
             return resolve_country_id(raw)
 
-        try:
-            return resolve_country_id(raw)
-        except ValueError:
-            pass
+        is_virtual_query = "virtual" in raw.lower() or "虚拟" in raw
+        if not is_virtual_query:
+            try:
+                return resolve_country_id(raw)
+            except ValueError:
+                pass
 
         key = normalize_name(raw)
         iso_hint = name_to_iso(raw)
         countries = await self.get_countries()
+        # 第一趟：精确名称/别名/ID/区号匹配（确保 United States Virtual 命中 #12 而非被 iso='us' 抢占）
         for item in countries:
             fields = [item.get("name"), item.get("name_zh"), item.get("iso"), item.get("id"), item.get("cc")]
             fields.extend(item.get("aliases") or [])
             normalized_fields = {normalize_name(value) for value in fields if value not in (None, "")}
-            if key in normalized_fields or (iso_hint and iso_hint == str(item.get("iso", "")).lower()):
+            if key in normalized_fields:
                 cid = int(item["id"]) if str(item.get("id", "")).isdigit() else item.get("id")
                 return cid, item.get("name") or str(cid)
+
+        # 第二趟：ISO2 映射匹配（非虚拟查询优先物理主线路）
+        if iso_hint:
+            iso_matches = [item for item in countries if str(item.get("iso", "")).lower() == iso_hint]
+            if iso_matches:
+                if not is_virtual_query:
+                    non_virt = [
+                        it for it in iso_matches
+                        if "virtual" not in str(it.get("name", "")).lower() and "虚拟" not in str(it.get("name_zh", ""))
+                    ]
+                    chosen = non_virt[0] if non_virt else iso_matches[0]
+                else:
+                    virt = [
+                        it for it in iso_matches
+                        if "virtual" in str(it.get("name", "")).lower() or "虚拟" in str(it.get("name_zh", ""))
+                    ]
+                    chosen = virt[0] if virt else iso_matches[0]
+                cid = int(chosen["id"]) if str(chosen.get("id", "")).isdigit() else chosen.get("id")
+                return cid, chosen.get("name") or str(cid)
 
         allow_sub = len(key) >= 4 or any(ord(ch) > 127 for ch in key)
         if allow_sub:
@@ -225,12 +249,18 @@ class SmsBowerProvider(BaseSmsProvider):
                 names = [item.get("name"), item.get("name_zh"), *(item.get("aliases") or [])]
                 normalized_names = [normalize_name(value) for value in names if value]
                 if key and any(
-                    (len(value) >= 4 or any(ord(c) > 127 for c in value)) and (key in value or value in key)
+                    (len(value) >= 4 or any(ord(c) > 127 for c in value)) and (key in value)
                     for value in normalized_names
                     if value
                 ):
                     cid = int(item["id"]) if str(item.get("id", "")).isdigit() else item.get("id")
                     return cid, item.get("name") or str(cid)
+
+        if is_virtual_query:
+            try:
+                return resolve_country_id(raw)
+            except ValueError:
+                pass
 
         raise ValueError(f"未知国家: {country}")
 
@@ -376,6 +406,9 @@ class SmsBowerProvider(BaseSmsProvider):
             ):
                 return list(self._countries_cache)
 
+            if force:
+                self._countries_generation += 1
+            gen = self._countries_generation
             text = await self._get(action="getCountries")
             try:
                 data = json.loads(text)
@@ -410,7 +443,7 @@ class SmsBowerProvider(BaseSmsProvider):
                     "aliases": aliases,
                 })
             sorted_result = sorted(result, key=lambda x: x["id"])
-            if sorted_result:
+            if sorted_result and gen == self._countries_generation:
                 self._countries_cache = sorted_result
                 self._countries_by_id = {int(item["id"]): item for item in sorted_result}
                 self._countries_fetched_at = time.monotonic()
@@ -678,7 +711,7 @@ class SmsBowerProvider(BaseSmsProvider):
     async def complete_activation_structured(self, activation_id: str):
         from app.providers.base import ActionOutcome, parse_complete_outcome
         try:
-            raw = await self.complete_activation(activation_id)
+            raw = await self._get(action="setStatus", id=activation_id, status=6)
             return parse_complete_outcome(raw)
         except Exception as exc:
             return ActionOutcome(ok=False, status="error", retryable=True, raw=str(exc))

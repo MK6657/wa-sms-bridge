@@ -417,3 +417,186 @@ async def test_end_to_end_audit_fixes_in_app_container(tmp_path: Path, monkeypat
         assert resolved_parent["settlement_state"] == "manual_resolved"
         assert resolved_parent["code_scrubbed"] is True
         assert resolved_parent["latest_code"] == ""
+
+
+# ── 4. v1.1.0 深度审查回归验证 ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_v1_1_0_audit_regressions(tmp_path: Path, monkeypatch):
+    # 1) 上游永久拒绝 complete_activation_structured 必须返回 retryable=False（避免补偿死循环）
+    sb = SmsBowerProvider(AsyncMock(return_value="k"))
+    monkeypatch.setattr(sb, "_get", AsyncMock(side_effect=["BAD_STATUS", "NO_ACTIVATION"]))
+    try:
+        r1 = await sb.complete_activation_structured("act_dead_1")
+        r2 = await sb.complete_activation_structured("act_dead_2")
+        assert r1.ok is False and r1.retryable is False and r1.status == "rejected"
+        assert r2.ok is False and r2.retryable is False and r2.status == "rejected"
+    finally:
+        await sb.close()
+
+    hero = HeroSmsProvider(AsyncMock(return_value="k"))
+    monkeypatch.setattr(hero, "_get", AsyncMock(return_value="BAD_STATUS"))
+    try:
+        rh = await hero.complete_activation_structured("act_hero_dead")
+        assert rh.ok is False and rh.retryable is False and rh.status == "rejected"
+    finally:
+        await hero.close()
+
+    fs = FiveSimProvider(AsyncMock(return_value="jwt"))
+    await fs._client.aclose()
+    fs._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(404, text="order not found")))
+    try:
+        rf = await fs.complete_activation_structured("999000")
+        assert rf.ok is False and rf.retryable is False and rf.status == "rejected"
+    finally:
+        await fs.close()
+
+    # 2) Virtual US (#12) 与实体 US (#187) 区分，且 "Papua New Guinea" 不可反向子串误命中 "Guinea"
+    sb2 = SmsBowerProvider(AsyncMock(return_value="k"))
+    monkeypatch.setattr(
+        sb2,
+        "get_countries",
+        AsyncMock(return_value=[
+            {"id": 68, "name": "Guinea", "iso": "gn", "cc": "224", "aliases": ["guinea"]},
+            {"id": 187, "name": "United States", "iso": "us", "cc": "1", "aliases": ["usa"]},
+            {"id": 12, "name": "United States (Virtual)", "iso": "us", "cc": "1", "aliases": ["usa virtual"]},
+        ]),
+    )
+    try:
+        assert (await sb2.resolve_country("US"))[0] == 187
+        assert (await sb2.resolve_country("United States (Virtual)"))[0] == 12
+        with pytest.raises(ValueError):
+            await sb2.resolve_country("Papua New Guinea")
+    finally:
+        await sb2.close()
+
+    # GlobalCountryIndex.search 可检索 provider_variants（如 virtual）
+    idx = GlobalCountryIndex()
+    mock_prov = MagicMock()
+    mock_prov.get_countries = AsyncMock(return_value=[
+        {"id": 187, "name": "United States", "iso": "us", "cc": "1"},
+        {"id": 12, "name": "United States (Virtual)", "iso": "us", "cc": "1"},
+    ])
+    monkeypatch.setattr(global_registry, "list_providers", lambda: ["smsbower"])
+    monkeypatch.setattr(global_registry, "get", lambda name: mock_prov)
+    await idx.refresh(force=True)
+    virt_hits = idx.search("virtual")
+    assert any(h["iso"] == "us" for h in virt_hits)
+
+    # 3) PricingService 仅调用 get_price_snapshot(..., force=True)（不调 invalidate）亦递增代数防旧包回写
+    reg = ProviderRegistry()
+    slow_gate = asyncio.Event()
+    p_calls = 0
+
+    class SlowThenFastProv:
+        provider_id = "smsbower"
+
+        async def resolve_country(self, c):
+            return 52, "Thailand"
+
+        async def get_prices(self, cid, svc):
+            nonlocal p_calls
+            p_calls += 1
+            if p_calls == 1:
+                await slow_gate.wait()
+                return [{"cost": 0.09, "count": 2}]
+            return [{"cost": 0.35, "count": 9}]
+
+    reg.init_provider("smsbower", SlowThenFastProv())  # type: ignore[arg-type]
+    psvc = PricingService(reg, cache_ttl=30.0)
+    t_slow = asyncio.create_task(psvc.get_price_snapshot("smsbower", "52", "go", force=False))
+    await asyncio.sleep(0.02)
+    fresh = await psvc.get_price_snapshot("smsbower", "52", "go", force=True)
+    assert fresh["low"] == 0.35
+    slow_gate.set()
+    await t_slow
+    after = await psvc.get_price_snapshot("smsbower", "52", "go", force=False)
+    assert after["low"] == 0.35
+
+    # 4) 应用级：版本号 1.1.0、API Key scopes 校验、黑名单跨格式命中与去重计数、delivering webhook 人工核销脱敏
+    monkeypatch.setenv("BRIDGE_DATA_DIR", str(tmp_path / "data_v110"))
+    monkeypatch.setenv("BRIDGE_SECRET_KEY", "audit-v110-secret-key-very-strong")
+    monkeypatch.setenv("SMS_CODE_RETENTION_HOURS", "0")
+    monkeypatch.delenv("CONSOLE_ADMIN_PASSWORD", raising=False)
+    env.reload()
+
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        container = app.state.container
+        db = container.db
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+            health = await client.get("/api/v1/health")
+            assert health.status_code == 200
+            assert health.json()["version"] == "1.1.0"
+            assert app.version == "1.1.0"
+
+            await client.post("/api/v1/auth/session")
+
+            # 非法 scope 拼写必须 422 拦截
+            bad_scope = await client.post(
+                "/api/v1/projects/keys",
+                json={"name": "BadScopeBot", "scopes": ["order:rw"]},
+            )
+            assert bad_scope.status_code == 422
+
+            # 黑名单批量添加：过滤过短无效串 + 重复项不虚增 added 计数 + 跨 +E.164/纯数字命中
+            b1 = await client.post(
+                "/api/v1/blacklist/batch",
+                json={"phones": ["+66899998888", "+66899998888", "12"], "provider": "smsbower"},
+            )
+            assert b1.status_code == 201
+            assert b1.json()["added"] == 1
+            b2 = await client.post(
+                "/api/v1/blacklist/batch",
+                json={"phones": ["+66899998888"], "provider": "smsbower"},
+            )
+            assert b2.json()["added"] == 0
+            assert await db.blacklist.is_blacklisted("66899998888", "smsbower") is True
+            assert await db.blacklist.is_blacklisted("+66899998888", "smsbower") is True
+
+        # 人工结清时若有 status='delivering' 的验证码投递，必须同步标记为 scrubbed
+        await db.orders.reserve(
+            order_id="ord_v110_dlv",
+            provider="smsbower",
+            service="google",
+            service_code="go",
+            country_id="52",
+            country_input="52",
+            country_label="Thailand",
+            status="code_received",
+        )
+        act_row_id = await db.activations.record_intent(
+            order_id="ord_v110_dlv",
+            attempt_no=1,
+            provider="smsbower",
+            country_id="52",
+            service_code="go",
+            quoted_max_price=0.12,
+        )
+        await db.activations.bind_acquired_atomic(
+            act_row_id,
+            order_id="ord_v110_dlv",
+            activation_id="aid_v110_dlv",
+            phone_raw="66812345678",
+            phone_e164="+66812345678",
+            actual_cost=0.12,
+        )
+        await db.webhooks.enqueue(
+            delivery_id="dlv_inflight_v110",
+            event_id="evt_inflight_v110",
+            event_type="order.code_received",
+            order_id="ord_v110_dlv",
+            project_id="proj_test",
+            target_url="https://example.com/hook",
+            payload={"code": "135790"},
+        )
+        await db.conn.write("UPDATE webhook_deliveries SET status='delivering' WHERE delivery_id='dlv_inflight_v110'")
+        await container.order_service.resolve_activation_manually(act_row_id, state="completed", note="人工结清验证脱敏")
+        dlv_row = await db.conn.fetchone("SELECT status, payload_scrubbed, payload_json FROM webhook_deliveries WHERE delivery_id='dlv_inflight_v110'")
+        assert dlv_row is not None
+        assert dlv_row["status"] == "scrubbed"
+        assert int(dlv_row["payload_scrubbed"]) == 1
+        assert "135790" not in dlv_row["payload_json"]
+

@@ -435,6 +435,7 @@ class ActivationsRepo:
         - applied 为 True：激活与父订单已在同一事务一致提交。
         """
         from app.db.orders_repo import OrdersRepo
+        from app.db.webhooks_repo import WebhooksRepo
 
         now = _utc_now_iso()
         guard = "" if state == "refund_confirmed" else " AND state != 'refund_confirmed'"
@@ -528,12 +529,7 @@ class ActivationsRepo:
                             (new_status, new_refund, completed_at, now, order_id),
                         )
                         await raw.execute("UPDATE sms_messages SET code='', raw_text='' WHERE order_id=?", (order_id,))
-                        await raw.execute(
-                            "UPDATE webhook_deliveries SET payload_json=?, payload_scrubbed=1, "
-                            "status=CASE WHEN status IN ('pending', 'sending') THEN 'scrubbed' ELSE status END, "
-                            "lease_expires_at='', updated_at=? WHERE order_id=? AND contains_code=1 AND payload_scrubbed=0",
-                            ("{}", now, order_id),
-                        )
+                        await WebhooksRepo.scrub_for_orders_in_tx(raw, [order_id], now)
                         v_cur = await raw.execute("SELECT code_scrub_version FROM sms_orders WHERE order_id=?", (order_id,))
                         v_row = await v_cur.fetchone()
                         if v_row is not None and scrub_result is not None:
