@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request, Response
 
 from app.api.schemas import AdminLoginRequest
-from app.core.auth_service import AuthService, is_direct_loopback
+from app.core.auth_service import AuthService, enforce_browser_csrf, is_direct_loopback
 from app.dependencies import get_auth_service
 from app.errors import AuthError, ForbiddenError
 
@@ -52,16 +52,20 @@ async def admin_login(
     auth_service: AuthService = Depends(get_auth_service),
 ):
     """使用 CONSOLE_ADMIN_PASSWORD 登录并签发 HttpOnly 管理员会话 Cookie。"""
+    enforce_browser_csrf(request)
     if not auth_service.password_configured():
         if not is_direct_loopback(request):
             raise ForbiddenError("未设置 CONSOLE_ADMIN_PASSWORD，禁止远程登录管理台")
-        expires_at = auth_service.issue_admin_cookie(response, request=request)
+        expires_at = await auth_service.issue_admin_cookie(response, request=request)
         return {"ok": True, "is_admin": True, "expires_at": expires_at}
 
+    auth_service.check_login_rate_limit(request)
     if not auth_service.verify_admin_password(req.password):
+        auth_service.record_login_result(request, success=False)
         raise AuthError("管理员口令不正确", code="AUTH_INVALID_PASSWORD")
 
-    expires_at = auth_service.issue_admin_cookie(response, request=request)
+    auth_service.record_login_result(request, success=True)
+    expires_at = await auth_service.issue_admin_cookie(response, request=request)
     return {"ok": True, "is_admin": True, "expires_at": expires_at}
 
 
@@ -72,18 +76,21 @@ async def bootstrap_local_session(
     auth_service: AuthService = Depends(get_auth_service),
 ):
     """仅限本机直连回环且未设置管理员口令时签发 HttpOnly 会话 Cookie，保证严格模式下工作台 REST 与 SSE 均可安全认证。"""
+    enforce_browser_csrf(request)
     if auth_service.password_configured():
         raise AuthError("已配置管理员口令，请使用 /api/v1/auth/login 登录", code="AUTH_PASSWORD_REQUIRED")
     if not is_direct_loopback(request):
         raise ForbiddenError("仅允许本机直连回环初始化免密会话（检测到非回环来源或反代头）")
-    expires_at = auth_service.issue_admin_cookie(response, request=request)
+    expires_at = await auth_service.issue_admin_cookie(response, request=request)
     return {"ok": True, "is_admin": True, "expires_at": expires_at}
 
 
 @router.post("/logout")
 async def admin_logout(
+    request: Request,
     response: Response,
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    auth_service.clear_admin_cookie(response)
+    enforce_browser_csrf(request)
+    await auth_service.revoke_and_clear_admin_cookie(request, response)
     return {"ok": True}

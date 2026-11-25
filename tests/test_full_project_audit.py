@@ -48,6 +48,21 @@ def test_extract_otp_code_ignores_minutes_sender_phone_and_app_hash():
     # 纯数字与连字符纯码
     assert extract_otp_code("908172") == "908172"
     assert extract_otp_code("451-892") == "451892"
+    # Apple 多语言与 WebOTP 短信模板精准提取
+    assert extract_otp_code("Your Apple Account code is: 482910. Do not share it with anyone.") == "482910"
+    assert extract_otp_code("<#> Your Apple ID Code is: 839201. Don't share it.\n@apple.com #839201 %apple.com") == "839201"
+    assert extract_otp_code("您的 Apple 账户代码为：739104。请勿与他人共享。") == "739104"
+    assert extract_otp_code("รหัสบัญชี Apple ของคุณคือ: 651902 อย่าแชร์กับใคร") == "651902"
+    # Apple 服务映射与常用置顶校验
+    from app.service_codes import canonical_service, list_services
+    assert canonical_service("apple") == "apple"
+    assert canonical_service("苹果") == "apple"
+    assert canonical_service("icloud") == "apple"
+    assert provider_service_code("smsbower", "apple") == "wx"
+    assert provider_service_code("herosms", "苹果") == "wx"
+    assert provider_service_code("5sim", "appleid") == "apple"
+    apple_entry = next(s for s in list_services("smsbower") if s["id"] == "apple")
+    assert apple_entry["popular"] is True and apple_entry["code"] == "wx"
     # 无数字正文不误提取
     assert extract_otp_code("Your verification code is pending") == ""
 
@@ -529,8 +544,8 @@ async def test_v1_1_0_audit_regressions(tmp_path: Path, monkeypatch):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
             health = await client.get("/api/v1/health")
             assert health.status_code == 200
-            assert health.json()["version"] == "1.1.0"
-            assert app.version == "1.1.0"
+            assert health.json()["version"] == "1.2.0"
+            assert app.version == "1.2.0"
 
             await client.post("/api/v1/auth/session")
 

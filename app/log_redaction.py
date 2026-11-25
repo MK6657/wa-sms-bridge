@@ -43,21 +43,45 @@ _QUERY_SECRET_PATTERNS = (
     re.compile(r"(?i)(api[_-]?key=)[^&\s]+"),
     re.compile(r"(?i)(token=)[^&\s]+"),
     re.compile(r"(?i)(password=)[^&\s]+"),
-    re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)((?:webhook[_-]?)?secret(?:[_-]?key)?=)[^&\s]+"),
+    re.compile(r"(?i)(sms_hub_session=)[^;\s,]+"),
+    re.compile(r"(?i)(authorization:\s*(?:bearer|basic)\s+)[^\s,;]+"),
     re.compile(r"(?i)(x-api-key:\s*)[^\s,;]+"),
 )
 
+_URL_EMBEDDED_CRED_PATTERN = re.compile(r"(?i)(://[^/:\s@]+:)[^@\s/]+(@)")
+
+_FULL_REDACT_FIELD_NAMES = frozenset({
+    "api_key",
+    "token",
+    "password",
+    "secret",
+    "secret_key",
+    "bridge_secret_key",
+    "sms_code",
+    "latest_code",
+    "code",
+    "raw_text",
+    "webhook_secret",
+    "challenge_data",
+})
+
 _SENSITIVE_FIELD_PATTERN = re.compile(
-    r"(?i)\b(activation|activation_id|wa_account_id|verification_request_id|login_state_id|"
-    r"challenge_data|api_key|token|password|secret|sms_code|latest_code|code|raw_text|webhook_secret)=([^\s,;)\]}]+)"
+    r"(?i)\b(?P<name>activation|activation_id|wa_account_id|verification_request_id|login_state_id|"
+    r"challenge_data|api_key|token|password|secret|secret_key|bridge_secret_key|"
+    r"sms_code|latest_code|code|raw_text|webhook_secret)=(?P<val>[^\s,;)\]}]+)"
 )
 
 _JSON_SENSITIVE_FIELD_PATTERN = re.compile(
-    r"(?i)([\"']?(activation|activation_id|wa_account_id|verification_request_id|login_state_id|"
-    r"challenge_data|api_key|token|password|secret|sms_code|latest_code|code|raw_text|webhook_secret)[\"']?\s*:\s*[\"'])([^\"']+)([\"'])"
+    r"(?i)(?P<prefix>[\"']?(?P<name>activation|activation_id|wa_account_id|verification_request_id|login_state_id|"
+    r"challenge_data|api_key|token|password|secret|secret_key|bridge_secret_key|"
+    r"sms_code|latest_code|code|raw_text|webhook_secret)[\"']?\s*:\s*)(?P<q>[\"'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"
+)
+_JSON_NUMERIC_CODE_FIELD_PATTERN = re.compile(
+    r"(?i)(?P<prefix>[\"']?(?:sms_code|latest_code|code)[\"']?\s*:\s*)(?P<val>\d{3,10})\b"
 )
 _JSON_PHONE_FIELD_PATTERN = re.compile(
-    r"(?i)([\"']?(phone|phone_number|e164_number|phone_e164|phone_raw)[\"']?\s*:\s*[\"'])([+]?\d[\d\s().-]{6,}\d)([\"'])"
+    r"(?i)(?P<prefix>[\"']?(?:phone|phone_number|e164_number|phone_e164|phone_raw)[\"']?\s*:\s*)(?P<q>[\"'])(?P<val>[+]?\d[\d\s().-]{6,}\d)(?P=q)"
 )
 _ACCESS_NUMBER_PATTERN = re.compile(r"(?i)(ACCESS_NUMBER:)([^:\s]+):([+]?\d[\d\s().-]{6,}\d)")
 _STATUS_OK_PATTERN = re.compile(r"(?i)(STATUS_OK:)([^\s,;]+)")
@@ -68,8 +92,15 @@ _PHONE_FIELD_PATTERN = re.compile(r"(?i)\b(phone|phone_number|e164_number|phone_
 _LONG_PHONE_PATTERN = re.compile(r"(?<![\w.])\+?\d{9,15}(?![\w.])")
 
 
+def _redact_field_value(name: str, val: str) -> str:
+    if (name or "").lower() in _FULL_REDACT_FIELD_NAMES:
+        return "***"
+    return mask_identifier(val)
+
+
 def redact_text(value: Any) -> str:
     text = str(value or "")
+    text = _URL_EMBEDDED_CRED_PATTERN.sub(r"\1***\2", text)
     for pattern in _QUERY_SECRET_PATTERNS:
         text = pattern.sub(r"\1***", text)
 
@@ -80,10 +111,20 @@ def redact_text(value: Any) -> str:
         lambda m: f"{m.group(1)}{mask_identifier(m.group(2))}:{mask_phone(m.group(3))}",
         text,
     )
-    text = _JSON_PHONE_FIELD_PATTERN.sub(lambda m: f"{m.group(1)}{mask_phone(m.group(3))}{m.group(4)}", text)
-    text = _JSON_SENSITIVE_FIELD_PATTERN.sub(lambda m: f"{m.group(1)}{mask_identifier(m.group(3))}{m.group(4)}", text)
+    text = _JSON_PHONE_FIELD_PATTERN.sub(
+        lambda m: f"{m.group('prefix')}{m.group('q')}{mask_phone(m.group('val'))}{m.group('q')}",
+        text,
+    )
+    text = _JSON_SENSITIVE_FIELD_PATTERN.sub(
+        lambda m: f"{m.group('prefix')}{m.group('q')}{_redact_field_value(m.group('name'), m.group('val'))}{m.group('q')}",
+        text,
+    )
+    text = _JSON_NUMERIC_CODE_FIELD_PATTERN.sub(lambda m: f"{m.group('prefix')}\"***\"", text)
     text = _PHONE_FIELD_PATTERN.sub(lambda m: f"{m.group(1)}={mask_phone(m.group(2))}", text)
-    text = _SENSITIVE_FIELD_PATTERN.sub(lambda m: f"{m.group(1)}={mask_identifier(m.group(2))}", text)
+    text = _SENSITIVE_FIELD_PATTERN.sub(
+        lambda m: f"{m.group('name')}={_redact_field_value(m.group('name'), m.group('val'))}",
+        text,
+    )
     text = _ACTIVATION_WORD_PATTERN.sub(lambda m: f"{m.group(1)} {mask_identifier(m.group(2))}", text)
     text = _LONG_PHONE_PATTERN.sub(lambda m: mask_phone(m.group(0)), text)
     return text

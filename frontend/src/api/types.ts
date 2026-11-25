@@ -117,6 +117,7 @@ export interface SmsOrder {
   phone_e164: string;
   phone_national: string;
   status: OrderStatus;
+  version?: number;
   settlement_state?: string;
   refund_state?: string;
   latest_code: string;

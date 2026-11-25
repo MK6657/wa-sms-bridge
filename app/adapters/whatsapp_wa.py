@@ -56,11 +56,15 @@ def _bool(value: Any, default: bool = False) -> bool:
 
 def _active_login_status(status: str) -> bool:
     normalized = status.strip().upper()
+    if "NOT_ACTIVE" in normalized or "INACTIVE" in normalized:
+        return False
     return normalized in {"ACTIVE", "LOGIN_STATE_STATUS_ACTIVE"} or normalized.endswith("_ACTIVE")
 
 
 def _registered_status(status: str) -> bool:
     normalized = status.strip().upper()
+    if "NOT_REGISTERED" in normalized or "UNREGISTERED" in normalized:
+        return False
     return normalized in {"REGISTERED", "REGISTRATION_STATUS_REGISTERED"} or normalized.endswith("_REGISTERED")
 
 
@@ -435,8 +439,9 @@ class WhatsappWaAdapter:
             if request_id:
                 body["request_id"] = request_id
             raw = await self._post_json("/api/wa/login-state-check", body)
-            ls = raw.get("login_state", {}) or {}
-            return _active_login_status(_text(ls.get("status"), raw.get("status")))
+            raw_obj = _object(raw)
+            ls = _object(raw_obj.get("login_state"))
+            return _active_login_status(_text(ls.get("status"), raw_obj.get("status")))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -463,8 +468,12 @@ class WhatsappWaAdapter:
         """GET /api/wa/accounts 列出账号。"""
         raw = await self._get_json(f"/api/wa/accounts?limit={limit}")
         if isinstance(raw, list):
-            return raw
-        return raw.get("accounts", []) or []
+            return [a for a in raw if isinstance(a, dict)]
+        raw_obj = _object(raw)
+        accounts = raw_obj.get("accounts")
+        if isinstance(accounts, list):
+            return [a for a in accounts if isinstance(a, dict)]
+        return []
 
 
 WaApiClient = WhatsappWaAdapter

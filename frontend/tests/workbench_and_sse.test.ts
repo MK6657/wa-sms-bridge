@@ -417,3 +417,27 @@ test("全项目审查: resolveOrderStatusMeta 准确区分已确认退款、未�
   assert.equal(resolveOrderStatusMeta("expired", "unrefundable").label, "超时(未退)");
   assert.equal(resolveOrderStatusMeta("expired", "unknown").label, "超时(待核对)");
 });
+
+test("v8 审计补充: parseApiErrorResponse 准确透传 CSRF_REJECTED 与 AUTH_RATE_LIMITED 错误码与重试属性", () => {
+  const csrfErr = parseApiErrorResponse(403, {
+    error: {
+      code: "CSRF_REJECTED",
+      message: "跨站写请求已被 CSRF 安全策略拦截",
+      retryable: false,
+    },
+  });
+  assert.equal(csrfErr.status, 403);
+  assert.equal(csrfErr.code, "CSRF_REJECTED");
+  assert.equal(csrfErr.retryable, false);
+
+  const rateErr = parseApiErrorResponse(429, {
+    error: {
+      code: "AUTH_RATE_LIMITED",
+      message: "登录失败次数过多，请稍后再试",
+      retryable: true,
+    },
+  });
+  assert.equal(rateErr.status, 429);
+  assert.equal(rateErr.code, "AUTH_RATE_LIMITED");
+  assert.equal(rateErr.retryable, true);
+});

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { AlertTriangle } from "lucide-react";
 
 interface ConfirmModalProps {
@@ -25,8 +26,13 @@ export function ConfirmModal({
   const cancelBtnRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
+    if (open) {
+      cancelBtnRef.current?.focus();
+    }
+  }, [open]);
+
+  useEffect(() => {
     if (!open) return;
-    cancelBtnRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !loading) {
         onCancel();
@@ -37,13 +43,13 @@ export function ConfirmModal({
   }, [open, loading, onCancel]);
 
   if (!open) return null;
-  return (
+  const modalNode = (
     <div
       role="dialog"
       aria-modal="true"
       aria-label={title}
-      onClick={() => {
-        if (!loading) onCancel();
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !loading) onCancel();
       }}
       className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/45 p-4 backdrop-blur-xs"
     >
@@ -86,4 +92,6 @@ export function ConfirmModal({
       </div>
     </div>
   );
+
+  return typeof document !== "undefined" ? createPortal(modalNode, document.body) : modalNode;
 }

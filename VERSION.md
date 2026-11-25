@@ -1,4 +1,11 @@
-# SMS Hub (`wa-sms-bridge`) v1.1.0
+# SMS Hub (`wa-sms-bridge`) v1.2.0
+
+## v1.2.0 更新亮点
+
+- **v2 HKDF 高速加密与平滑密钥轮转**：重构敏感字段加解密为单次主密钥 PBKDF2 强化 + 每记录随机盐 HKDF 派生，彻底消除高并发场景下的事件循环阻塞，兼容旧版 v1 密文并支持 `BRIDGE_SECRET_KEY_PREVIOUS` 无感轮转。
+- **全链路安全边界加固**：新增本机回环防 DNS Rebinding 校验、浏览器写接口同源/Fetch-Metadata CSRF 防护（`X-SMS-Hub-CSRF`）、管理员登出服务端 `epoch` 吊销与改密即失效、登录滑动窗口防爆破限流，以及跨租户 Webhook SSRF 同源强隔离与签名密钥解密失败闭合阻断。
+- **Schema v8 与订单核心引擎升级**：SQLite 写事务升级为取消安全的 `BEGIN IMMEDIATE`，新增 `resend_base_digest` 不可逆 HMAC 摘要（支持 0 小时留存脱敏后重发判重并立即放行新验证码）、订单/激活细粒度锁自动回收与复合性能索引。
+- **业务与多平台协议增强**：内置常用服务新增 Apple / Apple ID 与微信（WeChat），`extract_otp_code` 支持 WebOTP 标准格式与抗误判清洗，修复 HeroSMS 数字 ID / `+` 区号优先级、5sim 取消回查及 WA 编排器已注册账号保护逻辑，同步优化前端防连点锁、多平台国家偏好记忆与无障碍交互。
 
 ## v1.1.0 更新亮点
 

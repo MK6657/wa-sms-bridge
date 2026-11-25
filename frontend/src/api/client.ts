@@ -72,8 +72,12 @@ export function setUnauthorizedHandler(handler: ((err: ApiClientError) => void) 
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
+  const method = (init.method || "GET").toUpperCase();
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
+  }
+  if ((method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") && !headers.has("X-SMS-Hub-CSRF")) {
+    headers.set("X-SMS-Hub-CSRF", "1");
   }
 
   const resp = await fetch(path, {
@@ -97,7 +101,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       resp.status === 401 &&
       unauthorizedHandler &&
       !path.startsWith("/api/v1/auth/login") &&
-      !path.startsWith("/api/v1/auth/status")
+      !path.startsWith("/api/v1/auth/status") &&
+      !path.startsWith("/api/v1/auth/session") &&
+      !path.startsWith("/api/v1/auth/logout")
     ) {
       unauthorizedHandler(apiErr);
     }
@@ -207,13 +213,16 @@ export const api = {
     );
   },
 
-  listBlacklist: (provider = "") =>
-    request<{ total: number; entries: BlacklistEntry[] }>(
-      `/api/v1/blacklist${provider ? `?provider=${encodeURIComponent(provider)}` : ""}`,
-    ),
+  listBlacklist: (provider = "", limit = 1000) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (provider) qs.set("provider", provider);
+    return request<{ total: number; entries: BlacklistEntry[] }>(
+      `/api/v1/blacklist?${qs.toString()}`,
+    );
+  },
 
   addBlacklist: (phone: string, reason: string, provider = "smsbower") =>
-    request<{ success: boolean }>("/api/v1/blacklist", {
+    request<{ success: boolean; added?: number }>("/api/v1/blacklist", {
       method: "POST",
       body: JSON.stringify({ phone, reason, provider }),
     }),

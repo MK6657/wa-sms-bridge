@@ -95,7 +95,19 @@ class PluginManager:
                 summary[pid] = {"enabled": False, "started": False, "status": "disabled"}
                 continue
             try:
-                summary[pid] = {"enabled": True, "started": plugin._started, **(await plugin.health())}
-            except Exception as exc:
-                summary[pid] = {"enabled": True, "started": plugin._started, "ok": False, "error": str(exc)}
+                raw_health = await plugin.health()
+                ok = bool(raw_health.get("ok"))
+                summary[pid] = {
+                    "enabled": True,
+                    "started": plugin._started,
+                    "ok": ok,
+                    "status": "healthy" if ok else "unhealthy",
+                }
+            except Exception:
+                summary[pid] = {
+                    "enabled": True,
+                    "started": plugin._started,
+                    "ok": False,
+                    "status": "unhealthy",
+                }
         return summary

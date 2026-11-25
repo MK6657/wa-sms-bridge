@@ -51,12 +51,16 @@ export function BlacklistPage({ defaultProvider = "smsbower" }: BlacklistPagePro
       return;
     }
     setSubmitting(true);
+    let totalAdded = 0;
     try {
       if (parsedPhones.length === 1) {
-        await api.addBlacklist(parsedPhones[0], reason.trim() || "手动加入", defaultProvider);
-        notify(`已将 ${parsedPhones[0]} 加入黑名单`, "success");
+        const res = await api.addBlacklist(parsedPhones[0], reason.trim() || "手动加入", defaultProvider);
+        if (res.added === 0) {
+          notify(`号码 ${parsedPhones[0]} 已存在于黑名单中`, "info");
+        } else {
+          notify(`已将 ${parsedPhones[0]} 加入黑名单`, "success");
+        }
       } else {
-        let totalAdded = 0;
         for (let i = 0; i < parsedPhones.length; i += 200) {
           const chunk = parsedPhones.slice(i, i + 200);
           const res = await api.addBlacklistBatch(chunk, reason.trim() || "批量加入", defaultProvider);
@@ -67,7 +71,17 @@ export function BlacklistPage({ defaultProvider = "smsbower" }: BlacklistPagePro
       setPhonesText("");
       load();
     } catch (err) {
-      notify(err instanceof Error ? err.message : "添加失败", "error");
+      if (totalAdded > 0) {
+        load();
+      }
+      notify(
+        err instanceof Error
+          ? totalAdded > 0
+            ? `已加入 ${totalAdded} 个号码，后续批次失败：${err.message}`
+            : err.message
+          : "添加失败",
+        "error",
+      );
     } finally {
       setSubmitting(false);
     }

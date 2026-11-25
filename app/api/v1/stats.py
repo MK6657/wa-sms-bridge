@@ -26,6 +26,6 @@ async def get_stats(
         days=days,
         project_id=effective_project,
     )
-    bl_filter = None if (caller.is_admin and not effective_project) else effective_project
+    bl_filter = None if (caller.is_admin and not effective_project) else ("" if effective_project == "web-console" else effective_project)
     stats["blacklist_count"] = await db.blacklist.count(project_id=bl_filter)
     return stats

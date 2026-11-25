@@ -54,6 +54,8 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
   const [exporting, setExporting] = useState(false);
   const [reconciliation, setReconciliation] = useState<ReconciliationResponse | null>(null);
   const [resolvingId, setResolvingId] = useState<number | null>(null);
+  const [showAllReconcile, setShowAllReconcile] = useState(false);
+  const [manualCurrencyById, setManualCurrencyById] = useState<Record<number, string>>({});
   const [scrubTargetId, setScrubTargetId] = useState<string | null>(null);
   const [scrubbingOne, setScrubbingOne] = useState(false);
   const [revealedIds, setRevealedIds] = useState<Set<string>>(new Set());
@@ -64,7 +66,13 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      setDebouncedSearch(searchInput.trim());
+      const trimmed = searchInput.trim();
+      setDebouncedSearch((prev) => {
+        if (prev !== trimmed) {
+          setPage(1);
+        }
+        return trimmed;
+      });
     }, 240);
     return () => window.clearTimeout(timer);
   }, [searchInput]);
@@ -97,6 +105,11 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
         controller.signal,
       );
       if (reqSeq !== loadSeqRef.current || controller.signal.aborted) return;
+      const maxPage = Math.max(1, Math.ceil(res.total / pageSize));
+      if (res.total > 0 && page > maxPage) {
+        setPage(maxPage);
+        return;
+      }
       setOrders(res.items);
       setTotal(res.total);
     } catch (err) {
@@ -144,14 +157,19 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
 
   const handleResolveActivation = async (
     item: ReconciliationActivationItem,
-    nextState: "refund_confirmed" | "unrefundable" | "completed",
+    nextState: "refund_confirmed" | "unrefundable" | "completed" | "manual_resolved",
   ) => {
+    const needsCurrencyConfirm = Boolean(item.currency_review_required) || !item.currency || item.currency === "UNKNOWN";
+    const typedCurrency = (manualCurrencyById[item.id] || "").trim().toUpperCase();
+    const verifiedCurrency = needsCurrencyConfirm
+      ? typedCurrency || undefined
+      : item.currency;
     setResolvingId(item.id);
     try {
       await api.resolveReconciliation(item.id, {
         state: nextState,
         note: "控制台人工核销",
-        currency: item.currency && item.currency !== "UNKNOWN" ? item.currency : undefined,
+        currency: verifiedCurrency,
       });
       notify(`已将激活记录 #${item.id} 人工核销为 ${nextState}`, "success");
       await Promise.allSettled([load(), loadReconciliation()]);
@@ -196,30 +214,31 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
         "currency",
         "created_at",
       ];
-      const escapeCsv = (val: string) => {
-        const safe = /^[=+\-@]/.test(val) && !/^\+\d+$/.test(val) ? `'${val}` : val;
+      const escapeCsv = (val: string, allowTabPrefix = false) => {
+        const trimmed = val.trimStart();
+        const dangerous = /^[=+\-@]/.test(trimmed) && !/^\+\d+$/.test(trimmed);
+        const safe = dangerous ? `'${val}` : allowTabPrefix ? val : val.replace(/^[\t\r\n]+/, " ");
         return `"${safe.replace(/"/g, '""')}"`;
       };
       const rows = source.map((o) => {
         const phone = o.phone_e164 || o.phone_raw || "";
-        return [
-          o.order_id,
-          o.project_id,
-          o.external_ref || "",
-          o.provider,
-          o.service,
-          o.country_label || o.country_id,
-          phone ? `\t${phone}` : "",
-          o.status,
-          o.refund_state || "none",
-          String(o.code_count),
-          o.cost !== null ? String(o.cost) : "",
-          o.cost_status || (o.cost_is_estimated ? "estimated" : "actual"),
-          o.currency || "USD",
-          o.created_at,
-        ]
-          .map((v) => escapeCsv(String(v ?? "")))
-          .join(",");
+        const cols: Array<[string, boolean]> = [
+          [o.order_id, false],
+          [o.project_id, false],
+          [o.external_ref || "", false],
+          [o.provider, false],
+          [o.service, false],
+          [o.country_label || o.country_id, false],
+          [phone ? `\t${phone}` : "", true],
+          [o.status, false],
+          [o.refund_state || "none", false],
+          [String(o.code_count), false],
+          [o.cost !== null ? String(o.cost) : "", false],
+          [o.cost_status || (o.cost_is_estimated ? "estimated" : "actual"), false],
+          [o.currency || "USD", false],
+          [o.created_at, false],
+        ];
+        return cols.map(([v, allowTab]) => escapeCsv(String(v ?? ""), allowTab)).join(",");
       });
       const blob = new Blob(["\ufeff" + [header.join(","), ...rows].join("\n")], {
         type: "text/csv;charset=utf-8",
@@ -255,62 +274,138 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
   return (
     <div className="space-y-5">
       {/* 待人工核销对账队列 */}
-      {pendingActItems.length > 0 ? (
+      {pendingActItems.length > 0 || (reconciliation?.orders_requiring_review?.length ?? 0) > 0 ? (
         <section className="rounded-2xl border border-amber-200 bg-amber-50/75 p-4 shadow-2xs">
-          <div className="mb-2.5 flex items-center justify-between gap-2">
+          <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs font-semibold text-amber-950">
               <AlertTriangle className="h-4 w-4 text-amber-600" />
-              <span>待对账 / 异常激活记录 ({pendingActItems.length})</span>
+              <span>
+                待对账记录（激活 {pendingActItems.length} 项
+                {(reconciliation?.orders_requiring_review?.length ?? 0) > 0
+                  ? ` · 订单 ${reconciliation?.orders_requiring_review.length} 笔`
+                  : ""}
+                ）
+              </span>
             </div>
-            <button
-              type="button"
-              onClick={loadReconciliation}
-              className="cursor-pointer rounded-lg border border-amber-200 bg-white px-2.5 py-1 text-[11px] font-medium text-amber-800 hover:bg-amber-100"
-            >
-              刷新对账队列
-            </button>
+            <div className="flex items-center gap-2">
+              {pendingActItems.length > 8 ? (
+                <button
+                  type="button"
+                  onClick={() => setShowAllReconcile((v) => !v)}
+                  className="cursor-pointer rounded-lg border border-amber-200 bg-white px-2.5 py-1 text-[11px] font-medium text-amber-800 hover:bg-amber-100"
+                >
+                  {showAllReconcile ? "收起列表" : `展开全部 (${pendingActItems.length})`}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                onClick={loadReconciliation}
+                className="cursor-pointer rounded-lg border border-amber-200 bg-white px-2.5 py-1 text-[11px] font-medium text-amber-800 hover:bg-amber-100"
+              >
+                刷新对账队列
+              </button>
+            </div>
           </div>
           <div className="space-y-2">
-            {pendingActItems.slice(0, 8).map((act) => (
+            {(showAllReconcile ? pendingActItems : pendingActItems.slice(0, 8)).map((act) => {
+              const needsCurrencyConfirm =
+                Boolean(act.currency_review_required) || !act.currency || act.currency === "UNKNOWN";
+              return (
+                <div
+                  key={act.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200/80 bg-white px-3 py-2 text-xs shadow-2xs"
+                >
+                  <div className="min-w-0">
+                    <div className="font-mono-code font-medium text-slate-900">
+                      #{act.id} · 订单 {act.order_id} · {act.provider} ({act.state})
+                      {Boolean(act.currency_review_required) ? (
+                        <span className="ml-1.5 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                          币种待核实: {act.currency || "UNKNOWN"}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="truncate text-[11px] text-slate-500">
+                      激活ID: {act.activation_id || "未获取"} · {act.last_error || "待核对上游账单"}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {needsCurrencyConfirm ? (
+                      <input
+                        type="text"
+                        maxLength={8}
+                        value={manualCurrencyById[act.id] ?? ""}
+                        onChange={(e) =>
+                          setManualCurrencyById((prev) => ({
+                            ...prev,
+                            [act.id]: e.target.value.toUpperCase(),
+                          }))
+                        }
+                        placeholder="币种(如USD/RUB)"
+                        className="input-surface font-mono-code w-28 rounded-lg px-2 py-1 text-[11px]"
+                        title="核实币种后填写（留空则保持币种待核实，绝不自动覆盖未验证币种）"
+                      />
+                    ) : null}
+                    <button
+                      type="button"
+                      disabled={resolvingId === act.id}
+                      onClick={() => handleResolveActivation(act, "refund_confirmed")}
+                      className="cursor-pointer rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                    >
+                      确认已退
+                    </button>
+                    <button
+                      type="button"
+                      disabled={resolvingId === act.id}
+                      onClick={() => handleResolveActivation(act, "unrefundable")}
+                      className="cursor-pointer rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                    >
+                      确认未扣/不可退
+                    </button>
+                    <button
+                      type="button"
+                      disabled={resolvingId === act.id}
+                      onClick={() => handleResolveActivation(act, "completed")}
+                      className="inline-flex cursor-pointer items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3 w-3" />
+                      确认已完成
+                    </button>
+                    <button
+                      type="button"
+                      disabled={resolvingId === act.id}
+                      onClick={() => handleResolveActivation(act, "manual_resolved")}
+                      className="cursor-pointer rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                    >
+                      仅人工结清
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            {(reconciliation?.orders_requiring_review || []).slice(0, 6).map((ord) => (
               <div
-                key={act.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200/80 bg-white px-3 py-2 text-xs shadow-2xs"
+                key={ord.order_id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200/70 bg-amber-50/40 px-3 py-2 text-xs"
               >
                 <div className="min-w-0">
-                  <div className="font-mono-code font-medium text-slate-900">
-                    #{act.id} · 订单 {act.order_id} · {act.provider} ({act.state})
+                  <div className="font-mono-code font-medium text-slate-800">
+                    待复核订单 {ord.order_id} · {ord.provider}/{ord.service} ({ord.settlement_state || ord.status})
                   </div>
                   <div className="truncate text-[11px] text-slate-500">
-                    激活ID: {act.activation_id || "未获取"} · {act.last_error || "待核对上游账单"}
+                    {ord.error_message || ord.error_code || "完成或结算状态待复核"}
                   </div>
                 </div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <button
-                    type="button"
-                    disabled={resolvingId === act.id}
-                    onClick={() => handleResolveActivation(act, "refund_confirmed")}
-                    className="cursor-pointer rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
-                  >
-                    确认已退
-                  </button>
-                  <button
-                    type="button"
-                    disabled={resolvingId === act.id}
-                    onClick={() => handleResolveActivation(act, "unrefundable")}
-                    className="cursor-pointer rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
-                  >
-                    确认未扣/不可退
-                  </button>
-                  <button
-                    type="button"
-                    disabled={resolvingId === act.id}
-                    onClick={() => handleResolveActivation(act, "completed")}
-                    className="inline-flex cursor-pointer items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 disabled:opacity-50"
-                  >
-                    <CheckCircle2 className="h-3 w-3" />
-                    确认已完成
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchInput(ord.order_id);
+                    setDebouncedSearch(ord.order_id);
+                    setPage(1);
+                  }}
+                  className="cursor-pointer rounded-lg border border-amber-200 bg-white px-2.5 py-1 text-[11px] font-medium text-amber-800 hover:bg-amber-100"
+                >
+                  定位该订单
+                </button>
               </div>
             ))}
           </div>
@@ -424,7 +519,6 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                 value={searchInput}
                 onChange={(e) => {
                   setSearchInput(e.target.value);
-                  setPage(1);
                 }}
                 placeholder="搜索手机号 / 订单号 / 国家 / 外部ID"
                 className="input-surface w-64 rounded-xl py-2 pl-9 pr-8 text-xs"

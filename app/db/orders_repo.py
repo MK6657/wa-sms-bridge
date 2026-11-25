@@ -63,6 +63,7 @@ ALLOWED_ORDER_UPDATE_FIELDS = frozenset({
     "code_scrubbed",
     "code_count",
     "resend_base_code",
+    "resend_base_digest",
     "resend_seen_wait",
     "max_price",
     "quoted_max_price",
@@ -117,6 +118,12 @@ def _decrypt_code(stored: str) -> str:
     return stored
 
 
+def _compute_resend_digest(order_id: str, code: str) -> str:
+    if not order_id or not code:
+        return ""
+    return env.hmac_digest(f"resend:{order_id}", code)
+
+
 def _encode_field(field_name: str, val: Any) -> Any:
     if field_name in {"latest_code", "resend_base_code"}:
         return _encrypt_code_strict(str(val or ""))
@@ -150,6 +157,7 @@ class OrdersRepo:
         order["idempotency_error_message"] = str(order.get("idempotency_error_message") or "")
         order["latest_code"] = "" if order["code_scrubbed"] else _decrypt_code(str(order.get("latest_code") or ""))
         order["resend_base_code"] = _decrypt_code(str(order.get("resend_base_code") or ""))
+        order["resend_base_digest"] = str(order.get("resend_base_digest") or "")
         try:
             order["metadata"] = json.loads(order.get("metadata_json") or "{}")
         except Exception:
@@ -382,6 +390,9 @@ class OrdersRepo:
             sets.append(f"{field_name}=?")
             values.append(_encode_field(field_name, val))
 
+        if new_status in CLOSED_ORDER_STATUSES and "resend_base_digest" not in kwargs:
+            sets.append("resend_base_digest=''")
+
         placeholders = ",".join("?" for _ in expected_statuses)
         values.append(order_id)
         values.extend(expected_statuses)
@@ -407,7 +418,7 @@ class OrdersRepo:
                 ):
                     new_ver = int(sc_row["code_scrub_version"] or 0) + 1
                     await raw.execute(
-                        "UPDATE sms_orders SET latest_code='', resend_base_code='', code_scrubbed=1, "
+                        "UPDATE sms_orders SET latest_code='', resend_base_code='', resend_base_digest='', code_scrubbed=1, "
                         "code_scrub_version=?, updated_at=? WHERE order_id=?",
                         (new_ver, now, order_id),
                     )
@@ -436,6 +447,7 @@ class OrdersRepo:
         now = _utc_now_iso()
         enc_code = _encrypt_code_strict(code)
         enc_raw = _encrypt_code_strict(raw_text or code)
+        code_digest = _compute_resend_digest(order_id, code)
         commit_scrub_version = 0
         async with self._conn.transaction() as raw:
             state_cur = await raw.execute(
@@ -462,9 +474,9 @@ class OrdersRepo:
             upd = await raw.execute(
                 "UPDATE sms_orders SET status='code_received', version=version+1, "
                 "latest_code=?, code_received_at=?, code_scrubbed=0, code_count=?, "
-                "resend_base_code='', resend_seen_wait=0, error_code='', error_message='', updated_at=? "
+                "resend_base_code='', resend_base_digest=?, resend_seen_wait=0, error_code='', error_message='', updated_at=? "
                 "WHERE order_id=? AND status IN ('waiting_code', 'waiting_next_code') AND code_scrub_version=?",
-                (enc_code, now, next_seq, now, order_id, commit_scrub_version),
+                (enc_code, now, next_seq, code_digest, now, order_id, commit_scrub_version),
             )
             if (upd.rowcount or 0) != 1:
                 return None
@@ -615,11 +627,26 @@ class OrdersRepo:
     async def scrub_order_code_with_version(self, order_id: str) -> Optional[int]:
         """原子脱敏单笔订单并递增 code_scrub_version，返回新的脱敏版本号（不存在则返回 None）。"""
         now = _utc_now_iso()
+        closed_ph = ",".join("?" for _ in CLOSED_ORDER_STATUSES)
         async with self._conn.transaction() as raw:
+            pre_cur = await raw.execute(
+                "SELECT status, latest_code, resend_base_digest FROM sms_orders WHERE order_id=?",
+                (order_id,),
+            )
+            pre_row = await pre_cur.fetchone()
+            if pre_row is None:
+                return None
+            computed_digest = str(pre_row["resend_base_digest"] or "")
+            if not computed_digest and str(pre_row["status"] or "") not in CLOSED_ORDER_STATUSES:
+                plain_lc = _decrypt_code(str(pre_row["latest_code"] or ""))
+                if plain_lc:
+                    computed_digest = _compute_resend_digest(order_id, plain_lc)
+
             cur = await raw.execute(
-                "UPDATE sms_orders SET latest_code='', resend_base_code='', code_scrubbed=1, "
-                "code_scrub_version=code_scrub_version+1, updated_at=? WHERE order_id=?",
-                (now, order_id),
+                f"UPDATE sms_orders SET latest_code='', resend_base_code='', "
+                f"resend_base_digest=CASE WHEN status IN ({closed_ph}) THEN '' ELSE ? END, "
+                f"code_scrubbed=1, code_scrub_version=code_scrub_version+1, updated_at=? WHERE order_id=?",
+                (*CLOSED_ORDER_STATUSES, computed_digest, now, order_id),
             )
             if (cur.rowcount or 0) <= 0:
                 return None
@@ -700,7 +727,7 @@ class OrdersRepo:
 
             id_ph = ",".join("?" for _ in ids)
             await raw.execute(
-                f"UPDATE sms_orders SET latest_code='', resend_base_code='', code_scrubbed=1, "
+                f"UPDATE sms_orders SET latest_code='', resend_base_code='', resend_base_digest='', code_scrubbed=1, "
                 f"code_scrub_version=code_scrub_version+1, updated_at=? "
                 f"WHERE order_id IN ({id_ph})",
                 (now_iso, *ids),
@@ -838,7 +865,7 @@ class OrdersRepo:
                 refund_confirmed_count += 1
             elif ref == "pending":
                 refund_pending_count += 1
-            if status in {"cancelled", "expired"} and ref != "confirmed":
+            if status in {"cancelled", "expired"} and ref not in {"confirmed", "none"}:
                 unconfirmed_refund_count += 1
 
         refund_amount_unknown_count = 0

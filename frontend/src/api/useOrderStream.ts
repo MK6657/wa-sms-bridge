@@ -70,8 +70,8 @@ export function useOrderStream(
           // ignore
         }
         if (resyncRequired) {
+          // 服务端紧接着会推送独立 resync_required 事件，此处仅重置游标避免重复拉取两次快照
           tracker.resetCursor();
-          resyncRef.current?.("cursor_expired_or_restarted");
         } else if (isReconnect) {
           reconnectRef.current?.();
         }

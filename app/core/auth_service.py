@@ -14,22 +14,31 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import hashlib
 import hmac
+import ipaddress
+import logging
 import re
 import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastapi import Request, Response
 
 from app.config import env
 from app.db import Database
-from app.errors import AuthError, ConflictError, ForbiddenError
+from app.errors import AppError, AuthError, ConflictError, ForbiddenError
+
+logger = logging.getLogger(__name__)
 
 SESSION_COOKIE_NAME = "sms_hub_session"
+CSRF_HEADER_NAME = "x-sms-hub-csrf"
 DEFAULT_SCOPES = ["orders:rw", "prices:r", "blacklist:rw", "events:r"]
+UNSAFE_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "testserver", "test"})
 PROXY_FORWARD_HEADERS = (
     "x-forwarded-for",
     "x-forwarded-host",
@@ -52,14 +61,14 @@ def _slugify_project_id(name: str) -> str:
     return cleaned[:48]
 
 
-def _sign_session_token(expires_at: int) -> str:
+def _sign_session_token(expires_at: int, *, epoch: int = 1) -> str:
     nonce = secrets.token_hex(8)
-    payload = f"admin:{expires_at}:{nonce}"
+    payload = f"admin:{expires_at}:{epoch}:{nonce}"
     sig = hmac.new(env.session_signing_key, payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{payload}.{sig}"
 
 
-def _verify_session_token(token: str) -> bool:
+def _verify_session_token(token: str, *, current_epoch: int = 1) -> bool:
     if not token or "." not in token:
         return False
     payload, sig = token.rsplit(".", 1)
@@ -67,22 +76,154 @@ def _verify_session_token(token: str) -> bool:
     if not hmac.compare_digest(sig, expected):
         return False
     parts = payload.split(":")
-    if len(parts) != 3 or parts[0] != "admin":
+    if len(parts) == 4 and parts[0] == "admin":
+        try:
+            expires_at = int(parts[1])
+            token_epoch = int(parts[2])
+        except ValueError:
+            return False
+        if token_epoch != current_epoch:
+            return False
+        return time.time() < expires_at
+    if len(parts) == 3 and parts[0] == "admin":
+        if current_epoch != 1:
+            return False
+        try:
+            expires_at = int(parts[1])
+        except ValueError:
+            return False
+        return time.time() < expires_at
+    return False
+
+
+def _is_loopback_ip_literal(host_str: str) -> bool:
+    candidate = (host_str or "").strip().lower()
+    if not candidate:
         return False
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if "%" in candidate:
+        candidate = candidate.split("%", 1)[0]
     try:
-        expires_at = int(parts[1])
+        ip = ipaddress.ip_address(candidate)
     except ValueError:
         return False
-    return time.time() < expires_at
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return bool(ip.is_loopback)
+
+
+def _extract_host_without_port(raw_host: str) -> str:
+    text = (raw_host or "").strip().lower()
+    if not text:
+        return ""
+    if text.startswith("["):
+        end = text.find("]")
+        return text[1:end] if end != -1 else text
+    if text.count(":") == 1:
+        return text.split(":", 1)[0]
+    return text
+
+
+def _canonicalize_origin(origin_or_url: str) -> str:
+    raw = (origin_or_url or "").strip()
+    if not raw or raw.lower() == "null":
+        return ""
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    host_fmt = f"[{hostname}]" if ":" in hostname else hostname
+    if port is None or (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        return f"{scheme}://{host_fmt}"
+    return f"{scheme}://{host_fmt}:{port}"
+
+
+def _allowed_browser_origins(request: Request) -> set[str]:
+    allowed: set[str] = set()
+    fwd_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    scheme = fwd_proto if fwd_proto in {"http", "https"} else (request.url.scheme or "http").lower()
+    host_hdr = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+    if host_hdr:
+        same_origin = _canonicalize_origin(f"{scheme}://{host_hdr}")
+        if same_origin:
+            allowed.add(same_origin)
+    req_origin = _canonicalize_origin(f"{request.url.scheme}://{request.url.netloc}")
+    if req_origin:
+        allowed.add(req_origin)
+    for cfg_origin in env.cors_origins:
+        if cfg_origin and cfg_origin != "*":
+            canon = _canonicalize_origin(cfg_origin)
+            if canon:
+                allowed.add(canon)
+    return allowed
+
+
+def enforce_browser_csrf(request: Request) -> None:
+    """对基于 Cookie 或本机免密回环的写操作执行浏览器同源 / Fetch-Metadata CSRF 防护。"""
+    if request.method.upper() not in UNSAFE_HTTP_METHODS:
+        return
+
+    allowed_origins = _allowed_browser_origins(request)
+    explicit_cors = {
+        _canonicalize_origin(o)
+        for o in env.cors_origins
+        if o and o != "*" and _canonicalize_origin(o)
+    }
+
+    sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    raw_origin = (request.headers.get("origin") or "").strip()
+    canon_origin = _canonicalize_origin(raw_origin) if raw_origin else ""
+
+    if sec_fetch_site and sec_fetch_site not in {"same-origin", "none"}:
+        if not (canon_origin and canon_origin in explicit_cors):
+            raise ForbiddenError("跨站写请求已被 CSRF 安全策略拦截", code="CSRF_REJECTED")
+
+    if raw_origin:
+        if not canon_origin or canon_origin not in allowed_origins:
+            raise ForbiddenError("请求 Origin 与服务不同源，已被 CSRF 安全策略拦截", code="CSRF_REJECTED")
+    else:
+        raw_referer = (request.headers.get("referer") or "").strip()
+        if raw_referer:
+            canon_referer = _canonicalize_origin(raw_referer)
+            if not canon_referer or canon_referer not in allowed_origins:
+                raise ForbiddenError("请求 Referer 与服务不同源，已被 CSRF 安全策略拦截", code="CSRF_REJECTED")
+
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if content_type in {"application/x-www-form-urlencoded", "multipart/form-data", "text/plain"}:
+        if (request.headers.get(CSRF_HEADER_NAME) or "").strip() != "1":
+            raise ForbiddenError("表单类型写请求缺少 X-SMS-Hub-CSRF 防护头", code="CSRF_REJECTED")
 
 
 def is_direct_loopback(request: Request) -> bool:
-    """仅当直连本机回环且不存在任何反向代理转发头时返回 True。"""
+    """仅当直连本机回环、Host 为本机回环主机名、非跨站请求且不存在反代头时返回 True（防 DNS Rebinding）。"""
     for header_name in PROXY_FORWARD_HEADERS:
         if request.headers.get(header_name):
             return False
     client_host = (getattr(request.client, "host", "") or "").strip().lower()
-    return client_host in {"127.0.0.1", "::1", "testclient"}
+    if client_host != "testclient" and not _is_loopback_ip_literal(client_host):
+        return False
+
+    host_only = _extract_host_without_port(request.headers.get("host") or "")
+    if host_only and host_only not in ALLOWED_LOOPBACK_HOSTS and not _is_loopback_ip_literal(host_only):
+        return False
+
+    sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    if sec_fetch_site and sec_fetch_site not in {"same-origin", "none"}:
+        return False
+
+    raw_origin = (request.headers.get("origin") or "").strip()
+    if raw_origin:
+        canon_origin = _canonicalize_origin(raw_origin)
+        if not canon_origin or canon_origin not in _allowed_browser_origins(request):
+            return False
+
+    return True
 
 
 @dataclass(frozen=True)
@@ -117,9 +258,23 @@ class CallerContext:
 class AuthService:
     """统一管理会话与项目 API Key 鉴权。"""
 
+    _LOGIN_WINDOW_SECONDS = 60.0
+    _LOGIN_MAX_FAILURES = 10
+
     def __init__(self, db: Database):
         self._db = db
         self._bg_tasks: set[asyncio.Task] = set()
+        self._session_epoch: Optional[int] = None
+        self._failed_logins: dict[str, deque[float]] = {}
+
+    async def _get_session_epoch(self) -> int:
+        if self._session_epoch is None:
+            raw = await self._db.config.get("admin_session_epoch", "1")
+            try:
+                self._session_epoch = max(1, int(str(raw).strip()))
+            except ValueError:
+                self._session_epoch = 1
+        return self._session_epoch
 
     async def is_auth_required(self) -> bool:
         raw = await self._db.config.get("api_auth_required", "")
@@ -133,11 +288,58 @@ class AuthService:
     def password_configured(self) -> bool:
         return bool(env.console_admin_password)
 
-    def issue_admin_cookie(self, response: Response, *, request: Request) -> int:
+    def _client_rate_limit_key(self, request: Request) -> str:
+        if self.password_configured():
+            xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+            if xff:
+                return xff
+        return (getattr(request.client, "host", "") or "unknown").strip()
+
+    def check_login_rate_limit(self, request: Request) -> None:
+        key = self._client_rate_limit_key(request)
+        now = time.monotonic()
+        bucket = self._failed_logins.get(key)
+        if not bucket:
+            return
+        while bucket and now - bucket[0] > self._LOGIN_WINDOW_SECONDS:
+            bucket.popleft()
+        if not bucket:
+            self._failed_logins.pop(key, None)
+            return
+        if len(bucket) >= self._LOGIN_MAX_FAILURES:
+            raise AppError(
+                "管理员口令错误次数过多，请 1 分钟后再试",
+                status_code=429,
+                code="AUTH_RATE_LIMITED",
+                retryable=True,
+            )
+
+    def record_login_result(self, request: Request, *, success: bool) -> None:
+        key = self._client_rate_limit_key(request)
+        if success:
+            self._failed_logins.pop(key, None)
+            return
+        now = time.monotonic()
+        if len(self._failed_logins) >= 1024 and key not in self._failed_logins:
+            oldest_key = next(iter(self._failed_logins))
+            self._failed_logins.pop(oldest_key, None)
+        bucket = self._failed_logins.setdefault(key, deque())
+        while bucket and now - bucket[0] > self._LOGIN_WINDOW_SECONDS:
+            bucket.popleft()
+        bucket.append(now)
+        logger.warning("管理员控制台登录失败 source=%s failures_in_window=%d", key, len(bucket))
+
+    async def issue_admin_cookie(self, response: Response, *, request: Request) -> int:
         ttl = env.admin_session_ttl_seconds
         expires_at = int(time.time()) + ttl
-        token = _sign_session_token(expires_at)
-        is_https = (request.url.scheme or "").lower() == "https"
+        epoch = await self._get_session_epoch()
+        token = _sign_session_token(expires_at, epoch=epoch)
+        fwd_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        is_https = (
+            (request.url.scheme or "").lower() == "https"
+            or env.admin_cookie_secure
+            or (self.password_configured() and fwd_proto == "https")
+        )
         response.set_cookie(
             key=SESSION_COOKIE_NAME,
             value=token,
@@ -148,6 +350,16 @@ class AuthService:
             path="/",
         )
         return expires_at
+
+    async def revoke_and_clear_admin_cookie(self, request: Request, response: Response) -> None:
+        cookie_token = (request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
+        if cookie_token:
+            epoch = await self._get_session_epoch()
+            if _verify_session_token(cookie_token, current_epoch=epoch):
+                new_epoch = epoch + 1
+                self._session_epoch = new_epoch
+                await self._db.config.set("admin_session_epoch", str(new_epoch))
+        response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
 
     def clear_admin_cookie(self, response: Response) -> None:
         response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
@@ -271,7 +483,8 @@ class AuthService:
             )
         cookie_token = (request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
         if cookie_token:
-            return _verify_session_token(cookie_token)
+            epoch = await self._get_session_epoch()
+            return _verify_session_token(cookie_token, current_epoch=epoch)
         if env.console_admin_password or await self.is_auth_required():
             return False
         return is_direct_loopback(request)
@@ -338,7 +551,9 @@ class AuthService:
         # 2. 服务端签名 HttpOnly 管理员会话 Cookie（同时覆盖 REST 与浏览器 SSE）
         cookie_token = (request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
         if cookie_token:
-            if _verify_session_token(cookie_token):
+            epoch = await self._get_session_epoch()
+            if _verify_session_token(cookie_token, current_epoch=epoch):
+                enforce_browser_csrf(request)
                 return CallerContext(
                     project_id="web-console",
                     name="控制台管理员",
@@ -364,6 +579,8 @@ class AuthService:
                 "非本机直连请求必须提供有效凭据（请配置 CONSOLE_ADMIN_PASSWORD 或使用项目 API Key）",
                 code="AUTH_REMOTE_DENIED",
             )
+
+        enforce_browser_csrf(request)
 
         # 仅限单机直连回环、未设口令且未开启严格模式时的开发免密模式
         return CallerContext(

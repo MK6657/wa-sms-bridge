@@ -143,19 +143,13 @@ class RegisterOrchestrator:
         if not activation_id:
             return True, "not_required"
         try:
+            from app.providers.base import parse_cancel_outcome
+
             prov = self._registry.get(provider_name)
             result = await prov._safe_cancel(activation_id)
-            text = str(result or "").strip()
-            normalized = text.upper()
-            settled = any(token in normalized for token in (
-                "ACCESS_CANCEL",
-                "ACCESS_READY",
-                "CANCELLED",
-                "CANCELED",
-                "COMPLETED",
-                "FINISH",
-                "READY",
-            ))
+            outcome = parse_cancel_outcome(result)
+            settled = outcome.settled
+            text = str(result or "").strip() or outcome.status
             log_method = logger.info if settled else logger.warning
             log_method(
                 "[%s] 补偿取消激活: provider=%s activation=%s reason=%s result=%s settled=%s",
@@ -598,7 +592,9 @@ class RegisterOrchestrator:
                                   request_interval: float = 1.0,
                                   proxy: str = "") -> dict:
         """异步启动注册任务。"""
-        if canonical_service(service) != "whatsapp":
+        provider_name = (provider_name or "smsbower").strip().lower()
+        raw_svc = str(service or "whatsapp").strip().lower()
+        if raw_svc.startswith("custom:") or canonical_service(service) != "whatsapp":
             return {
                 "task_id": task_id,
                 "status": "failed",
@@ -687,8 +683,9 @@ class RegisterOrchestrator:
         task = await self._db.get_task(task_id)
         if task and task.get("status") in {"running", "compensation_pending"}:
             commit_state = str(task.get("account_commit_state") or "none")
+            account_already_cleaned = bool(task.get("account_compensated"))
             outcome = await self._compensate_task_snapshot(task, reason="手动停止")
-            if commit_state in {"pending", "committed"}:
+            if commit_state in {"pending", "committed"} and not account_already_cleaned:
                 await self._mark_attention(
                     task_id,
                     "停止发生在账号提交阶段，已保护账号且未执行删除，请核对登录态",
@@ -859,6 +856,15 @@ class RegisterOrchestrator:
                         wait_before_next = True
                         continue
 
+                    if phone_input.e164_number != activation.phone_number and await self._db.is_blacklisted(
+                        phone_input.e164_number, provider=provider_name
+                    ):
+                        final_error = "号码在黑名单中"
+                        if not await compensate_attempt("号码在黑名单中"):
+                            return
+                        wait_before_next = True
+                        continue
+
                     await self._db.update_task(task_id, step="探测中")
                     probe = await self._waapi.probe_phone(
                         phone_input,
@@ -926,15 +932,21 @@ class RegisterOrchestrator:
                         step="提交 OTP",
                         account_commit_state="pending",
                     )
-                    otp_result = await self._waapi.submit_otp(
-                        reg.wa_account_id,
-                        sms_code,
-                        verification_request_id=reg.verification_request_id,
-                        proxy_url=proxy_url,
-                        correlation_id=task_id,
-                        request_id=f"{attempt_request_id}:otp",
-                    )
-                    if not otp_result.success or not otp_result.registered:
+                    try:
+                        otp_result = await self._waapi.submit_otp(
+                            reg.wa_account_id,
+                            sms_code,
+                            verification_request_id=reg.verification_request_id,
+                            proxy_url=proxy_url,
+                            correlation_id=task_id,
+                            request_id=f"{attempt_request_id}:otp",
+                        )
+                    except Exception as otp_exc:
+                        attempt_committed = True
+                        raise otp_exc
+                    if otp_result.request_failed or not otp_result.success or not (
+                        otp_result.login_active or otp_result.registered
+                    ):
                         failure_category = otp_result.failure_category
                         failure_code = otp_result.failure_reason or otp_result.error_code or otp_result.status
                         final_error = OTP_FAILURE_MESSAGES.get(
@@ -952,6 +964,7 @@ class RegisterOrchestrator:
                             error=final_error,
                             failure_category=failure_category,
                             failure_code=failure_code,
+                            account_commit_state="none",
                             attempts_used=attempts_used,
                             wa_status=otp_result.status,
                             registration_phase=otp_result.registration_phase,
@@ -1227,8 +1240,9 @@ class RegisterOrchestrator:
             logger.info("[%s] 任务被取消", task_id)
             task = await self._db.get_task(task_id)
             commit_state = str((task or {}).get("account_commit_state") or "none")
+            account_already_cleaned = bool((task or {}).get("account_compensated"))
             outcome = await self._compensate_task_snapshot(task, reason="任务取消")
-            if commit_state in {"pending", "committed"}:
+            if commit_state in {"pending", "committed"} and not account_already_cleaned:
                 await self._mark_attention(
                     task_id,
                     "任务在账号提交阶段被停止，已保护账号且未执行删除，请核对登录态",

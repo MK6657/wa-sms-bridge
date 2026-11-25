@@ -30,6 +30,8 @@ def _scrub_event_payload_in_place(data: dict[str, Any]) -> None:
         data["latest_code"] = ""
     if "resend_base_code" in data:
         data["resend_base_code"] = ""
+    if "resend_base_digest" in data:
+        data["resend_base_digest"] = ""
     if "code_scrubbed" in data or "latest_code" in data or "messages" in data or "message" in data:
         data["code_scrubbed"] = True
     messages = data.get("messages")
@@ -94,6 +96,7 @@ class _Subscriber:
     order_id: str = ""
     project_id: str = ""
     credential_project_id: str = ""
+    overflowed: bool = False
 
 
 class EventBus:
@@ -108,6 +111,27 @@ class EventBus:
         self._scrub_versions: dict[str, int] = {}
         self._next_sub_id = 1
         self._next_seq = 1
+        self._closed = False
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def close_all(self) -> None:
+        """优雅停机时唤醒所有 SSE 订阅协程立即退出，不卡死 Uvicorn 关停。"""
+        self._closed = True
+        for sub in list(self._sub_map.values()):
+            sub.revoke_event.set()
+
+    def consume_overflow(self, queue: asyncio.Queue[BusEvent]) -> bool:
+        """检查并重置指定订阅队列的溢出丢包标记。"""
+        for sub in self._sub_map.values():
+            if sub.queue is queue:
+                if sub.overflowed:
+                    sub.overflowed = False
+                    return True
+                return False
+        return False
 
     def _check_scrubbed(self, order_id: str, seq: int, code_scrub_version: Optional[int] = None) -> bool:
         if not order_id:
@@ -174,12 +198,13 @@ class EventBus:
             if sub.queue.full():
                 try:
                     sub.queue.get_nowait()
+                    sub.overflowed = True
                 except asyncio.QueueEmpty:
                     pass
             try:
                 sub.queue.put_nowait(item)
             except asyncio.QueueFull:
-                pass
+                sub.overflowed = True
         return item
 
     def scrub_order_codes(
@@ -205,6 +230,10 @@ class EventBus:
                 self._scrub_versions[oid] = max(prev_ver, int(scrub_versions[oid]))
             else:
                 self._scrub_versions[oid] = prev_ver + 1
+            if len(self._scrubbed_up_to_seq) > 4096:
+                self._scrubbed_up_to_seq.pop(next(iter(self._scrubbed_up_to_seq)), None)
+            if len(self._scrub_versions) > 4096:
+                self._scrub_versions.pop(next(iter(self._scrub_versions)), None)
 
             refs = self._live_refs.pop(oid, [])
             for ref in refs:

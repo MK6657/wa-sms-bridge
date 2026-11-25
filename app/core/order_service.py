@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -125,6 +126,38 @@ class _RefCountedLock:
     refs: int = 0
 
 
+class _ManagedAsyncLock:
+    """自动引用计数回收的异步互斥锁（无持有者与等待者时自动从字典剔除，杜绝长稳运行内存增长）。"""
+
+    def __init__(self, table: dict[Any, "_ManagedAsyncLock"], key: Any):
+        self._table = table
+        self._key = key
+        self._lock = asyncio.Lock()
+        self.refs = 0
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def __aenter__(self) -> "_ManagedAsyncLock":
+        self.refs += 1
+        try:
+            await self._lock.acquire()
+        except BaseException:
+            self.refs -= 1
+            if self.refs <= 0 and self._table.get(self._key) is self and not self._lock.locked():
+                self._table.pop(self._key, None)
+            raise
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            self._lock.release()
+        finally:
+            self.refs -= 1
+            if self.refs <= 0 and self._table.get(self._key) is self and not self._lock.locked():
+                self._table.pop(self._key, None)
+
+
 class OrderService:
     """通用 SMS 接码订单状态机与按需轮询管理器。"""
 
@@ -150,8 +183,8 @@ class OrderService:
         self._on_orders_scrubbed_cb = on_orders_scrubbed
         self._tasks: dict[str, asyncio.Task] = {}
         self._inflight_binds: dict[str, asyncio.Task] = {}
-        self._order_locks: dict[str, asyncio.Lock] = {}
-        self._activation_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._order_locks: dict[str, _ManagedAsyncLock] = {}
+        self._activation_locks: dict[tuple[str, str], _ManagedAsyncLock] = {}
         self._idem_locks: dict[tuple[str, str], _RefCountedLock] = {}
         self._acquire_waiters: dict[str, asyncio.Event] = {}
         self._acquire_errors: dict[str, AppError] = {}
@@ -187,18 +220,22 @@ class OrderService:
     def set_scrub_notifier(self, callback: Callable[[list[str]], Any]) -> None:
         self._on_orders_scrubbed_cb = callback
 
-    def _lock_for(self, order_id: str) -> asyncio.Lock:
+    def _is_order_locked(self, order_id: str) -> bool:
+        entry = self._order_locks.get(order_id)
+        return bool(entry is not None and entry.locked())
+
+    def _lock_for(self, order_id: str) -> _ManagedAsyncLock:
         lock = self._order_locks.get(order_id)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = _ManagedAsyncLock(self._order_locks, order_id)
             self._order_locks[order_id] = lock
         return lock
 
-    def _activation_lock_for(self, provider: str, activation_id: str) -> asyncio.Lock:
+    def _activation_lock_for(self, provider: str, activation_id: str) -> _ManagedAsyncLock:
         key = ((provider or "").strip().lower(), (activation_id or "").strip())
         lock = self._activation_locks.get(key)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = _ManagedAsyncLock(self._activation_locks, key)
             self._activation_locks[key] = lock
         return lock
 
@@ -1153,8 +1190,9 @@ class OrderService:
                     )
                 )
                 self._inflight_binds[order_id] = bind_task
+                bound_ok = False
                 try:
-                    await asyncio.shield(bind_task)
+                    bound_ok = bool(await asyncio.shield(bind_task))
                 except asyncio.CancelledError:
                     raise
                 except Exception as bind_exc:
@@ -1193,6 +1231,11 @@ class OrderService:
                 finally:
                     if self._inflight_binds.get(order_id) is bind_task and bind_task.done():
                         self._inflight_binds.pop(order_id, None)
+
+                if not bound_ok:
+                    # 购买意图行在取号期间已被并发取消或人工核销：立即补偿取消上游刚分配的激活
+                    await self._provider_cancel(provider, activation.activation_id)
+                    return None
 
                 # 复核 P1-03: 对支持精确成交价回报的平台，校验成交价未越过锁定目标价
                 if (
@@ -1945,8 +1988,6 @@ class OrderService:
                             status, code = "ERROR", ""
 
                         if status == "OK" and code:
-                            # v7 复核 P0-01: 脱敏后重发 (waiting_next_code 且 base_code=='') 严禁用 code != '' 跳过 WAIT 校验；
-                            # 无上游消息 ID 时必须观测到上游 WAIT 状态跳变（seen_wait_since_resend=True）才接受后续短信，零哈希残留！
                             if order["status"] == "waiting_next_code":
                                 if base_code:
                                     is_new_code = (
@@ -1954,7 +1995,16 @@ class OrderService:
                                         and code not in ignored_scrubbed_codes
                                     )
                                 else:
-                                    is_new_code = seen_wait_since_resend and code not in ignored_scrubbed_codes
+                                    base_digest = str(order.get("resend_base_digest") or "")
+                                    if base_digest:
+                                        cand_digest = env.hmac_digest(f"resend:{order_id}", code)
+                                        matches_old = hmac.compare_digest(cand_digest, base_digest)
+                                        is_new_code = (
+                                            (seen_wait_since_resend or not matches_old)
+                                            and code not in ignored_scrubbed_codes
+                                        )
+                                    else:
+                                        is_new_code = seen_wait_since_resend and code not in ignored_scrubbed_codes
                             else:
                                 is_new_code = (
                                     (seen_wait_since_resend or (bool(base_code) and code != base_code))
@@ -2113,98 +2163,126 @@ class OrderService:
                     return
 
                 provider_key = str(latest["provider"]).strip().lower()
-                provider = None
-                try:
-                    provider = self._registry.get(provider_key)
-                    outcome = await self._provider_cancel(provider, activation_id)
-                except Exception as exc:
-                    outcome = CancelOutcome(settled=False, status="error", retryable=True, raw=str(exc), refund_confirmed=False)
-
-                if outcome.refund_confirmed:
-                    act_row = await self._db.activations.get_by_activation_id(order_id, activation_id)
-                    ref_amt, ref_src = self._resolve_refund_evidence(provider, outcome, act_row)
-
-                    async def _act_to_ref_tx(raw, now):
-                        await self._db.activations.ensure_activation_state_in_tx(
-                            raw,
-                            order_id,
-                            activation_id,
-                            provider=str(latest["provider"]),
-                            state="refund_confirmed",
-                            now=now,
-                            last_error="等码超时已确认退款",
-                            country_id=str(latest.get("country_id") or ""),
-                            service_code=str(latest.get("service_code") or ""),
-                            currency=str(latest.get("currency") or ""),
-                            refund_amount=ref_amt,
-                            refund_amount_source=ref_src,
+                async with self._activation_lock_for(provider_key, activation_id):
+                    existing_act = await self._db.activations.get_by_activation_id(order_id, activation_id)
+                    provider = self._registry.get(provider_key) if self._registry.is_active(provider_key) else None
+                    if existing_act and existing_act.get("state") == "refund_confirmed":
+                        outcome = CancelOutcome(
+                            settled=True,
+                            status="refund_confirmed",
+                            retryable=False,
+                            raw="CACHED_REFUND_CONFIRMED",
+                            refund_confirmed=True,
                         )
+                    elif existing_act and existing_act.get("state") in {"unrefundable", "completed", "manual_resolved"}:
+                        outcome = CancelOutcome(
+                            settled=True,
+                            status=str(existing_act.get("state")),
+                            retryable=False,
+                            raw=f"CACHED_{str(existing_act.get('state')).upper()}",
+                            refund_confirmed=False,
+                        )
+                    elif provider is None:
+                        outcome = CancelOutcome(
+                            settled=False,
+                            status="provider_inactive",
+                            retryable=True,
+                            raw=f"provider '{provider_key}' not active",
+                            refund_confirmed=False,
+                        )
+                    else:
+                        try:
+                            outcome = await self._provider_cancel(provider, activation_id)
+                        except Exception as exc:
+                            outcome = CancelOutcome(settled=False, status="error", retryable=True, raw=str(exc), refund_confirmed=False)
 
-                    await self._finalize_order_status(
-                        order_id,
-                        expected_statuses=("cancelling",),
-                        new_status="expired",
-                        base_order=claimed,
-                        activation_tx_hook=_act_to_ref_tx,
-                        refund_state="confirmed",
-                        settlement_state="cancelled",
-                        error_code="SMS_TIMEOUT",
-                        error_message=f"等码超时 ({latest.get('wait_timeout', 180)}s)，已确认取消退款",
-                    )
+                    if outcome.refund_confirmed:
+                        ref_amt, ref_src = self._resolve_refund_evidence(provider, outcome, existing_act)
+
+                        async def _act_to_ref_tx(raw, now):
+                            await self._db.activations.ensure_activation_state_in_tx(
+                                raw,
+                                order_id,
+                                activation_id,
+                                provider=str(latest["provider"]),
+                                state="refund_confirmed",
+                                now=now,
+                                last_error="等码超时已确认退款",
+                                country_id=str(latest.get("country_id") or ""),
+                                service_code=str(latest.get("service_code") or ""),
+                                currency=str(latest.get("currency") or ""),
+                                refund_amount=ref_amt,
+                                refund_amount_source=ref_src,
+                                protect_settled=True,
+                            )
+
+                        await self._finalize_order_status(
+                            order_id,
+                            expected_statuses=("cancelling",),
+                            new_status="expired",
+                            base_order=claimed,
+                            activation_tx_hook=_act_to_ref_tx,
+                            refund_state="confirmed",
+                            settlement_state="cancelled",
+                            error_code="SMS_TIMEOUT",
+                            error_message=f"等码超时 ({latest.get('wait_timeout', 180)}s)，已确认取消退款",
+                        )
+                        return
+                    elif outcome.settled:
+                        async def _act_to_unref_tx(raw, now):
+                            await self._db.activations.ensure_activation_state_in_tx(
+                                raw,
+                                order_id,
+                                activation_id,
+                                provider=str(latest["provider"]),
+                                state="unrefundable",
+                                now=now,
+                                last_error=outcome.raw,
+                                country_id=str(latest.get("country_id") or ""),
+                                service_code=str(latest.get("service_code") or ""),
+                                currency=str(latest.get("currency") or ""),
+                                protect_settled=True,
+                            )
+
+                        await self._finalize_order_status(
+                            order_id,
+                            expected_statuses=("cancelling",),
+                            new_status="expired",
+                            base_order=claimed,
+                            activation_tx_hook=_act_to_unref_tx,
+                            refund_state="unrefundable",
+                            settlement_state="cancelled",
+                            error_code="SMS_TIMEOUT",
+                            error_message=f"等码超时，上游返回 {outcome.status}（未确认退款）",
+                        )
+                    else:
+                        async def _act_to_pend_tx(raw, now):
+                            await self._db.activations.ensure_activation_state_in_tx(
+                                raw,
+                                order_id,
+                                activation_id,
+                                provider=str(latest["provider"]),
+                                state="refund_pending",
+                                now=now,
+                                last_error=outcome.raw,
+                                country_id=str(latest.get("country_id") or ""),
+                                service_code=str(latest.get("service_code") or ""),
+                                currency=str(latest.get("currency") or ""),
+                                protect_settled=True,
+                            )
+
+                        updated = await self._db.orders.transition_status(
+                            order_id,
+                            expected_statuses=("cancelling",),
+                            new_status="compensation_pending",
+                            refund_state="pending",
+                            error_code="CANCEL_RETRY_PENDING",
+                            error_message=f"等码超时，自动退款待后台重试: {outcome.raw or outcome.status}",
+                            tx_hook=_act_to_pend_tx,
+                        )
+                        if updated:
+                            self._emit("order.status_changed", updated)
                     return
-                elif outcome.settled:
-                    async def _act_to_unref_tx(raw, now):
-                        await self._db.activations.ensure_activation_state_in_tx(
-                            raw,
-                            order_id,
-                            activation_id,
-                            provider=str(latest["provider"]),
-                            state="unrefundable",
-                            now=now,
-                            last_error=outcome.raw,
-                            country_id=str(latest.get("country_id") or ""),
-                            service_code=str(latest.get("service_code") or ""),
-                            currency=str(latest.get("currency") or ""),
-                        )
-
-                    await self._finalize_order_status(
-                        order_id,
-                        expected_statuses=("cancelling",),
-                        new_status="expired",
-                        base_order=claimed,
-                        activation_tx_hook=_act_to_unref_tx,
-                        refund_state="unrefundable",
-                        settlement_state="cancelled",
-                        error_code="SMS_TIMEOUT",
-                        error_message=f"等码超时，上游返回 {outcome.status}（未确认退款）",
-                    )
-                else:
-                    async def _act_to_pend_tx(raw, now):
-                        await self._db.activations.ensure_activation_state_in_tx(
-                            raw,
-                            order_id,
-                            activation_id,
-                            provider=str(latest["provider"]),
-                            state="refund_pending",
-                            now=now,
-                            last_error=outcome.raw,
-                            country_id=str(latest.get("country_id") or ""),
-                            service_code=str(latest.get("service_code") or ""),
-                            currency=str(latest.get("currency") or ""),
-                        )
-
-                    updated = await self._db.orders.transition_status(
-                        order_id,
-                        expected_statuses=("cancelling",),
-                        new_status="compensation_pending",
-                        refund_state="pending",
-                        error_code="CANCEL_RETRY_PENDING",
-                        error_message=f"等码超时，自动退款待后台重试: {outcome.raw or outcome.status}",
-                        tx_hook=_act_to_pend_tx,
-                    )
-                    if updated:
-                        self._emit("order.status_changed", updated)
-                return
 
         if restart_poller is not None:
             self._start_code_poller(order_id, previous_code=restart_poller[0], initial_seen_wait=restart_poller[1])
@@ -2338,7 +2416,10 @@ class OrderService:
                     f"当前状态 '{order['status']}' 不支持请求重发，仅在收到验证码（code_received）后可用",
                     code="ORDER_INVALID_STATE",
                 )
-            provider = self._registry.get(order["provider"])
+            try:
+                provider = self._registry.get(order["provider"])
+            except ValueError as exc:
+                raise AppError(str(exc), status_code=400, code="PROVIDER_NOT_ACTIVE") from exc
             if not getattr(provider.capabilities, "supports_resend", False):
                 raise AppError(f"平台 {order['provider']} 不支持请求重发短信", status_code=400, code="RESEND_UNSUPPORTED")
 
@@ -2351,6 +2432,11 @@ class OrderService:
                 )
 
             previous_code = str(order.get("latest_code") or "")
+            base_digest = (
+                env.hmac_digest(f"resend:{order_id}", previous_code)
+                if previous_code
+                else str(order.get("resend_base_digest") or "")
+            )
             expires_at = (_utc_now() + timedelta(seconds=int(order.get("wait_timeout") or 180))).isoformat()
             updated = await self._db.orders.transition_status(
                 order_id,
@@ -2358,6 +2444,7 @@ class OrderService:
                 new_status="waiting_next_code",
                 expires_at=expires_at,
                 resend_base_code=previous_code,
+                resend_base_digest=base_digest,
                 resend_seen_wait=False,
                 error_code="",
                 error_message="",
@@ -3259,6 +3346,9 @@ class OrderService:
                                         "UPDATE sms_orders SET refund_state='confirmed', version=version+1, updated_at=? WHERE order_id=?",
                                         (now, order_id),
                                     )
+                                refreshed_parent = await self._db.orders.get(order_id, include_messages=True, include_activations=True)
+                                if refreshed_parent:
+                                    self._emit("order.status_changed", refreshed_parent)
                             else:
                                 await self._db.activations.update_state(
                                     int(row["id"]),
@@ -3319,6 +3409,9 @@ class OrderService:
                                         "UPDATE sms_orders SET refund_state='unrefundable', version=version+1, updated_at=? WHERE order_id=?",
                                         (now, order_id),
                                     )
+                                refreshed_parent = await self._db.orders.get(order_id, include_messages=True, include_activations=True)
+                                if refreshed_parent:
+                                    self._emit("order.status_changed", refreshed_parent)
                             else:
                                 await self._db.activations.update_state(
                                     int(row["id"]), state="unrefundable", last_error=outcome.raw
@@ -3344,7 +3437,7 @@ class OrderService:
                                         "idempotency_error_code": "ACQUIRE_POST_ERROR",
                                         "idempotency_error_message": "滞留激活已转入后台退款重试",
                                     }
-                                await self._db.orders.transition_status(
+                                comp_ord = await self._db.orders.transition_status(
                                     order_id,
                                     expected_statuses=("acquiring",),
                                     new_status="compensation_pending",
@@ -3355,6 +3448,8 @@ class OrderService:
                                     tx_hook=_act_upd_pend_tx,
                                     **idem_extra,
                                 )
+                                if comp_ord:
+                                    self._emit("order.status_changed", comp_ord)
                             else:
                                 await self._db.activations.update_state(
                                     int(row["id"]),
@@ -3459,6 +3554,7 @@ class OrderService:
             )
             if recovered is None:
                 return False
+            self._emit("order.status_changed", recovered)
             if fallback_status == "waiting_code":
                 expires_dt = _parse_iso(str(recovered.get("expires_at") or ""))
                 if expires_dt and _utc_now() >= expires_dt:
@@ -3516,12 +3612,12 @@ class OrderService:
                         await self._handle_provider_inactive_in_recovery(order)
                         reconciled += 1
                 elif status == "cancelling":
-                    if self._has_live_task(order_id) or self._lock_for(order_id).locked():
+                    if self._has_live_task(order_id) or self._is_order_locked(order_id):
                         continue
                     if await self._recover_stranded_cancelling(order, attempted_activations=attempted_activations):
                         reconciled += 1
                 elif status == "completing":
-                    if self._has_live_task(order_id) or self._lock_for(order_id).locked():
+                    if self._has_live_task(order_id) or self._is_order_locked(order_id):
                         continue
                     if await self._recover_stranded_completing(order):
                         reconciled += 1
@@ -3532,7 +3628,9 @@ class OrderService:
 
     async def list_reconciliation_items(self) -> dict[str, Any]:
         """汇总所有需要人工关注的对账项：不确定购买、收码写库持续失败、待退款激活、待核对历史币种及待核对订单。"""
-        uncertain_activations = await self._db.activations.list_uncertain()
+        uncertain_activations = await self._db.activations.list_uncertain(
+            active_acquiring_order_ids=self._active_acquiring_orders,
+        )
         pending_refund_activations = await self._db.activations.list_pending_refunds(
             active_acquiring_order_ids=self._active_acquiring_orders,
         )

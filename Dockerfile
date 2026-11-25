@@ -2,15 +2,15 @@
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /build/frontend
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
 # ── Stage 2: 极简 Python 运行时（零 Node.js 进程与残留） ──────────
 FROM python:3.11-slim
 
-LABEL version="1.1.0"
+LABEL version="1.2.0"
 LABEL description="SMS Hub (wa-sms-bridge) — 独立 SMS 接码核心与对外集成 API 服务"
 
 WORKDIR /app
@@ -32,4 +32,4 @@ ENV ACTIVE_PROVIDERS=smsbower
 ENV DEFAULT_PROVIDER=smsbower
 ENV ENABLE_WA_PLUGIN=false
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090", "--timeout-graceful-shutdown", "5"]

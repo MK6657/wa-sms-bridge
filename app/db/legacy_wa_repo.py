@@ -11,6 +11,37 @@ from app.db.connection import DatabaseConnection
 logger = logging.getLogger(__name__)
 
 
+ALLOWED_TASK_STATE_FIELDS = frozenset({
+    "status",
+    "provider",
+    "country_id",
+    "country_label",
+    "activation_id",
+    "phone_number",
+    "order_id",
+    "wa_account_id",
+    "verification_request_id",
+    "wa_status",
+    "registration_phase",
+    "failure_category",
+    "failure_code",
+    "step",
+    "error",
+    "attempts_used",
+    "successes_done",
+    "target_success_count",
+    "cost_total",
+    "account_commit_state",
+    "attempt_request_id",
+    "sms_finalize_state",
+    "reconciliation_required",
+    "reconciliation_error",
+    "activation_compensated",
+    "account_compensated",
+    "completed_at",
+})
+
+
 class LegacyWaRepo:
     def __init__(self, conn: DatabaseConnection):
         self._conn = conn
@@ -37,10 +68,15 @@ class LegacyWaRepo:
     async def update_task(self, task_id: str, **kwargs: Any) -> None:
         if not kwargs:
             return
+        for k in kwargs:
+            if k not in ALLOWED_TASK_STATE_FIELDS:
+                raise ValueError(f"Unsupported task_state column: {k}")
+        now = datetime.now(timezone.utc).isoformat()
         sets = [f"{k}=?" for k in kwargs]
         values = list(kwargs.values())
+        sets.append("updated_at=?")
+        values.append(now)
         values.append(task_id)
-        sets.append("updated_at=datetime('now')")
         await self._conn.write(f"UPDATE task_state SET {', '.join(sets)} WHERE task_id=?", tuple(values))
 
     async def get_task(self, task_id: str) -> Optional[dict[str, Any]]:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 from typing import Any, Optional
@@ -195,10 +196,18 @@ class SmsBowerProvider(BaseSmsProvider):
             except Exception:
                 countries = []
             if iso_for_cc:
-                for item in countries:
-                    if str(item.get("iso", "")).lower() == iso_for_cc and str(item.get("cc", "")) == cc_digits:
-                        cid = int(item["id"]) if str(item.get("id", "")).isdigit() else item.get("id")
-                        return cid, item.get("name") or str(cid)
+                iso_cc_matches = [
+                    item for item in countries
+                    if str(item.get("iso", "")).lower() == iso_for_cc and str(item.get("cc", "")) == cc_digits
+                ]
+                if iso_cc_matches:
+                    non_virt = [
+                        it for it in iso_cc_matches
+                        if "virtual" not in str(it.get("name", "")).lower() and "虚拟" not in str(it.get("name_zh", ""))
+                    ]
+                    chosen = non_virt[0] if non_virt else iso_cc_matches[0]
+                    cid = int(chosen["id"]) if str(chosen.get("id", "")).isdigit() else chosen.get("id")
+                    return cid, chosen.get("name") or str(cid)
             for item in countries:
                 if str(item.get("cc", "")) == cc_digits:
                     cid = int(item["id"]) if str(item.get("id", "")).isdigit() else item.get("id")
@@ -268,25 +277,34 @@ class SmsBowerProvider(BaseSmsProvider):
         """SMSBower 号码归一化，动态国家数据优先、静态表兜底。"""
         from app.phone_normalizer import build_phone_input, resolve_country_metadata
 
-        cid = int(country_id) if isinstance(country_id, (int, str)) and str(country_id).isdigit() else 0
-        info = COUNTRIES.get(cid, {})
+        cid: Optional[int]
+        if isinstance(country_id, int) or (isinstance(country_id, str) and country_id.strip().isdigit()):
+            cid = int(str(country_id).strip())
+        else:
+            cid = ALIASES.get(str(country_id or "").strip().lower())
+        info = COUNTRIES.get(cid, {}) if cid is not None else {}
         static_rows = [{
             "id": cid,
             "name": info.get("eng", ""),
             "cc": info.get("cc", ""),
             "iso": COUNTRY_ISO2.get(cid, ""),
-        }] if info else []
+        }] if (cid is not None and info) else []
 
         rows = static_rows
-        if not info or not info.get("cc") or not COUNTRY_ISO2.get(cid, ""):
+        if cid is None or not info or not info.get("cc") or not COUNTRY_ISO2.get(cid, ""):
             try:
                 rows = static_rows + await self.get_countries()
             except Exception:
                 rows = static_rows
 
+        fallback_label = (
+            (info.get("eng", "") or self._cached_country_label(cid))
+            if cid is not None
+            else str(country_id or "")
+        )
         meta = resolve_country_metadata(
-            cid,
-            country_label=info.get("eng", "") or self._cached_country_label(cid),
+            cid if cid is not None else country_id,
+            country_label=fallback_label,
             countries=rows,
         )
         return build_phone_input(
@@ -380,7 +398,10 @@ class SmsBowerProvider(BaseSmsProvider):
         text = await self._get(action="getBalance")
         if text.startswith("ACCESS_BALANCE:"):
             try:
-                return float(text.split(":", 1)[1].strip())
+                bal = float(text.split(":", 1)[1].strip())
+                if not math.isfinite(bal):
+                    raise ValueError("non-finite balance")
+                return bal
             except ValueError as exc:
                 raise SmsProviderError(f"余额数值格式异常: {text[:100]}") from exc
         raise SmsProviderError(f"获取余额失败: {text[:100]}")
@@ -471,16 +492,20 @@ class SmsBowerProvider(BaseSmsProvider):
             if isinstance(value, (list, tuple)) and value:
                 value = value[0]
             try:
-                return float(value)
-            except (TypeError, ValueError):
+                num = float(value)
+                return num if math.isfinite(num) else None
+            except (TypeError, ValueError, OverflowError):
                 return None
 
         def as_count(value) -> int:
             if isinstance(value, str) and value.strip().lower() == "few":
                 return 1
             try:
-                return max(0, int(float(value)))
-            except (TypeError, ValueError):
+                num = float(value)
+                if not math.isfinite(num):
+                    return 0
+                return max(0, int(num))
+            except (TypeError, ValueError, OverflowError):
                 return 0
 
         def first_float(obj: dict, names: tuple[str, ...]) -> Optional[float]:
@@ -497,7 +522,7 @@ class SmsBowerProvider(BaseSmsProvider):
                     return as_count(obj.get(name))
             return 0
 
-        def add_entry(cost: Optional[float], count: int, provider_id=None, mode: str = "explicit", raw_key=None):
+        def add_entry(cost: Optional[float], count: int, provider_id=None, mode: str = "explicit", raw_key=None, depth: int = 0):
             if cost is None or cost <= 0:
                 stats["rejected"] += 1
                 return
@@ -510,14 +535,14 @@ class SmsBowerProvider(BaseSmsProvider):
             entries.append(entry)
             stats[mode] += 1
 
-        def walk(obj, parent_key=None):
+        def walk(obj, parent_key=None, depth: int = 0):
             if isinstance(obj, dict):
                 direct_cost = first_float(obj, ("price", "cost", "Price", "Cost"))
                 has_nested_providers = isinstance(obj.get("providers"), (dict, list))
                 if direct_cost is not None and not has_nested_providers:
                     count = first_count(obj, ("count", "qty", "Qty", "quantity", "Quantity"))
                     provider_id = obj.get("provider_id") or obj.get("id") or parent_key
-                    add_entry(direct_cost, count, provider_id=provider_id, mode="explicit")
+                    add_entry(direct_cost, count, provider_id=provider_id, mode="explicit", depth=depth)
                     return
 
                 for k, v in obj.items():
@@ -526,7 +551,7 @@ class SmsBowerProvider(BaseSmsProvider):
                         if v_cost is not None and not isinstance(v.get("providers"), (dict, list)):
                             count = first_count(v, ("count", "qty", "Qty", "quantity", "Quantity"))
                             provider_id = v.get("provider_id") or v.get("id") or k
-                            add_entry(v_cost, count, provider_id=provider_id, mode="explicit")
+                            add_entry(v_cost, count, provider_id=provider_id, mode="explicit", depth=depth + 1)
                             continue
 
                     is_price_key = bool(re.fullmatch(r"\d+(?:\.\d+)?", str(k)))
@@ -540,12 +565,12 @@ class SmsBowerProvider(BaseSmsProvider):
                             if isinstance(v, (int, float, str))
                             else first_count(v, ("count", "qty", "Qty", "quantity", "Quantity"))
                         )
-                        add_entry(cost, count, mode="legacy", raw_key=k)
+                        add_entry(cost, count, mode="legacy", raw_key=k, depth=depth)
                     else:
-                        walk(v, k)
+                        walk(v, k, depth + 1)
             elif isinstance(obj, list):
                 for item in obj:
-                    walk(item, parent_key)
+                    walk(item, parent_key, depth + 1)
 
         walk(data)
         if not entries:
@@ -625,6 +650,10 @@ class SmsBowerProvider(BaseSmsProvider):
             raise NoNumbersError(f"国家 {country_id} 无可用号码: {text[:100]}")
         if "NO_BALANCE" in text:
             raise BalanceError(f"SMSBower 余额不足: {text[:100]}")
+        if text.lstrip().startswith("<") or "ERROR_SQL" in text.upper() or "SQL_ERROR" in text.upper():
+            raise PurchaseUncertainError(
+                f"SMSBower 取号返回网关/数据库异常，购买结果未知: {redact_text(text[:120])}"
+            )
 
         raise SmsProviderError(f"取号失败: {text[:200]}")
 
@@ -732,7 +761,14 @@ class SmsBowerProvider(BaseSmsProvider):
             if elapsed >= timeout:
                 raise SmsTimeoutError(f"等码超时 ({timeout}s), activation={activation_id}")
 
-            status, code = await self.get_sms_code(activation_id)
+            try:
+                status, code = await self.get_sms_code(activation_id)
+            except SmsProviderError as exc:
+                err_up = str(exc).upper()
+                if any(tok in err_up for tok in ("BAD_KEY", "BAD_ACTION", "WRONG_ACTIVATION_ID")):
+                    raise
+                logger.warning("SMSBower 轮询查码暂时异常，稍后重试: %s", exc)
+                status, code = "WAIT", ""
 
             if status == "OK":
                 return code

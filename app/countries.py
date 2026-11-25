@@ -79,6 +79,21 @@ NAME_TO_ISO: dict[str, str] = {
     "kosovo": "xk",
     "sint maarten": "sx",
     "syrian arab republic": "sy",
+    "uk": "gb",
+    "great britain": "gb",
+    "uae": "ae",
+    "dr congo": "cd",
+    "democratic republic of the congo": "cd",
+    "north macedonia": "mk",
+    "czechia": "cz",
+    "czech republic": "cz",
+    "eswatini": "sz",
+    "cabo verde": "cv",
+    "cape verde": "cv",
+    "salvador": "sv",
+    "el salvador": "sv",
+    "bosnia": "ba",
+    "bosnia and herzegovina": "ba",
 }
 
 ZH_TO_ISO: dict[str, str] = {
@@ -120,6 +135,21 @@ ZH_TO_ISO: dict[str, str] = {
     "科索沃": "xk",
     "圣马丁岛": "sx",
     "叙利亚阿拉伯共和国": "sy",
+    "阿联酋": "ae",
+    "阿拉伯联合酋长国": "ae",
+    "日本": "jp",
+    "德国": "de",
+    "法国": "fr",
+    "加拿大": "ca",
+    "澳大利亚": "au",
+    "巴西": "br",
+    "墨西哥": "mx",
+    "新加坡": "sg",
+    "土耳其": "tr",
+    "香港": "hk",
+    "中国香港": "hk",
+    "台湾": "tw",
+    "中国台湾": "tw",
 }
 
 

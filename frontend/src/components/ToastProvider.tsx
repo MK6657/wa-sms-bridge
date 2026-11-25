@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, CheckCircle2, Info, X } from "lucide-react";
 
 type ToastTone = "success" | "error" | "info" | "warn";
@@ -21,16 +21,38 @@ export function useToast() {
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
+  const timersRef = useRef<Map<number, number>>(new Map());
+
+  const dismiss = useCallback((id: number) => {
+    const timer = timersRef.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      timersRef.current.delete(id);
+    }
+    setItems((prev) => prev.filter((item) => item.id !== id));
+  }, []);
 
   const notify = useCallback((message: string, tone: ToastTone = "info") => {
     const id = Date.now() + Math.floor(Math.random() * 10000);
     setItems((prev) => [...prev.slice(-3), { id, message, tone }]);
-    window.setTimeout(() => {
+    const timer = window.setTimeout(() => {
+      timersRef.current.delete(id);
       setItems((prev) => prev.filter((item) => item.id !== id));
     }, 3600);
+    timersRef.current.set(id, timer);
   }, []);
 
-  const dismiss = (id: number) => setItems((prev) => prev.filter((item) => item.id !== id));
+  useEffect(() => {
+    const timers = timersRef.current;
+    return () => {
+      for (const timer of timers.values()) {
+        window.clearTimeout(timer);
+      }
+      timers.clear();
+    };
+  }, []);
+
+  const contextValue = useMemo(() => ({ notify }), [notify]);
 
   const toneStyles: Record<ToastTone, string> = {
     success: "border-emerald-200 bg-emerald-50 text-emerald-900",
@@ -40,7 +62,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <ToastContext.Provider value={{ notify }}>
+    <ToastContext.Provider value={contextValue}>
       {children}
       <div className="pointer-events-none fixed right-4 top-4 z-[70] flex w-full max-w-sm flex-col gap-2">
         {items.map((item) => (

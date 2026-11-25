@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Any, Optional
 
@@ -17,9 +18,9 @@ def _price_value(entry: dict[str, Any]) -> Optional[float]:
             continue
         try:
             price = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
-        if price > 0:
+        if math.isfinite(price) and price > 0:
             return round(price, 4)
     return None
 
@@ -32,8 +33,11 @@ def _price_count(entry: dict[str, Any]) -> int:
         if isinstance(value, str) and value.strip().lower() == "few":
             return 1
         try:
-            return max(0, int(float(value)))
-        except (TypeError, ValueError):
+            num = float(value)
+            if not math.isfinite(num):
+                continue
+            return max(0, int(num))
+        except (TypeError, ValueError, OverflowError):
             continue
     return 0
 
@@ -120,7 +124,14 @@ class PricingService:
                 **summary,
             }
             if self._cache_ttl > 0 and gen == self._generation:
-                self._cache[cache_key] = (time.monotonic(), snapshot)
+                now_mono = time.monotonic()
+                if len(self._cache) >= 512 and cache_key not in self._cache:
+                    expired_keys = [k for k, (ts, _) in self._cache.items() if (now_mono - ts) >= self._cache_ttl]
+                    for k in expired_keys:
+                        self._cache.pop(k, None)
+                    if len(self._cache) >= 512:
+                        self._cache.pop(next(iter(self._cache)), None)
+                self._cache[cache_key] = (now_mono, snapshot)
             return snapshot
 
         task = asyncio.create_task(_fetch())

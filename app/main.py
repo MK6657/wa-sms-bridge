@@ -214,8 +214,15 @@ def _init_active_providers(
             base_url_getter=get_smsbower_base_url,
             country_cache_ttl=float(env.country_cache_ttl_seconds),
         ),
-        "5sim": lambda: FiveSimProvider(get_five_sim_key),
-        "herosms": lambda: HeroSmsProvider(get_hero_sms_key, base_url_getter=get_hero_sms_base_url),
+        "5sim": lambda: FiveSimProvider(
+            get_five_sim_key,
+            country_cache_ttl=float(env.country_cache_ttl_seconds),
+        ),
+        "herosms": lambda: HeroSmsProvider(
+            get_hero_sms_key,
+            base_url_getter=get_hero_sms_base_url,
+            country_cache_ttl=float(env.country_cache_ttl_seconds),
+        ),
     }
 
     for name in active_names:
@@ -246,6 +253,7 @@ def create_app(
     skip_startup_probe: bool = False,
 ) -> FastAPI:
     """创建可测试、可隔离实例化的 FastAPI 应用。"""
+    env.reload()
 
     wa_enabled = env.enable_wa_plugin if enable_wa_plugin is None else bool(enable_wa_plugin)
     legacy_enabled = (
@@ -257,6 +265,10 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         env.reload()
+        for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            for _uv_handler in logging.getLogger(_uv_name).handlers:
+                _uv_handler.addFilter(_SECRET_FILTER)
+                _uv_handler.setFormatter(RedactingFormatter(LOG_FORMAT, LOG_DATE_FORMAT))
         effective_db_path = db_path or env.db_path
         data_dir = str(Path(effective_db_path).parent) if db_path and effective_db_path != ":memory:" else env.bridge_data_dir
         async def _safe_close(label: str, coro_fn) -> None:
@@ -308,6 +320,7 @@ def create_app(
             stack.push_async_callback(_close_providers)
 
             event_bus = EventBus()
+            stack.callback(event_bus.close_all)
             pricing_service = PricingService(reg, cache_ttl=float(env.price_cache_ttl_seconds))
             webhook_dispatcher = WebhookDispatcher(db, timeout_seconds=env.webhook_timeout_seconds)
             stack.push_async_callback(_safe_close, "webhook_dispatcher", webhook_dispatcher.shutdown)
@@ -392,7 +405,7 @@ def create_app(
         application.add_middleware(
             CORSMiddleware,
             allow_origins=env.cors_origins,
-            allow_credentials=True,
+            allow_credentials="*" not in env.cors_origins,
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -447,4 +460,4 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=9090, reload=True)
+    uvicorn.run("app.main:app", host=os.environ.get("BRIDGE_BIND_HOST", "127.0.0.1"), port=9090, reload=True)

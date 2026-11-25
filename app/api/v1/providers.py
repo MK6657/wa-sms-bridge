@@ -82,7 +82,7 @@ async def get_provider_countries(
     except ValueError as exc:
         raise AppError(str(exc), status_code=400, code="PROVIDER_NOT_ACTIVE") from exc
     try:
-        if force and hasattr(prov, "invalidate_countries_cache"):
+        if force and caller.is_admin and hasattr(prov, "invalidate_countries_cache"):
             prov.invalidate_countries_cache()
         countries = await prov.get_countries()
     except Exception as exc:
@@ -102,7 +102,7 @@ async def refresh_provider_countries(
     except ValueError as exc:
         raise AppError(str(exc), status_code=400, code="PROVIDER_NOT_ACTIVE") from exc
     try:
-        if hasattr(prov, "invalidate_countries_cache"):
+        if caller.is_admin and hasattr(prov, "invalidate_countries_cache"):
             prov.invalidate_countries_cache()
         countries = await prov.get_countries()
     except Exception as exc:
@@ -121,7 +121,7 @@ async def get_provider_prices(
 ):
     AuthService.ensure_scope(caller, "prices:r")
     try:
-        return await pricing_service.get_price_snapshot(provider, country, service, force=force)
+        return await pricing_service.get_price_snapshot(provider, country, service, force=bool(force and caller.is_admin))
     except ValueError as exc:
         raise AppError(str(exc), status_code=400, code="INVALID_PRICE_QUERY") from exc
     except Exception as exc:

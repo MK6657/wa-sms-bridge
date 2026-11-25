@@ -1,4 +1,4 @@
-# SMS Hub (`wa-sms-bridge` v1.1.0)
+# SMS Hub (`wa-sms-bridge` v1.2.0)
 
 独立、轻量、低耦合的 SMS 接码中心与标准对外 API 服务（基于 Python FastAPI + SQLite WAL + React/TypeScript 静态工作台）。
 
@@ -55,7 +55,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 9099
      ```
 3. **旧接口 → v1 接口迁移对照**：
 
-| v0.2.0 旧接口 | v1.1.0 对应接口 | 说明 |
+| v0.2.0 旧接口 | v1.2.0 对应接口 | 说明 |
 |--------------|----------------|------|
 | `GET /api/health` | `GET /api/v1/health`（保留 `/api/health`） | DB 异常返回 HTTP 503；存活探针 `/api/v1/health/live` |
 | `POST /api/provider/test-number` | `POST /api/v1/orders` + `/cancel` | 完整订单状态机与激活对账 |

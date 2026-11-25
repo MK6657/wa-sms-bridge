@@ -25,6 +25,7 @@ from app.config import env
 from app.core.url_guard import (
     PinnedIPAsyncTransport,
     _host_matches_allowlist,
+    normalize_url_hostname,
     pin_webhook_host,
     validate_webhook_url_async,
 )
@@ -80,14 +81,22 @@ class WebhookDispatcher:
         self._worker_task: Optional[asyncio.Task] = None
         self._inflight: set[asyncio.Task] = set()
         self._inflight_code_by_order: dict[str, set[asyncio.Task]] = {}
-        self._order_locks: dict[str, asyncio.Lock] = {}
 
-    def _lock_for_order(self, order_id: str) -> asyncio.Lock:
-        lock = self._order_locks.get(order_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._order_locks[order_id] = lock
-        return lock
+    async def _send_http_post(self, clean_url: str, *, body: bytes, headers: dict[str, str]) -> int:
+        """发送 Webhook POST 并仅读取状态头，不缓冲任意大小响应体（兼容测试对 _client.post 的桩替换）。"""
+        overall_timeout = max(3.0, self._timeout * 2.0 + 2.0)
+        if not isinstance(self._client, httpx.AsyncClient) or "post" in getattr(self._client, "__dict__", {}):
+            resp = await asyncio.wait_for(
+                self._client.post(clean_url, content=body, headers=headers),
+                timeout=overall_timeout,
+            )
+            return int(resp.status_code)
+
+        async def _stream_status_only() -> int:
+            async with self._client.stream("POST", clean_url, content=body, headers=headers) as resp:
+                return int(resp.status_code)
+
+        return await asyncio.wait_for(_stream_status_only(), timeout=overall_timeout)
 
     def notify(self) -> None:
         self._wakeup.set()
@@ -151,7 +160,8 @@ class WebhookDispatcher:
         available_slots = max(0, self._max_concurrency - len(self._inflight))
         if available_slots <= 0:
             return 0
-        claimed = await self._db.webhooks.claim_due(limit=available_slots, lease_seconds=30)
+        lease_seconds = max(30, int(self._dns_timeout + self._timeout * 2.0 + 15))
+        claimed = await self._db.webhooks.claim_due(limit=available_slots, lease_seconds=lease_seconds)
         for item in claimed:
             oid = str(item.get("order_id") or "")
             is_code = bool(item.get("contains_code")) or str(item.get("event_type")) == "order.code_received"
@@ -168,6 +178,7 @@ class WebhookDispatcher:
                         bucket.discard(done_task)
                         if not bucket:
                             self._inflight_code_by_order.pop(_oid, None)
+                self._wakeup.set()
 
             task.add_done_callback(_cleanup)
         return len(claimed)
@@ -176,14 +187,16 @@ class WebhookDispatcher:
         if self._inflight:
             await asyncio.gather(*list(self._inflight), return_exceptions=True)
 
-    async def _lookup_project_delivery_auth(self, project_id: str) -> tuple[bool, str]:
-        """校验项目仍处于启用状态并返回其签名密钥；若外部项目已被停用或删除则拒绝继续外发 Webhook。"""
+    async def _lookup_project_delivery_auth(self, project_id: str) -> tuple[bool, str, str]:
+        """校验项目仍处于启用状态并返回其签名密钥；若密钥已停用或签名密钥解密失败则拒绝无签名外发。"""
         if not project_id or project_id == "web-console":
-            return True, ""
+            return True, "", ""
         row = await self._db.api_keys.get(project_id, include_secret=True)
         if row is None or not row.get("enabled"):
-            return False, ""
-        return True, str(row.get("webhook_secret") or "")
+            return False, "", "项目密钥已停用或删除，停止投递"
+        if row.get("webhook_secret_decrypt_error"):
+            return False, "", "项目 Webhook 签名密钥解密失败，停止无签名投递"
+        return True, str(row.get("webhook_secret") or ""), ""
 
     async def _deliver_outbox_item(self, item: dict[str, Any]) -> None:
         delivery_id = str(item["delivery_id"])
@@ -206,14 +219,14 @@ class WebhookDispatcher:
                 await self._db.webhooks.mark_scrubbed(delivery_id)
                 return
 
-        allowed_proj, secret = await self._lookup_project_delivery_auth(project_id)
+        allowed_proj, secret, auth_err = await self._lookup_project_delivery_auth(project_id)
         if not allowed_proj:
             await self._db.webhooks.mark_retry_or_failed(
                 delivery_id,
                 attempts=max_attempts,
                 max_attempts=max_attempts,
                 status_code=0,
-                error="项目密钥已停用或删除，停止投递",
+                error=auth_err or "项目密钥已停用或删除，停止投递",
                 retry_delay_seconds=0,
                 scrub_on_terminal=contains_code,
                 expected_lease=lease_token,
@@ -241,8 +254,9 @@ class WebhookDispatcher:
             )
             return
 
-        parsed_host = (urlparse(clean_url).hostname or "").strip().lower()
-        allow_private = _host_matches_allowlist(parsed_host, env.webhook_allowed_hosts) or env.webhook_allow_private_nets
+        parsed_host = normalize_url_hostname(urlparse(clean_url).hostname or "")
+        explicit_allow = _host_matches_allowlist(parsed_host, env.webhook_allowed_hosts)
+        allow_private = explicit_allow or env.webhook_allow_private_nets
 
         # 阶段 2: 真正发送 HTTP 前最后时刻复核租约、项目启用态与订单脱敏标记，再解密并立即发送（修复 v3 复核 P0-01）
         async with self._semaphore:
@@ -250,14 +264,14 @@ class WebhookDispatcher:
             if fresh_row is None:
                 # 在 DNS 期间已被清理(scrubbed)或租约已失效，立即中止发送！
                 return
-            still_allowed, latest_secret = await self._lookup_project_delivery_auth(project_id)
+            still_allowed, latest_secret, latest_auth_err = await self._lookup_project_delivery_auth(project_id)
             if not still_allowed:
                 await self._db.webhooks.mark_retry_or_failed(
                     delivery_id,
                     attempts=max_attempts,
                     max_attempts=max_attempts,
                     status_code=0,
-                    error="项目密钥已停用或删除，停止投递",
+                    error=latest_auth_err or "项目密钥已停用或删除，停止投递",
                     retry_delay_seconds=0,
                     scrub_on_terminal=contains_code,
                     expected_lease=lease_token,
@@ -298,10 +312,14 @@ class WebhookDispatcher:
             status_code = 0
             error_text = ""
             ok = False
-            with pin_webhook_host(parsed_host, approved_ips, allow_private=allow_private):
+            with pin_webhook_host(
+                parsed_host,
+                approved_ips,
+                allow_private=allow_private,
+                allow_loopback=explicit_allow,
+            ):
                 try:
-                    resp = await self._client.post(clean_url, content=body, headers=headers)
-                    status_code = int(resp.status_code)
+                    status_code = await self._send_http_post(clean_url, body=body, headers=headers)
                     if 200 <= status_code < 300:
                         ok = True
                     else:
@@ -358,8 +376,9 @@ class WebhookDispatcher:
             resolve_dns=True,
             dns_timeout=self._dns_timeout,
         )
-        parsed_host = (urlparse(clean_url).hostname or "").strip().lower()
-        allow_private = _host_matches_allowlist(parsed_host, env.webhook_allowed_hosts) or env.webhook_allow_private_nets
+        parsed_host = normalize_url_hostname(urlparse(clean_url).hostname or "")
+        explicit_allow = _host_matches_allowlist(parsed_host, env.webhook_allowed_hosts)
+        allow_private = explicit_allow or env.webhook_allow_private_nets
 
         payload = {
             "id": "evt_test",
@@ -381,10 +400,14 @@ class WebhookDispatcher:
             headers["X-SMS-Signature"] = compute_webhook_signature(secret, body)
 
         async with self._semaphore:
-            with pin_webhook_host(parsed_host, approved_ips, allow_private=allow_private):
+            with pin_webhook_host(
+                parsed_host,
+                approved_ips,
+                allow_private=allow_private,
+                allow_loopback=explicit_allow,
+            ):
                 try:
-                    resp = await self._client.post(clean_url, content=body, headers=headers)
-                    status_code = int(resp.status_code)
+                    status_code = await self._send_http_post(clean_url, body=body, headers=headers)
                     if 200 <= status_code < 300:
                         return {"ok": True, "status_code": status_code, "attempts": 1}
                     return {

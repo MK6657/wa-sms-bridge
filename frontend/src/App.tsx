@@ -71,6 +71,7 @@ function AppShell() {
   // 管理员会话认证状态
   const [authReady, setAuthReady] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [authCheckError, setAuthCheckError] = useState("");
   const [isAdminSession, setIsAdminSession] = useState(false);
   const [loginPassword, setLoginPassword] = useState("");
   const [showLoginPwd, setShowLoginPwd] = useState(false);
@@ -79,11 +80,14 @@ function AppShell() {
 
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [balance, setBalance] = useState<number | null>(null);
+  const [balanceCurrency, setBalanceCurrency] = useState("USD");
   const [balanceError, setBalanceError] = useState("");
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [activeOrders, setActiveOrders] = useState<SmsOrder[]>([]);
   const [maskInHistory, setMaskInHistory] = useState(true);
+  const initInFlightRef = useRef<Promise<void> | null>(null);
+  const latestOrderVersionRef = useRef<Map<string, number>>(new Map());
   const [soundEnabled, setSoundEnabled] = useState(() => {
     try {
       return localStorage.getItem("sms-hub.sound") !== "off";
@@ -93,26 +97,36 @@ function AppShell() {
   });
 
   const initSession = useCallback(async () => {
-    try {
-      const status = await api.getAuthStatus();
-      setAuthStatus(status);
-      if (status.is_admin && status.authenticated) {
-        setIsAdminSession(true);
-      } else if (status.can_bootstrap_local_session) {
-        try {
-          await api.bootstrapLocalSession();
-          setIsAdminSession(true);
-        } catch {
-          setIsAdminSession(status.is_admin);
-        }
-      } else {
-        setIsAdminSession(false);
-      }
-    } catch {
-      setIsAdminSession(false);
-    } finally {
-      setAuthReady(true);
+    if (initInFlightRef.current) {
+      return initInFlightRef.current;
     }
+    const task = (async () => {
+      try {
+        const status = await api.getAuthStatus();
+        setAuthStatus(status);
+        setAuthCheckError("");
+        if (status.is_admin && status.authenticated) {
+          setIsAdminSession(true);
+        } else if (status.can_bootstrap_local_session) {
+          try {
+            await api.bootstrapLocalSession();
+            setIsAdminSession(true);
+          } catch {
+            setIsAdminSession(status.is_admin);
+          }
+        } else {
+          setIsAdminSession(false);
+        }
+      } catch (err) {
+        setAuthCheckError(err instanceof Error ? err.message : "无法连接后端服务");
+        setIsAdminSession(false);
+      } finally {
+        setAuthReady(true);
+        initInFlightRef.current = null;
+      }
+    })();
+    initInFlightRef.current = task;
+    return task;
   }, []);
 
   useEffect(() => {
@@ -173,6 +187,7 @@ function AppShell() {
       try {
         const res = await api.getBalance(prov);
         setBalance(res.balance);
+        setBalanceCurrency(res.currency || "USD");
       } catch (err) {
         setBalance(null);
         setBalanceError(err instanceof Error ? err.message : "余额获取失败");
@@ -183,18 +198,51 @@ function AppShell() {
     [health?.default_provider],
   );
 
+  const recordOrderVersion = useCallback((order: SmsOrder): boolean => {
+    const map = latestOrderVersionRef.current;
+    const incomingVer = typeof order.version === "number" ? order.version : undefined;
+    const knownVer = map.get(order.order_id);
+    if (incomingVer !== undefined && knownVer !== undefined && incomingVer < knownVer) {
+      return false;
+    }
+    if (incomingVer !== undefined) {
+      if (map.size >= 1000 && !map.has(order.order_id)) {
+        const firstKey = map.keys().next().value;
+        if (firstKey !== undefined) map.delete(firstKey);
+      }
+      map.set(order.order_id, incomingVer);
+    }
+    return true;
+  }, []);
+
   const activeOrdersSeqRef = useRef(0);
   const loadActiveOrders = useCallback(async () => {
     const seq = ++activeOrdersSeqRef.current;
     try {
-      const res = await api.listOrders({ active_only: true, page: 1, page_size: 50 });
+      const res = await api.listOrders({ active_only: true, page: 1, page_size: 200 });
       if (seq === activeOrdersSeqRef.current) {
-        setActiveOrders(res.items);
+        setActiveOrders((prev) => {
+          const prevById = new Map(prev.map((o) => [o.order_id, o]));
+          const merged: SmsOrder[] = [];
+          for (const item of res.items) {
+            if (!recordOrderVersion(item)) {
+              const newerLocal = prevById.get(item.order_id);
+              if (newerLocal && ACTIVE_STATUSES.has(newerLocal.status)) {
+                merged.push(newerLocal);
+              }
+              continue;
+            }
+            if (ACTIVE_STATUSES.has(item.status)) {
+              merged.push(item);
+            }
+          }
+          return merged;
+        });
       }
     } catch {
       // ignore initial error
     }
-  }, []);
+  }, [recordOrderVersion]);
 
   const loadStats = useCallback(async () => {
     try {
@@ -233,18 +281,24 @@ function AppShell() {
     }
   }, [isAdminSession, refreshCoreData]);
 
-  const upsertOrder = useCallback((order: SmsOrder) => {
-    setActiveOrders((prev) => {
-      const exists = prev.some((o) => o.order_id === order.order_id);
-      if (!ACTIVE_STATUSES.has(order.status)) {
-        return prev.filter((o) => o.order_id !== order.order_id);
+  const upsertOrder = useCallback(
+    (order: SmsOrder) => {
+      if (!recordOrderVersion(order)) {
+        return;
       }
-      if (exists) {
-        return prev.map((o) => (o.order_id === order.order_id ? order : o));
-      }
-      return [order, ...prev];
-    });
-  }, []);
+      setActiveOrders((prev) => {
+        const exists = prev.some((o) => o.order_id === order.order_id);
+        if (!ACTIVE_STATUSES.has(order.status)) {
+          return prev.filter((o) => o.order_id !== order.order_id);
+        }
+        if (exists) {
+          return prev.map((o) => (o.order_id === order.order_id ? order : o));
+        }
+        return [order, ...prev];
+      });
+    },
+    [recordOrderVersion],
+  );
 
   const handleStreamEvent = useCallback(
     (evt: StreamEventMessage) => {
@@ -319,14 +373,29 @@ function AppShell() {
             <div>
               <h1 className="text-base font-bold text-slate-900">SMS Hub 管理员登录</h1>
               <p className="text-xs text-slate-500">
-                {authStatus?.password_required
-                  ? "请输入 CONSOLE_ADMIN_PASSWORD 登录工作台"
-                  : "检测到非本机直连访问，请先配置 CONSOLE_ADMIN_PASSWORD"}
+                {authCheckError
+                  ? "后端服务暂不可达，请检查服务运行状态后重试"
+                  : authStatus?.password_required
+                    ? "请输入 CONSOLE_ADMIN_PASSWORD 登录工作台"
+                    : "检测到非本机直连访问，请先配置 CONSOLE_ADMIN_PASSWORD"}
               </p>
             </div>
           </div>
 
-          {authStatus?.password_required ? (
+          {authCheckError && !authStatus ? (
+            <div className="space-y-3">
+              <div className="rounded-xl border border-rose-200 bg-rose-50 p-3.5 text-xs leading-relaxed text-rose-800">
+                无法校验控制台会话状态：{authCheckError}
+              </div>
+              <button
+                type="button"
+                onClick={() => initSession()}
+                className="w-full cursor-pointer rounded-xl bg-slate-900 py-2.5 text-sm font-semibold text-white shadow-xs transition hover:bg-slate-800"
+              >
+                重试连接
+              </button>
+            </div>
+          ) : authStatus?.password_required ? (
             <form onSubmit={handleLogin} className="space-y-3.5">
               <div>
                 <label className="mb-1.5 block text-xs font-medium text-slate-700">管理员口令</label>
@@ -378,7 +447,7 @@ function AppShell() {
   const currentNav = NAV_ITEMS.find((n) => n.key === page) || NAV_ITEMS[0];
   const CurrentNavIcon = currentNav.icon;
   const defaultProviderLabel = (health?.default_provider || "smsbower").toUpperCase();
-  const appVersion = health?.version ? `v${health.version}` : "v1.1.0";
+  const appVersion = health?.version ? `v${health.version}` : "v1.2.0";
 
   return (
     <div className="flex min-h-screen text-slate-900">
@@ -478,7 +547,7 @@ function AppShell() {
           {sidebarCollapsed ? (
             <div className="flex flex-col items-center gap-2 py-1">
               <div
-                title={`${defaultProviderLabel} · 余额 ${balance !== null ? formatMoney(balance) : "-"} · ${sseConnected ? "SSE 在线" : "SSE 重连中"}`}
+                title={`${defaultProviderLabel} · 余额 ${balance !== null ? formatMoney(balance, balanceCurrency) : "-"} · ${sseConnected ? "SSE 在线" : "SSE 重连中"}`}
                 className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-800/70 ring-1 ring-inset ring-slate-700/70"
               >
                 <span
@@ -519,7 +588,7 @@ function AppShell() {
                 <div className="mt-1.5 flex items-center justify-between text-slate-400">
                   <span>可用余额</span>
                   <span className="font-mono-code font-semibold text-white">
-                    {balance !== null ? formatMoney(balance) : "-"}
+                    {balance !== null ? formatMoney(balance, balanceCurrency) : "-"}
                   </span>
                 </div>
                 <div className="mt-1.5 flex items-center justify-between text-slate-400">
@@ -589,7 +658,7 @@ function AppShell() {
               <Wallet className="h-3.5 w-3.5 text-emerald-600" />
               <span className="hidden text-slate-500 md:inline">{defaultProviderLabel}</span>
               <span className="font-mono-code font-semibold text-slate-900">
-                {balance !== null ? formatMoney(balance) : "-"}
+                {balance !== null ? formatMoney(balance, balanceCurrency) : "-"}
               </span>
               <button
                 type="button"

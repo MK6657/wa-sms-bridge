@@ -135,6 +135,12 @@ async def test_webhook(
     if not secret and req.project_id:
         row = await db.api_keys.get(req.project_id, include_secret=True)
         if row:
+            if row.get("webhook_secret_decrypt_error"):
+                raise AppError(
+                    "项目 Webhook 签名密钥解密失败，请重新设置签名密钥后再测试",
+                    status_code=500,
+                    code="WEBHOOK_SECRET_DECRYPT_FAILED",
+                )
             secret = str(row.get("webhook_secret") or "")
     return await dispatcher.send_test(req.url.strip(), secret=secret, project_id=req.project_id)
 

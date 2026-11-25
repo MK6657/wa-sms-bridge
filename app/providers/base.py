@@ -150,30 +150,43 @@ def parse_cancel_outcome(raw_result: Any) -> CancelOutcome:
 
 
 _GOOGLE_OTP_RE = re.compile(r"(?i)\bg-\s*(\d{4,8})\b")
+_WEBOTP_RE = re.compile(r"(?m)@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\s+#(\d{4,8})\b")
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _E164_PHONE_RE = re.compile(r"(?<!\d)\+\d{8,15}\b")
+_FORMATTED_PHONE_RE = re.compile(r"(?<!\d)\+?\d{1,3}(?:[\t ()-]+\d{2,4}){2,4}(?!\d)")
+_ISO_DATE_RE = re.compile(r"\b(?:19|20)\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\b")
+_CLOCK_TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b")
 _APP_HASH_TAIL_RE = re.compile(r"(?m)(?:^|\s)(?=[A-Za-z0-9+/]{11}\s*$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9+/]{11}\s*$")
+_OTP_KEYWORDS = (
+    r"(?:(?<![A-Za-z])(?:code|otp|pin|passcode|verification|código|codigo)(?![A-Za-z])"
+    r"|验证码|驗證碼|校验码|校驗碼|动态码|動態碼|确认码|確認碼|安全码|安全碼|认证码|認證碼|登录码|登錄碼|提取码|代码|代碼"
+    r"|コード|코드|код|รหัส)"
+)
 _KEYWORD_FWD_OTP_RE = re.compile(
-    r"(?i)(?:code|otp|pin|passcode|verification|码|驗證碼|验证码)[^\d]{0,16}?(\d{3,4}[-\s]\d{3,4}|\d{4,8})(?!\d)"
+    rf"(?i){_OTP_KEYWORDS}[^\d\n]{{0,24}}?(\d{{3}}(?:[-\t ]+|\s+and\s+)\d{{3}}|\d{{3,4}}[-\t ]\d{{3,4}}|\d{{4,8}})(?!\d)"
 )
 _KEYWORD_REV_OTP_RE = re.compile(
-    r"(?i)(?<!\d)(\d{3,4}[-\s]\d{3,4}|\d{4,8})(?!\d)[^\d]{0,20}?(?:is\s+your|for\s+your|verification|code|otp|码|驗證碼|验证码)"
+    rf"(?i)(?<!\d)(\d{{3,4}}[-\t ]\d{{3,4}}|\d{{4,8}})(?!\d)[^\d\n]{{0,24}}?(?:(?<![A-Za-z])(?:is\s+your|for\s+your)(?![A-Za-z])|{_OTP_KEYWORDS})"
 )
-_HYPHEN_OTP_RE = re.compile(r"(?<![A-Za-z0-9])(\d{3,4}-\d{3,4})(?![A-Za-z0-9])")
+_HYPHEN_OTP_RE = re.compile(r"(?<![A-Za-z0-9-])(\d{3,4}-\d{3,4})(?![A-Za-z0-9-])")
 _STANDALONE_OTP_RE = re.compile(
     r"(?<![A-Za-z0-9])(\d{4,8})(?![A-Za-z0-9])"
-    r"(?!\s*(?:min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours|分钟|秒|小时)\b)",
+    r"(?!\s*(?:(?:min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours|day|days|usd|rub|eur)\b|分钟|分|秒钟|秒|小时|天|年|元))",
     re.IGNORECASE,
 )
 
 
 def extract_otp_code(raw: Any) -> str:
     """从上游短信文本或预解析码串中精准提取单个验证码，避免把有效分钟数、发送方号码或应用签名哈希拼入验证码。"""
-    text = str(raw or "").strip()
+    text = str(raw or "").strip()[:4096]
     if not text:
         return ""
-    if re.fullmatch(r"[\d\s-]+", text):
+    if re.fullmatch(r"\d{3,8}|\d{3,4}[-\t ]\d{3,4}", text):
         return re.sub(r"\D", "", text)
+
+    m_webotp = _WEBOTP_RE.search(text)
+    if m_webotp:
+        return m_webotp.group(1)
 
     m_google = _GOOGLE_OTP_RE.search(text)
     if m_google:
@@ -181,6 +194,9 @@ def extract_otp_code(raw: Any) -> str:
 
     cleaned = _URL_RE.sub(" ", text)
     cleaned = _E164_PHONE_RE.sub(" ", cleaned)
+    cleaned = _ISO_DATE_RE.sub(" ", cleaned)
+    cleaned = _CLOCK_TIME_RE.sub(" ", cleaned)
+    cleaned = _FORMATTED_PHONE_RE.sub(" ", cleaned)
     cleaned = _APP_HASH_TAIL_RE.sub(" ", cleaned)
 
     m_fwd = _KEYWORD_FWD_OTP_RE.search(cleaned)
@@ -200,17 +216,15 @@ def extract_otp_code(raw: Any) -> str:
         for cand in candidates:
             if len(cand) == 6:
                 return cand
+        for cand in candidates:
+            if len(cand) in {5, 7, 8}:
+                return cand
+        for cand in candidates:
+            if not (len(cand) == 4 and 1990 <= int(cand) <= 2039):
+                return cand
         return candidates[0]
 
-    runs = re.findall(r"\d+", cleaned)
-    if not runs:
-        return ""
-    if len(runs) == 1:
-        return runs[0]
-    for run in runs:
-        if 4 <= len(run) <= 8:
-            return run
-    return "".join(runs)
+    return ""
 
 
 def parse_complete_outcome(raw_result: Any) -> ActionOutcome:

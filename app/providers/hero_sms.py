@@ -10,7 +10,9 @@ Base URL: https://hero-sms.com/stubs/handler_api.php
 """
 
 import asyncio
+import json
 import logging
+import math
 import re
 import time
 from typing import Any, Optional
@@ -63,17 +65,15 @@ HERO_COUNTRY_NAMES = {cid: info["chn"] for cid, info in HERO_COUNTRIES.items()}
 
 HERO_ALIASES: dict[str, int] = {}
 for _cid, _info in HERO_COUNTRIES.items():
-    HERO_ALIASES[str(_cid)] = _cid
     for _value in (_info["eng"], _info["chn"], _info["iso"]):
         HERO_ALIASES[_value.strip().lower()] = _cid
     HERO_ALIASES[re.sub(r"[^a-z0-9]+", "", _info["eng"].lower())] = _cid
-for _cid, _info in HERO_COUNTRIES.items():
-    HERO_ALIASES.setdefault(_info["cc"].strip().lower(), _cid)
 HERO_ALIASES.update({
     "usa": 12,
     "america": 12,
     "美国": 12,
     "us": 12,
+    "russia": 0,
     "nanfei": 31,
     "southafrica": 31,
     "taiguo": 52,
@@ -87,6 +87,7 @@ def _hero_static_rows() -> list[dict]:
         {
             "id": cid,
             "name": info["eng"],
+            "name_zh": info["chn"],
             "cn": info["chn"],
             "cc": info["cc"],
             "iso": info["iso"],
@@ -105,10 +106,20 @@ class HeroSmsProvider(BaseSmsProvider):
 
     provider_id = "herosms"
 
-    def __init__(self, api_key_getter, base_url_getter=None):
+    def __init__(self, api_key_getter, base_url_getter=None, *, country_cache_ttl: float = 1800.0):
         self._api_key_getter = api_key_getter
         self._base_url_getter = base_url_getter or (lambda: DEFAULT_BASE_URL)
         self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+        self._country_cache_ttl = max(0.0, float(country_cache_ttl))
+        self._countries_cache: list[dict] = []
+        self._countries_fetched_at: float = 0.0
+        self._countries_generation: int = 0
+        self._countries_lock = asyncio.Lock()
+
+    def invalidate_countries_cache(self) -> None:
+        self._countries_generation += 1
+        self._countries_cache = []
+        self._countries_fetched_at = 0.0
 
     async def close(self):
         await self._client.aclose()
@@ -134,7 +145,7 @@ class HeroSmsProvider(BaseSmsProvider):
         except httpx.TimeoutException as exc:
             raise SmsProviderError("HeroSMS 请求超时") from exc
         except httpx.RequestError as exc:
-            raise SmsProviderError(f"HeroSMS 连接失败，请检查网络: {exc}") from exc
+            raise SmsProviderError("HeroSMS 连接失败，请检查网络") from exc
         duration_ms = int((time.perf_counter() - started) * 1000)
         logger.debug(
             "HeroSMS request action=%s params=%s status=%s duration_ms=%s response_len=%s",
@@ -158,73 +169,137 @@ class HeroSmsProvider(BaseSmsProvider):
         """解析 ACCESS_NUMBER 响应。返回 (activation_id, phone)。"""
         m = re.match(r"^ACCESS_NUMBER:\s*([^:]+):\s*(.+)$", text)
         if m:
-            return m.group(1).strip(), m.group(2).strip()
+            act_id, phone = m.group(1).strip(), m.group(2).strip()
+            if act_id and phone and re.search(r"\d", phone):
+                return act_id, phone
         if "NO_NUMBERS" in text or "WRONG_MAX_PRICE" in text:
             raise NoNumbersError(f"HeroSMS 无满足条件号码: {text[:100]}")
-        if "NO_BALANCE" in text or "BALANCE" in text.upper():
+        if "NO_BALANCE" in text.upper():
             raise BalanceError("HeroSMS 余额不足")
+        if text.lstrip().startswith("<") or "ERROR_SQL" in text.upper() or "SQL_ERROR" in text.upper():
+            raise PurchaseUncertainError("HeroSMS 取号返回网关/数据库异常，购买结果未知")
         raise SmsProviderError(f"HeroSMS 取号异常: {text[:100]}")
 
     async def get_balance(self) -> float:
         text = await self._get(action="getBalance")
         m = re.search(r"ACCESS_BALANCE:\s*([\d.]+)", text)
         if m:
-            return float(m.group(1))
+            bal = float(m.group(1))
+            if math.isfinite(bal):
+                return bal
         raise SmsProviderError(f"HeroSMS 余额解析失败: {text[:100]}")
 
-    async def get_countries(self) -> list[dict]:
-        """获取国家列表，统一格式 {id, name, cc, iso}。"""
-        text = await self._get(action="getPricesV3")
-        if not text.startswith("{"):
-            return _hero_static_rows()
-        try:
-            import json
-            data = json.loads(text)
-            result = []
-            for cid_str in (data or {}).keys():
-                if not str(cid_str).isdigit():
-                    continue
-                cid = int(cid_str)
-                static = HERO_COUNTRIES.get(cid, {})
-                name = static.get("eng") or f"Country #{cid}"
-                cc = static.get("cc", "")
-                iso = static.get("iso", "")
-                result.append({
-                    "id": cid,
-                    "name": name,
-                    "cc": cc,
-                    "iso": iso,
-                })
-            known_ids = {int(item["id"]) for item in result if str(item.get("id", "")).isdigit()}
-            for row in _hero_static_rows():
-                if row["id"] not in known_ids:
-                    result.append(row)
-            return sorted(result, key=lambda item: item.get("name", ""))
-        except json.JSONDecodeError:
-            return _hero_static_rows()
+    async def get_countries(self, *, force: bool = False) -> list[dict]:
+        """获取国家列表，统一格式 {id, name, name_zh, cc, iso}，带 TTL 内存缓存。"""
+        now = time.monotonic()
+        if (
+            not force
+            and self._countries_cache
+            and self._country_cache_ttl > 0
+            and (now - self._countries_fetched_at) < self._country_cache_ttl
+        ):
+            return list(self._countries_cache)
+
+        async with self._countries_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._countries_cache
+                and self._country_cache_ttl > 0
+                and (now - self._countries_fetched_at) < self._country_cache_ttl
+            ):
+                return list(self._countries_cache)
+
+            if force:
+                self._countries_generation += 1
+            gen = self._countries_generation
+            text = await self._get(action="getPricesV3")
+            if not text.startswith("{"):
+                return _hero_static_rows()
+            try:
+                data = json.loads(text)
+                result = []
+                for cid_str in (data or {}).keys():
+                    if not str(cid_str).isdigit():
+                        continue
+                    cid = int(cid_str)
+                    static = HERO_COUNTRIES.get(cid, {})
+                    name = static.get("eng") or f"Country #{cid}"
+                    name_zh = static.get("chn", "")
+                    cc = static.get("cc", "")
+                    iso = static.get("iso", "")
+                    result.append({
+                        "id": cid,
+                        "name": name,
+                        "name_zh": name_zh,
+                        "cn": name_zh,
+                        "cc": cc,
+                        "iso": iso,
+                    })
+                known_ids = {int(item["id"]) for item in result if str(item.get("id", "")).isdigit()}
+                for row in _hero_static_rows():
+                    if row["id"] not in known_ids:
+                        result.append(row)
+                sorted_res = sorted(result, key=lambda item: item.get("name", ""))
+                if sorted_res and gen == self._countries_generation:
+                    self._countries_cache = sorted_res
+                    self._countries_fetched_at = time.monotonic()
+                return list(sorted_res)
+            except json.JSONDecodeError:
+                return _hero_static_rows()
 
     async def resolve_country(self, country: str) -> tuple[Any, str]:
+        from app.countries import cc_to_iso, name_to_iso
+
         raw = str(country or "").strip()
         if not raw:
             raise ValueError("未知 HeroSMS 国家: empty")
+
+        if raw.isdigit():
+            cid = int(raw)
+            if cid in HERO_COUNTRIES:
+                return cid, _hero_label(cid)
+            try:
+                countries = await self.get_countries()
+                for item in countries:
+                    if str(item.get("id", "")) == str(cid):
+                        return cid, item.get("name") or _hero_label(cid)
+            except Exception:
+                pass
+            raise ValueError(f"未知 HeroSMS 国家 ID: {country}")
+
+        if raw.startswith("+"):
+            cc_digits = re.sub(r"\D", "", raw)
+            if not cc_digits:
+                raise ValueError(f"未知 HeroSMS 国家: {country}")
+            iso_for_cc = cc_to_iso(cc_digits)
+            if iso_for_cc and iso_for_cc in HERO_ALIASES:
+                cid = HERO_ALIASES[iso_for_cc]
+                return cid, _hero_label(cid)
+            for scid, sinfo in HERO_COUNTRIES.items():
+                if sinfo.get("cc") == cc_digits:
+                    return scid, _hero_label(scid)
+            try:
+                countries = await self.get_countries()
+                for item in countries:
+                    if str(item.get("cc", "")).strip() == cc_digits:
+                        cid = int(item["id"]) if str(item.get("id", "")).isdigit() else item.get("id")
+                        return cid, item.get("name") or str(cid)
+            except Exception:
+                pass
+            raise ValueError(f"未知 HeroSMS 国家区号: {country}")
 
         key = raw.lower()
         compact = re.sub(r"[^a-z0-9]+", "", key)
         cid = HERO_ALIASES.get(key)
         if cid is None and compact:
             cid = HERO_ALIASES.get(compact)
+        if cid is None:
+            iso_hint = name_to_iso(raw)
+            if iso_hint:
+                cid = HERO_ALIASES.get(iso_hint)
         if cid is not None:
             return cid, _hero_label(cid)
-
-        if raw.isdigit():
-            cid = int(raw)
-            try:
-                countries = await self.get_countries()
-                if any(str(item.get("id", "")) == str(cid) for item in countries):
-                    return cid, _hero_label(cid)
-            except Exception:
-                pass
-            raise ValueError(f"未知 HeroSMS 国家 ID: {country}")
 
         allow_sub = len(key) >= 4 or any(ord(ch) > 127 for ch in key)
         if allow_sub:
@@ -243,14 +318,14 @@ class HeroSmsProvider(BaseSmsProvider):
 
         try:
             countries = await self.get_countries()
+            iso_hint = name_to_iso(raw)
             for item in countries:
-                fields = [
+                fields = {
                     str(item.get("name", "")).strip().lower(),
+                    str(item.get("name_zh", "")).strip().lower(),
                     str(item.get("iso", "")).strip().lower(),
-                    str(item.get("id", "")).strip().lower(),
-                    str(item.get("cc", "")).strip().lower(),
-                ]
-                if key in fields:
+                } - {""}
+                if key in fields or (iso_hint and str(item.get("iso", "")).strip().lower() == iso_hint):
                     cid = int(item["id"]) if str(item.get("id", "")).isdigit() else item.get("id")
                     return cid, item.get("name") or str(cid)
         except Exception:
@@ -261,41 +336,56 @@ class HeroSmsProvider(BaseSmsProvider):
     async def get_prices(self, country_id: Any, product: str = DEFAULT_SERVICE) -> list[dict]:
         text = await self._get(action="getPricesV3", service=product, country=country_id)
         try:
-            import json
             data = json.loads(text)
             prices = []
+
             def _as_count(raw_cnt: Any) -> int:
                 if isinstance(raw_cnt, str) and raw_cnt.strip().lower() == "few":
                     return 1
                 try:
-                    return max(0, int(float(raw_cnt)))
-                except (TypeError, ValueError):
+                    num = float(raw_cnt)
+                    return max(0, int(num)) if math.isfinite(num) else 0
+                except (TypeError, ValueError, OverflowError):
                     return 0
 
-            def walk(obj):
+            def walk(obj, depth: int = 0):
                 if isinstance(obj, dict):
                     cost = None
                     for k in ("cost", "Price", "price"):
                         v = obj.get(k)
                         if v is not None:
                             try:
-                                parsed_cost = round(float(v), 4)
-                                if parsed_cost > 0:
-                                    cost = parsed_cost
+                                parsed_cost = float(v)
+                                if math.isfinite(parsed_cost) and parsed_cost > 0:
+                                    cost = round(parsed_cost, 4)
                                 break
-                            except (ValueError, TypeError):
+                            except (ValueError, TypeError, OverflowError):
                                 pass
                     if cost is not None and not isinstance(obj.get("providers"), (dict, list)):
                         raw_cnt = next((obj.get(ck) for ck in ("count", "Qty", "qty", "quantity") if ck in obj), 0)
                         count = _as_count(raw_cnt)
                         prices.append({"cost": cost, "count": count, "in_stock": count > 0})
                         return
-                    for v in obj.values():
+                    for k, v in obj.items():
+                        is_price_key = bool(re.fullmatch(r"\d+(?:\.\d+)?", str(k)))
+                        has_count = isinstance(v, dict) and any(ck in v for ck in ("count", "Qty", "qty", "quantity"))
+                        if is_price_key and (isinstance(v, (int, float, str)) or has_count):
+                            try:
+                                k_cost = float(k)
+                            except (ValueError, OverflowError):
+                                k_cost = 0.0
+                            if math.isfinite(k_cost) and k_cost > 0 and not (depth == 0 and k_cost >= 5 and "." not in str(k)):
+                                cnt = _as_count(v) if isinstance(v, (int, float, str)) else _as_count(
+                                    next((v.get(ck) for ck in ("count", "Qty", "qty", "quantity") if ck in v), 0)
+                                )
+                                prices.append({"cost": round(k_cost, 4), "count": cnt, "in_stock": cnt > 0})
+                                continue
                         if isinstance(v, (dict, list)):
-                            walk(v)
+                            walk(v, depth + 1)
                 elif isinstance(obj, list):
                     for item in obj:
-                        walk(item)
+                        walk(item, depth + 1)
+
             walk(data)
             return prices
         except json.JSONDecodeError as exc:
@@ -340,10 +430,17 @@ class HeroSmsProvider(BaseSmsProvider):
         except (TypeError, ValueError) as exc:
             raise ValueError(f"HeroSMS 国家 ID 无效: {country_id}") from exc
         metadata = HERO_COUNTRIES.get(cid, {})
-        if not metadata.get("cc") or not metadata.get("iso"):
-            raise ValueError(
-                f"HeroSMS 国家 {country_id} 缺少区号/ISO 映射，已在取号前阻止 WA 注册"
-            )
+        if metadata.get("cc") and metadata.get("iso"):
+            return
+        try:
+            for item in await self.get_countries():
+                if str(item.get("id", "")) == str(cid) and item.get("cc") and item.get("iso"):
+                    return
+        except Exception:
+            pass
+        raise ValueError(
+            f"HeroSMS 国家 {country_id} 缺少区号/ISO 映射，已在取号前阻止 WA 注册"
+        )
 
     async def get_sms_code(self, activation_id: str) -> tuple[str, str]:
         text = await self._get(action="getStatus", id=activation_id)
@@ -435,10 +532,19 @@ class HeroSmsProvider(BaseSmsProvider):
             return ActionOutcome(ok=False, status="error", retryable=True, raw=str(exc))
 
     async def poll_sms_code(self, activation_id: str, timeout: int = 180) -> str:
-        intervals = [3] * 12 + [5] * 12 + [8] * 15
         start = asyncio.get_running_loop().time()
-        for delay in intervals:
-            status, code = await self.get_sms_code(activation_id)
+        while True:
+            elapsed = asyncio.get_running_loop().time() - start
+            if elapsed >= timeout:
+                raise SmsTimeoutError(f"HeroSMS 等码超时 ({timeout}s)")
+            try:
+                status, code = await self.get_sms_code(activation_id)
+            except SmsProviderError as exc:
+                err_up = str(exc).upper()
+                if any(tok in err_up for tok in ("BAD_KEY", "BAD_ACTION", "WRONG_ACTIVATION_ID")):
+                    raise
+                logger.warning("HeroSMS 轮询查码暂时异常，稍后重试: %s", exc)
+                status, code = "WAIT", ""
             if status == "OK" and code:
                 return code
             if status == "CANCEL":
@@ -448,8 +554,8 @@ class HeroSmsProvider(BaseSmsProvider):
             elapsed = asyncio.get_running_loop().time() - start
             if elapsed >= timeout:
                 raise SmsTimeoutError(f"HeroSMS 等码超时 ({timeout}s)")
+            delay = 3 if elapsed < 36 else (5 if elapsed < 96 else 8)
             await asyncio.sleep(delay)
-        raise SmsTimeoutError(f"HeroSMS 等码超时 ({timeout}s)")
 
     async def normalize_phone(self, raw_phone: str, country_id: Any) -> "PhoneInput":
         from app.phone_normalizer import build_phone_input, resolve_country_metadata

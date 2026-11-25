@@ -69,18 +69,18 @@ async def stream_events(
             # 断线重连回放阶段：每条推送前复核凭据有效性（修复补充 P1-03：密钥撤销同步停止历史回放）
             seen_ids: set[str] = set()
             for missed in missed_events:
-                if revoke_event.is_set() or not await _still_authorized():
+                if event_bus.is_closed or revoke_event.is_set() or not await _still_authorized():
                     return
                 seen_ids.add(missed.id)
                 payload = json.dumps(missed.to_payload(), ensure_ascii=False)
                 yield f"id: {missed.id}\nevent: {missed.event}\ndata: {payload}\n\n"
 
-            while True:
+            while not event_bus.is_closed:
                 if await request.is_disconnected():
                     break
                 if revoke_event.is_set():
                     revoke_event.clear()
-                    if not await _still_authorized():
+                    if event_bus.is_closed or not await _still_authorized():
                         break
 
                 get_task = asyncio.create_task(queue.get())
@@ -96,6 +96,9 @@ async def stream_events(
                     if pending:
                         await asyncio.gather(*pending, return_exceptions=True)
 
+                    if event_bus.is_closed:
+                        break
+
                     if revoke_task in done:
                         revoke_event.clear()
                         if not await _still_authorized():
@@ -107,6 +110,9 @@ async def stream_events(
                         evt = get_task.result()
                         if not await _still_authorized():
                             break
+                        if event_bus.consume_overflow(queue):
+                            overflow_payload = json.dumps({"reason": "subscriber_queue_overflow"}, ensure_ascii=False)
+                            yield f"event: resync_required\ndata: {overflow_payload}\n\n"
                         if evt.id in seen_ids:
                             continue
                         payload = json.dumps(evt.to_payload(), ensure_ascii=False)

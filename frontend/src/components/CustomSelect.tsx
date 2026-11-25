@@ -145,9 +145,12 @@ export function CustomSelect({
             } else {
               setActiveIdx((i) => Math.max(i - 1, 0));
             }
-          } else if (e.key === "Enter" && open && options[activeIdx]) {
+          } else if ((e.key === "Enter" || e.key === " ") && open && options[activeIdx]) {
             e.preventDefault();
             selectItem(options[activeIdx].value);
+          } else if (e.key === " " && !open) {
+            e.preventDefault();
+            toggleOpen();
           }
         }}
         className={`flex w-full cursor-pointer items-center justify-between border text-left font-medium transition outline-none ${sizeClass} ${

@@ -113,8 +113,8 @@ class ActivationsRepo:
         currency: Optional[str] = None,
         currency_source: str = "",
         state: str = "active",
-    ) -> None:
-        """同事务原子绑定激活台账与订单的 activation_id 及财务成本口径。"""
+    ) -> bool:
+        """同事务原子绑定激活台账与订单的 activation_id 及财务成本口径（仅允许从 purchasing 状态转换）。"""
         now = _utc_now_iso()
         resolved_status = cost_status or (
             "actual" if actual_cost is not None else ("estimated" if estimated_cost is not None else "unknown")
@@ -125,10 +125,10 @@ class ActivationsRepo:
             or ("provider_default" if resolved_ccy != "UNKNOWN" else "unknown")
         ).strip()
         async with self._conn.transaction() as raw:
-            await raw.execute(
+            cur = await raw.execute(
                 "UPDATE order_activations SET activation_id=?, phone_raw=?, phone_e164=?, "
                 "actual_cost=?, estimated_cost=?, cost_status=?, currency=?, currency_source=?, "
-                "currency_review_required=0, state=?, updated_at=? WHERE id=?",
+                "currency_review_required=0, state=?, updated_at=? WHERE id=? AND state='purchasing'",
                 (
                     activation_id,
                     phone_raw,
@@ -143,6 +143,8 @@ class ActivationsRepo:
                     row_id,
                 ),
             )
+            if (cur.rowcount or 0) != 1:
+                return False
             await raw.execute(
                 "UPDATE sms_orders SET activation_id=?, phone_raw=?, cost=?, actual_cost=?, "
                 "cost_status=?, currency=?, updated_at=? WHERE order_id=?",
@@ -157,6 +159,7 @@ class ActivationsRepo:
                     order_id,
                 ),
             )
+            return True
 
     async def update_state(
         self,
@@ -485,12 +488,30 @@ class ActivationsRepo:
                 # 当父订单已绑定具体 activation_id 时，核销早期无 activation_id 的 uncertain_purchase 绝不能提前终结父订单！
                 matches_primary = (not ord_aid) if not act_aid else ((not ord_aid) or (ord_aid == act_aid))
 
+                if matches_primary and norm_ccy and norm_ccy != "UNKNOWN":
+                    cur_ord_ccy = _normalize_currency(str(ord_row.get("currency") or ""), fallback="UNKNOWN")
+                    if cur_ord_ccy == "UNKNOWN" or (act_aid and ord_aid == act_aid):
+                        await raw.execute(
+                            "UPDATE sms_orders SET currency=?, updated_at=? WHERE order_id=?",
+                            (norm_ccy, now, order_id),
+                        )
+                        ord_row["currency"] = norm_ccy
+
+                sib_cur = await raw.execute(
+                    "SELECT 1 FROM order_activations "
+                    "WHERE order_id=? AND id!=? "
+                    "AND state IN ('purchasing', 'uncertain_purchase', 'refund_pending', 'code_persist_failed') "
+                    "LIMIT 1",
+                    (order_id, row_id),
+                )
+                has_unresolved_siblings = (await sib_cur.fetchone()) is not None
+
                 if matches_primary and (
                     cur_settlement in {"uncertain", "complete_uncertain", "complete_failed", "code_persist_failed"}
                     or cur_status in {"compensation_pending", "cancelling"}
                     or (
                         cur_status in {"code_received", "waiting_code", "waiting_next_code"}
-                        and state in {"completed", "refund_confirmed", "unrefundable"}
+                        and state in {"completed", "refund_confirmed", "unrefundable", "manual_resolved"}
                     )
                 ):
                     new_status = cur_status
@@ -500,7 +521,7 @@ class ActivationsRepo:
                             new_status = "completed"
                         elif state in {"refund_confirmed", "unrefundable"}:
                             new_status = "cancelled"
-                        elif cur_status in {"compensation_pending", "cancelling"}:
+                        else:
                             new_status = "completed" if int(ord_row.get("code_count") or 0) > 0 else "cancelled"
                         if new_status in {"completed", "cancelled", "expired", "failed"} and not completed_at:
                             completed_at = now
@@ -518,15 +539,20 @@ class ActivationsRepo:
                         "manual_resolved": fallback_manual_refund,
                     }
                     new_refund = refund_map.get(state, "none")
+                    next_settlement = (
+                        cur_settlement
+                        if (has_unresolved_siblings and cur_settlement in {"uncertain", "code_persist_failed"})
+                        else "manual_resolved"
+                    )
 
                     is_terminal_now = new_status in {"completed", "cancelled", "expired", "failed"}
                     do_scrub = bool(scrub_if_terminal and is_terminal_now)
                     if do_scrub:
                         await raw.execute(
-                            "UPDATE sms_orders SET status=?, settlement_state='manual_resolved', refund_state=?, "
-                            "completed_at=?, latest_code='', resend_base_code='', code_scrubbed=1, "
+                            "UPDATE sms_orders SET status=?, settlement_state=?, refund_state=?, "
+                            "completed_at=?, latest_code='', resend_base_code='', resend_base_digest='', code_scrubbed=1, "
                             "code_scrub_version=COALESCE(code_scrub_version, 0)+1, version=version+1, updated_at=? WHERE order_id=?",
-                            (new_status, new_refund, completed_at, now, order_id),
+                            (new_status, next_settlement, new_refund, completed_at, now, order_id),
                         )
                         await raw.execute("UPDATE sms_messages SET code='', raw_text='' WHERE order_id=?", (order_id,))
                         await WebhooksRepo.scrub_for_orders_in_tx(raw, [order_id], now)
@@ -535,11 +561,18 @@ class ActivationsRepo:
                         if v_row is not None and scrub_result is not None:
                             scrub_result[order_id] = int(v_row["code_scrub_version"] or 1)
                     else:
-                        await raw.execute(
-                            "UPDATE sms_orders SET status=?, settlement_state='manual_resolved', refund_state=?, "
-                            "completed_at=?, version=version+1, updated_at=? WHERE order_id=?",
-                            (new_status, new_refund, completed_at, now, order_id),
-                        )
+                        if is_terminal_now:
+                            await raw.execute(
+                                "UPDATE sms_orders SET status=?, settlement_state=?, refund_state=?, "
+                                "completed_at=?, resend_base_digest='', version=version+1, updated_at=? WHERE order_id=?",
+                                (new_status, next_settlement, new_refund, completed_at, now, order_id),
+                            )
+                        else:
+                            await raw.execute(
+                                "UPDATE sms_orders SET status=?, settlement_state=?, refund_state=?, "
+                                "completed_at=?, version=version+1, updated_at=? WHERE order_id=?",
+                                (new_status, next_settlement, new_refund, completed_at, now, order_id),
+                            )
                     if result_meta is not None:
                         result_meta["order_id"] = order_id
                         result_meta["parent_status_changed"] = new_status != cur_status
@@ -548,7 +581,7 @@ class ActivationsRepo:
                         snap = {
                             **ord_row,
                             "status": new_status,
-                            "settlement_state": "manual_resolved",
+                            "settlement_state": next_settlement,
                             "refund_state": new_refund,
                             "completed_at": completed_at,
                             **({"latest_code": "", "code_scrubbed": 1} if do_scrub else {}),
@@ -620,13 +653,29 @@ class ActivationsRepo:
             params,
         )
 
-    async def list_uncertain(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        """返回结果未知或收码落库持续失败、需人工核对上游账单的激活记录。"""
+    async def list_uncertain(
+        self,
+        *,
+        limit: int = 100,
+        active_acquiring_order_ids: Optional[Iterable[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """返回结果未知或收码落库持续失败、需人工核对上游账单的激活记录（排除仍在活跃购买中的正常尝试）。"""
+        safe_limit = max(1, min(int(limit), 500))
+        in_flight = [str(oid) for oid in (active_acquiring_order_ids or ()) if oid]
+        if in_flight:
+            ph = ",".join("?" for _ in in_flight)
+            return await self._conn.fetchall(
+                f"SELECT * FROM order_activations "
+                f"WHERE state IN ('uncertain_purchase', 'code_persist_failed') "
+                f"   OR (state = 'purchasing' AND order_id NOT IN ({ph})) "
+                f"ORDER BY id DESC LIMIT ?",
+                (*in_flight, safe_limit),
+            )
         return await self._conn.fetchall(
             "SELECT * FROM order_activations "
             "WHERE state IN ('purchasing', 'uncertain_purchase', 'code_persist_failed') "
             "ORDER BY id DESC LIMIT ?",
-            (max(1, min(int(limit), 500)),),
+            (safe_limit,),
         )
 
     async def list_currency_review(self, *, limit: int = 100) -> list[dict[str, Any]]:

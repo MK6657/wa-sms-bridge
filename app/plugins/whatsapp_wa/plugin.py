@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -43,19 +44,23 @@ class WhatsappWaPlugin(IntegrationPlugin):
 
     async def on_startup(self, *, db: Any, registry: Any) -> None:
         self._db = db
-        wa_app_url = await db.get_config("wa_app_url", env.wa_app_url)
-        self.waapi = create_wa_adapter(env.wa_adapter, wa_app_url or env.wa_app_url)
-        self.waapi.configure_auth(
-            auth_type=env.wa_app_auth_type,
-            token=env.wa_app_api_token,
-            username=env.wa_app_api_username,
-            password=env.wa_app_api_password,
-        )
-        self.orch = RegisterOrchestrator(registry, self.waapi, db)
-        stale_count = await self.orch.recover_stale_tasks()
-        if stale_count:
-            logger.warning("whatsapp_wa 插件启动恢复 %d 个残留任务", stale_count)
-        self.orch.start_background_tasks()
+        try:
+            wa_app_url = await db.get_config("wa_app_url", env.wa_app_url)
+            self.waapi = create_wa_adapter(env.wa_adapter, wa_app_url or env.wa_app_url)
+            self.waapi.configure_auth(
+                auth_type=env.wa_app_auth_type,
+                token=env.wa_app_api_token,
+                username=env.wa_app_api_username,
+                password=env.wa_app_api_password,
+            )
+            self.orch = RegisterOrchestrator(registry, self.waapi, db)
+            stale_count = await self.orch.recover_stale_tasks()
+            if stale_count:
+                logger.warning("whatsapp_wa 插件启动恢复 %d 个残留任务", stale_count)
+            self.orch.start_background_tasks()
+        except BaseException:
+            await self.on_shutdown()
+            raise
 
     async def on_shutdown(self) -> None:
         if self.orch is not None:
@@ -95,16 +100,19 @@ class WhatsappWaPlugin(IntegrationPlugin):
             AuthService.ensure_scope(caller, "wa:r")
             if not self.enabled:
                 return {"enabled": False, "ok": False, "status": "disabled"}
-            return {"enabled": True, **(await self.health())}
+            if not self._started:
+                return {"enabled": True, "started": False, "ok": False, "status": "startup_failed"}
+            return {"enabled": True, "started": True, **(await self.health())}
 
         @r.post("/register")
         async def wa_plugin_register(req: RegisterRequest, caller: CallerContext = Depends(get_caller)):
             AuthService.ensure_scope(caller, "wa:w")
             self._require_enabled()
             assert self.orch is not None
-            if canonical_service(req.service) != "whatsapp":
+            raw_svc = str(req.service or "whatsapp").strip().lower()
+            if raw_svc.startswith("custom:") or canonical_service(req.service) != "whatsapp":
                 raise HTTPException(400, "whatsapp_wa 插件仅支持 WhatsApp 自动注册")
-            task_id = f"task_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+            task_id = f"task_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}_{uuid4().hex[:6]}"
             return await self.orch.start_registration(
                 task_id=task_id,
                 country=req.country or "52",

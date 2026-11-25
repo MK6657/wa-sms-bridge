@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Optional
 
@@ -44,9 +45,9 @@ def _floor_4(dec: Decimal, *, field_name: str) -> float:
 def _positive_float(value: Any) -> Optional[float]:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return number if number > 0 else None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def effective_price_max(
@@ -69,10 +70,15 @@ def effective_price_max(
     if price_lock_enabled:
         computed = target
     elif price_float_enabled:
-        try:
-            pct = max(Decimal("0"), Decimal(str(price_float_percent or 0)))
-        except (InvalidOperation, ValueError):
+        if price_float_percent is None or (isinstance(price_float_percent, str) and not price_float_percent.strip()):
             pct = Decimal("0")
+        else:
+            try:
+                pct = Decimal(str(price_float_percent).strip())
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError("price_float_percent 必须是有效数字") from exc
+            if not pct.is_finite() or pct < 0:
+                raise ValueError("price_float_percent 必须是大于等于 0 的有限数字")
         computed = target * (Decimal("1") + pct / Decimal("100"))
     else:
         computed = target
@@ -84,15 +90,22 @@ def effective_price_max(
 
 
 def locked_price_available(entries: list[dict[str, Any]], target_price: Any) -> tuple[bool, int]:
+    if target_price is None:
+        return True, 0
     target = _positive_float(target_price)
     if target is None:
-        return True, 0
+        return False, 0
     stock = 0
     for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
         try:
-            cost = float(entry.get("cost"))
-            count = int(float(entry.get("count") or 0))
-        except (TypeError, ValueError):
+            cost = float(entry.get("cost"))  # type: ignore[arg-type]
+            raw_cnt = float(entry.get("count") or 0)
+            if not math.isfinite(cost) or not math.isfinite(raw_cnt):
+                continue
+            count = int(raw_cnt)
+        except (TypeError, ValueError, OverflowError):
             continue
         if abs(cost - target) <= PRICE_EPSILON:
             stock += max(0, count)
@@ -107,7 +120,10 @@ def polling_interval_seconds(
 ) -> float:
     if request_interval_enabled:
         try:
-            return max(0.1, min(float(request_interval), 3600.0))
-        except (TypeError, ValueError):
+            val = float(request_interval)
+            if not math.isfinite(val):
+                return 1.0
+            return max(0.1, min(val, 3600.0))
+        except (TypeError, ValueError, OverflowError):
             return 1.0
     return 1.0 if continuous_poll else 0.0

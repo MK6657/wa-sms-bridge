@@ -11,10 +11,12 @@ backups
 **/__pycache__
 **/*.pyc
 *.db
+*.db-*
 *.sqlite
 *.sqlite3
 *.log
 *.jsonl
 frontend/node_modules
+frontend/dist
 app/web_dist
 tests

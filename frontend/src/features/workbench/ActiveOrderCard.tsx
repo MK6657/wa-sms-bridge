@@ -184,7 +184,7 @@ export function ActiveOrderCard({
                 <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
                   <Sparkles className="h-3.5 w-3.5" />
                   <span>
-                    已收到短信验证码
+                    {order.status === "waiting_next_code" ? "上一条验证码（正在等待重发新短信）" : "已收到短信验证码"}
                     {order.code_count > 1 ? `（第 ${order.code_count} 条）` : ""}
                   </span>
                 </div>
@@ -216,16 +216,17 @@ export function ActiveOrderCard({
                     <button
                       key={msg.id}
                       type="button"
-                      title={msg.raw_text || `点击复制验证码 ${msg.code}`}
+                      disabled={!msg.code}
+                      title={msg.raw_text || (msg.code ? `点击复制验证码 ${msg.code}` : "该条历史验证码已脱敏")}
                       onClick={async () => {
                         if (msg.code && (await copyToClipboard(msg.code))) {
                           notify(`已复制第 #${msg.seq} 条验证码 ${msg.code}`, "success");
                         }
                       }}
-                      className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-emerald-200 bg-white/95 px-2.5 py-1 text-xs shadow-2xs transition hover:border-emerald-400 hover:bg-white"
+                      className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-emerald-200 bg-white/95 px-2.5 py-1 text-xs shadow-2xs transition hover:border-emerald-400 hover:bg-white disabled:cursor-default disabled:opacity-60"
                     >
                       <span className="text-slate-400">#{msg.seq}</span>
-                      <strong className="font-mono-code text-emerald-900">{msg.code}</strong>
+                      <strong className="font-mono-code text-emerald-900">{msg.code || "已脱敏"}</strong>
                       <span className="text-[11px] text-slate-400">
                         {formatDateTime(msg.received_at).slice(-8)}
                       </span>
@@ -253,7 +254,9 @@ export function ActiveOrderCard({
           <div className="flex items-center gap-2.5 rounded-xl border border-dashed border-slate-200 bg-slate-50/60 px-3.5 py-3 text-xs text-slate-500">
             <MessageSquareText className="h-4 w-4 shrink-0 text-slate-400" />
             <span>
-              该订单历史验证码已按安全策略脱敏清理；如需新验证码可点击下方「再收一条短信」。
+              {order.status === "code_received" && supportsResend
+                ? "该订单历史验证码已按安全策略脱敏清理；如需新验证码可点击下方「再收一条短信」。"
+                : "该订单历史验证码已按安全策略脱敏清理。"}
             </span>
           </div>
         ) : order.status !== "acquiring" ? (
@@ -273,7 +276,7 @@ export function ActiveOrderCard({
 
         {/* 操作按钮栏 */}
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
-          {order.status === "code_received" ? (
+          {order.status === "code_received" || (order.status === "waiting_next_code" && order.code_count > 0) ? (
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
@@ -288,7 +291,7 @@ export function ActiveOrderCard({
                 )}
                 确认完成
               </button>
-              {supportsResend ? (
+              {order.status === "code_received" && supportsResend ? (
                 <button
                   type="button"
                   disabled={isBusy}

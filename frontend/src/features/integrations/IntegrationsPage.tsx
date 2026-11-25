@@ -63,6 +63,7 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
   const [editName, setEditName] = useState("");
   const [editWebhookUrl, setEditWebhookUrl] = useState("");
   const [editWebhookSecret, setEditWebhookSecret] = useState("");
+  const [clearEditSecret, setClearEditSecret] = useState(false);
   const [showEditSecret, setShowEditSecret] = useState(false);
   const [editScopes, setEditScopes] = useState<string[]>([]);
   const [savingEdit, setSavingEdit] = useState(false);
@@ -175,6 +176,7 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
     setEditName(item.name);
     setEditWebhookUrl(item.default_webhook_url || "");
     setEditWebhookSecret("");
+    setClearEditSecret(false);
     setShowEditSecret(false);
     setEditScopes(Array.isArray(item.scopes) ? [...item.scopes] : SCOPE_META.map((s) => s.id));
   };
@@ -198,7 +200,9 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
         default_webhook_url: editWebhookUrl.trim(),
         scopes: editScopes,
       };
-      if (editWebhookSecret.trim()) {
+      if (clearEditSecret) {
+        payload.webhook_secret = "";
+      } else if (editWebhookSecret.trim()) {
         payload.webhook_secret = editWebhookSecret.trim();
       }
       await api.updateProjectKey(editingItem.project_id, payload);
@@ -236,7 +240,11 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
     if (!deleteTarget) return;
     setDeleting(true);
     try {
-      await api.deleteProjectKey(deleteTarget.project_id);
+      const deletedId = deleteTarget.project_id;
+      await api.deleteProjectKey(deletedId);
+      if (justCreatedKey?.project_id === deletedId) {
+        setJustCreatedKey(null);
+      }
       notify(`已删除项目密钥 ${deleteTarget.name}`, "success");
       setDeleteTarget(null);
       load();
@@ -275,29 +283,33 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
 BASE = "${origin}"
 HEADERS = {"X-API-Key": "${sampleKey}"}
 
-with httpx.Client(base_url=BASE, headers=HEADERS, timeout=90) as client:
+with httpx.Client(base_url=BASE, headers=HEADERS, timeout=110) as client:
     # 1. 取号（带 Idempotency-Key 防止重试重复扣费）
-    order = client.post(
+    order_resp = client.post(
         "/api/v1/orders",
         headers={"Idempotency-Key": str(uuid.uuid4())},
         json={
-            "service": "telegram",       # 支持 whatsapp / telegram / google / openai / 原生服务码
+            "service": "apple",          # 支持 whatsapp / telegram / google / apple / openai / 原生服务码
             "country": "Thailand",       # 支持中文 / 英文 / ISO / SMSBower ID
             "wait_timeout": 180,
             "external_ref": "job-001",
             "strategy": {"target_price": 0.15, "price_float_enabled": True, "price_float_percent": 10},
         },
-    ).json()
+    )
+    order_resp.raise_for_status()
+    order = order_resp.json()
     print("拿到手机号:", order["phone_e164"])
 
     # 2. 长轮询等码（收到验证码瞬间返回，无须手写循环）
-    res = client.get(f"/api/v1/orders/{order['order_id']}/wait", params={"timeout": 90}).json()
+    wait_resp = client.get(f"/api/v1/orders/{order['order_id']}/wait", params={"timeout": 90})
+    wait_resp.raise_for_status()
+    res = wait_resp.json()
     if res["latest_code"]:
         print("收到验证码:", res["latest_code"])
-        client.post(f"/api/v1/orders/{order['order_id']}/complete")
+        client.post(f"/api/v1/orders/{order['order_id']}/complete").raise_for_status()
     else:
         # 没收到或号码不可用：取消退款并可选拉黑
-        client.post(f"/api/v1/orders/{order['order_id']}/cancel", json={"blacklist": False})`,
+        client.post(f"/api/v1/orders/{order['order_id']}/cancel", json={"blacklist": False}).raise_for_status()`,
 
     curl: `# 1. 幂等取号
 curl -X POST "${origin}/api/v1/orders" \\
@@ -319,24 +331,28 @@ const headers = {
   "Content-Type": "application/json",
   "X-API-Key": "${sampleKey}",
 };
+const parseJson = async (r) => {
+  if (!r.ok) throw new Error(\`HTTP \${r.status}: \${await r.text()}\`);
+  return r.json();
+};
 
 // 1. 取号
 const order = await fetch(\`\${BASE}/api/v1/orders\`, {
   method: "POST",
   headers: { ...headers, "Idempotency-Key": crypto.randomUUID() },
   body: JSON.stringify({ service: "google", country: "52", wait_timeout: 180 }),
-}).then(r => r.json());
+}).then(parseJson);
 
 console.log("手机号:", order.phone_e164);
 
 // 2. 等待验证码
 const result = await fetch(\`\${BASE}/api/v1/orders/\${order.order_id}/wait?timeout=90\`, {
   headers,
-}).then(r => r.json());
+}).then(parseJson);
 
 if (result.latest_code) {
   console.log("验证码:", result.latest_code);
-  await fetch(\`\${BASE}/api/v1/orders/\${order.order_id}/complete\`, { method: "POST", headers });
+  await fetch(\`\${BASE}/api/v1/orders/\${order.order_id}/complete\`, { method: "POST", headers }).then(parseJson);
 }`,
 
     sse: `// SSE 实时监听全部（或单个）订单的验证码事件
@@ -566,14 +582,45 @@ es.addEventListener("order.expired", (ev) => {
                 />
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium text-slate-700">更换签名密钥（留空保持不变）</label>
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <label className="block text-xs font-medium text-slate-700">更换签名密钥（留空保持不变）</label>
+                  {editingItem.has_webhook_secret ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setClearEditSecret((prev) => {
+                          const next = !prev;
+                          if (next) setEditWebhookSecret("");
+                          return next;
+                        });
+                      }}
+                      className={`cursor-pointer rounded px-1.5 py-0.5 text-[11px] font-medium transition ${
+                        clearEditSecret
+                          ? "bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300"
+                          : "text-slate-500 hover:bg-slate-100 hover:text-rose-600"
+                      }`}
+                    >
+                      {clearEditSecret ? "保存时将清除密钥" : "清除已设密钥"}
+                    </button>
+                  ) : null}
+                </div>
                 <div className="relative">
                   <input
                     type={showEditSecret ? "text" : "password"}
                     value={editWebhookSecret}
-                    onChange={(e) => setEditWebhookSecret(e.target.value)}
-                    placeholder={editingItem.has_webhook_secret ? "已设置签名密钥，留空保持不变" : "可选 HMAC-SHA256 密钥"}
-                    className="input-surface font-mono-code w-full rounded-xl py-2 pl-3 pr-9 text-xs"
+                    disabled={clearEditSecret}
+                    onChange={(e) => {
+                      setEditWebhookSecret(e.target.value);
+                      if (e.target.value.trim()) setClearEditSecret(false);
+                    }}
+                    placeholder={
+                      clearEditSecret
+                        ? "保存后将清空已设签名密钥"
+                        : editingItem.has_webhook_secret
+                          ? "已设置签名密钥，留空保持不变"
+                          : "可选 HMAC-SHA256 密钥"
+                    }
+                    className="input-surface font-mono-code w-full rounded-xl py-2 pl-3 pr-9 text-xs disabled:bg-slate-100 disabled:text-slate-400"
                   />
                   <button
                     type="button"
@@ -588,7 +635,12 @@ es.addEventListener("order.expired", (ev) => {
             <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-1.5 text-xs">
                 <span className="font-medium text-slate-600">接口权限：</span>
-                {SCOPE_META.map((sc) => {
+                {[
+                  ...SCOPE_META,
+                  ...editScopes
+                    .filter((sc) => !SCOPE_META.some((m) => m.id === sc))
+                    .map((sc) => ({ id: sc, label: "自定义权限" })),
+                ].map((sc) => {
                   const checked = editScopes.includes(sc.id);
                   return (
                     <button

@@ -87,7 +87,7 @@ async def add_blacklist(
     if len(digits) < 5:
         raise AppError("手机号格式无效（至少包含 5 位数字）", status_code=422, code="VALIDATION_ERROR")
     phone = f"+{digits}" if raw_phone.startswith("+") else digits
-    provider = req.provider.strip() or registry.default_provider
+    provider = (req.provider.strip() or registry.default_provider).lower()
     target_project = _resolve_target_project(caller, req.scope)
     inserted = await db.blacklist.add(phone, reason=req.reason.strip(), provider=provider, project_id=target_project)
     return {
@@ -108,17 +108,21 @@ async def add_blacklist_batch(
     registry: ProviderRegistry = Depends(get_registry),
 ):
     AuthService.ensure_scope(caller, "blacklist:w")
-    provider = req.provider.strip() or registry.default_provider
+    provider = (req.provider.strip() or registry.default_provider).lower()
     target_project = _resolve_target_project(caller, req.scope)
-    added = 0
+    normalized_phones: list[str] = []
     for raw in req.phones:
         raw_phone = str(raw or "").strip()
         digits = re.sub(r"\D", "", raw_phone)
         if len(digits) < 5:
             continue
-        phone = f"+{digits}" if raw_phone.startswith("+") else digits
-        if await db.blacklist.add(phone, reason=req.reason.strip(), provider=provider, project_id=target_project):
-            added += 1
+        normalized_phones.append(f"+{digits}" if raw_phone.startswith("+") else digits)
+    added = await db.blacklist.add_batch(
+        normalized_phones,
+        reason=req.reason.strip(),
+        provider=provider,
+        project_id=target_project,
+    )
     return {
         "success": True,
         "added": added,
@@ -138,7 +142,7 @@ async def remove_blacklist(
     registry: ProviderRegistry = Depends(get_registry),
 ):
     AuthService.ensure_scope(caller, "blacklist:w")
-    prov = provider.strip() or registry.default_provider
+    prov = (provider.strip() or registry.default_provider).lower()
     target_project = _resolve_target_project(caller, scope, project_id=project_id)
     deleted = await db.blacklist.remove(phone.strip(), provider=prov, project_id=target_project)
     return {"success": True, "deleted": deleted, "project_id": target_project}

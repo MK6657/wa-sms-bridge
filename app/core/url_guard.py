@@ -38,6 +38,7 @@ class _PinnedRoute:
     host: str
     ips: tuple[str, ...]
     allow_private: bool
+    allow_loopback: bool = False
 
 
 _PINNED_WEBHOOK_ROUTE: contextvars.ContextVar[Optional[_PinnedRoute]] = contextvars.ContextVar(
@@ -46,12 +47,45 @@ _PINNED_WEBHOOK_ROUTE: contextvars.ContextVar[Optional[_PinnedRoute]] = contextv
 )
 
 
+def normalize_url_hostname(host: str, *, error_code: str = "INVALID_WEBHOOK_URL") -> str:
+    """规范化主机名：去尾点、小写化、IPv6 去括号、非 ASCII 域名转 IDNA Punycode。"""
+    h = (host or "").strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    h = h.rstrip(".")
+    if not h:
+        return ""
+    try:
+        ipaddress.ip_address(h)
+        return h
+    except ValueError:
+        pass
+    if not h.isascii():
+        try:
+            h = h.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise AppError(f"URL 主机名包含无效国际化域名字符: {exc}", status_code=422, code=error_code) from exc
+    return h
+
+
 @contextmanager
-def pin_webhook_host(host: str, approved_ips: Iterable[str], *, allow_private: bool = False) -> Iterator[None]:
+def pin_webhook_host(
+    host: str,
+    approved_ips: Iterable[str],
+    *,
+    allow_private: bool = False,
+    allow_loopback: Optional[bool] = None,
+) -> Iterator[None]:
     """在当前异步上下文中将目标主机绑定到已批准的解析 IP 列表，供底层 TCP 连接强制使用。"""
+    norm_host = normalize_url_hostname(host)
     clean_ips = tuple(str(ip).strip() for ip in approved_ips if str(ip).strip())
+    eff_loopback = (
+        _host_matches_allowlist(norm_host, env.webhook_allowed_hosts)
+        if allow_loopback is None
+        else bool(allow_loopback)
+    )
     token = _PINNED_WEBHOOK_ROUTE.set(
-        _PinnedRoute(host=(host or "").strip().lower(), ips=clean_ips, allow_private=allow_private)
+        _PinnedRoute(host=norm_host, ips=clean_ips, allow_private=allow_private, allow_loopback=eff_loopback)
     )
     try:
         yield
@@ -60,19 +94,37 @@ def pin_webhook_host(host: str, approved_ips: Iterable[str], *, allow_private: b
 
 
 def _host_matches_allowlist(host: str, allowlist: Iterable[str]) -> bool:
-    h = (host or "").strip().lower()
+    h = normalize_url_hostname(host) if host else ""
     if not h:
         return False
     for raw in allowlist:
-        pattern = str(raw or "").strip().lower()
-        if not pattern:
+        raw_str = str(raw or "").strip().lower().rstrip(".")
+        if not raw_str:
             continue
-        if pattern.startswith("*."):
-            suffix = pattern[1:]
-            if h.endswith(suffix) and len(h) > len(suffix):
+        if raw_str.startswith("*."):
+            base = normalize_url_hostname(raw_str[2:])
+            suffix = f".{base}"
+            if base and h.endswith(suffix) and len(h) > len(suffix):
                 return True
-        elif h == pattern:
-            return True
+        else:
+            pattern = normalize_url_hostname(raw_str)
+            if pattern and h == pattern:
+                return True
+    return False
+
+
+def _is_forbidden_even_when_private_allowed(ip_str: str, *, allow_loopback: bool = False) -> bool:
+    """即使放行私有网段，也绝不允许链路本地(169.254 云元数据)、未指定(0.0.0.0/::)、组播；回环仅限显式主机白名单。"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+        return True
+    if ip.is_loopback and not allow_loopback:
+        return True
     return False
 
 
@@ -106,14 +158,14 @@ def _validate_webhook_url_syntax(
     *,
     allowed_project_url: str = "",
     enforce_project_origin: bool = False,
-) -> tuple[str, str, int, bool, Optional[str]]:
+) -> tuple[str, str, int, bool, bool, Optional[str]]:
     raw = (url or "").strip()
     if not raw:
         raise AppError("Webhook URL 不能为空", status_code=422, code="INVALID_WEBHOOK_URL")
 
     parsed = urlparse(raw)
     scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").strip().lower()
+    host = normalize_url_hostname(parsed.hostname or "", error_code="INVALID_WEBHOOK_URL")
     parsed_port = _safe_url_port(parsed, error_code="INVALID_WEBHOOK_URL")
 
     if not host:
@@ -133,7 +185,9 @@ def _validate_webhook_url_syntax(
             code="WEBHOOK_SCHEME_NOT_ALLOWED",
         )
 
-    if enforce_project_origin and not explicitly_allowed_host:
+    # 安全边界：外部项目 API Key 自定义订单 webhook_url 必须始终与管理员登记给该项目的默认回调同源，
+    # 绝不允许借用全局 WEBHOOK_ALLOWED_HOSTS 越权回调其他内部租户或内部主机！
+    if enforce_project_origin:
         if not allowed_project_url:
             raise AppError(
                 "该项目未由管理员登记允许的 Webhook 目标，禁止自定义订单回调地址",
@@ -142,12 +196,13 @@ def _validate_webhook_url_syntax(
             )
         reg = urlparse(allowed_project_url.strip())
         reg_scheme = (reg.scheme or "").lower()
+        reg_host = normalize_url_hostname(reg.hostname or "", error_code="INVALID_WEBHOOK_URL")
         reg_port = _safe_url_port(reg, error_code="INVALID_WEBHOOK_URL")
         eff_reg_port = reg_port or (443 if reg_scheme == "https" else 80)
         eff_parsed_port = parsed_port or (443 if scheme == "https" else 80)
         if (
             reg_scheme != scheme
-            or (reg.hostname or "").strip().lower() != host
+            or reg_host != host
             or eff_reg_port != eff_parsed_port
         ):
             raise AppError(
@@ -157,36 +212,41 @@ def _validate_webhook_url_syntax(
             )
 
     allow_private = explicitly_allowed_host or env.webhook_allow_private_nets
+    allow_loopback = explicitly_allowed_host
     port = parsed_port or (443 if scheme == "https" else 80)
 
     literal_ip: Optional[str] = None
     try:
         ip_obj = ipaddress.ip_address(host)
-        if not allow_private and _is_blocked_ip(str(ip_obj)):
+        ip_text = str(ip_obj)
+        if _is_forbidden_even_when_private_allowed(ip_text, allow_loopback=allow_loopback) or (
+            not allow_private and _is_blocked_ip(ip_text)
+        ):
             raise AppError(
                 f"Webhook 目标地址 '{host}' 属于受限内网/回环/元数据网段，已被安全策略拦截",
                 status_code=422,
                 code="WEBHOOK_HOST_BLOCKED",
             )
-        literal_ip = str(ip_obj)
+        literal_ip = ip_text
     except ValueError:
         literal_ip = None
 
-    return raw, host, port, allow_private, literal_ip
+    return raw, host, port, allow_private, allow_loopback, literal_ip
 
 
-def _check_resolved_ips(host: str, infos: list, allow_private: bool) -> list[str]:
+def _check_resolved_ips(host: str, infos: list, allow_private: bool, *, allow_loopback: bool = False) -> list[str]:
     ips = list(dict.fromkeys(str(info[4][0]) for info in infos if info and info[4]))
-    if not allow_private:
-        if not ips:
-            raise AppError(f"Webhook 主机 '{host}' 无有效解析地址", status_code=422, code="WEBHOOK_DNS_FAILED")
-        for ip_str in ips:
-            if _is_blocked_ip(ip_str):
-                raise AppError(
-                    f"Webhook 主机 '{host}' 解析到受限地址 ({ip_str})，已被安全策略拦截",
-                    status_code=422,
-                    code="WEBHOOK_HOST_BLOCKED",
-                )
+    if not ips and not allow_private:
+        raise AppError(f"Webhook 主机 '{host}' 无有效解析地址", status_code=422, code="WEBHOOK_DNS_FAILED")
+    for ip_str in ips:
+        if _is_forbidden_even_when_private_allowed(ip_str, allow_loopback=allow_loopback) or (
+            not allow_private and _is_blocked_ip(ip_str)
+        ):
+            raise AppError(
+                f"Webhook 主机 '{host}' 解析到受限地址 ({ip_str})，已被安全策略拦截",
+                status_code=422,
+                code="WEBHOOK_HOST_BLOCKED",
+            )
     return ips
 
 
@@ -198,7 +258,7 @@ def validate_webhook_url(
     resolve_dns: bool = True,
 ) -> tuple[str, list[str]]:
     """同步校验 Webhook URL（供同步单元测试或无事件循环上下文使用）。"""
-    raw, host, port, allow_private, literal_ip = _validate_webhook_url_syntax(
+    raw, host, port, allow_private, allow_loopback, literal_ip = _validate_webhook_url_syntax(
         url,
         allowed_project_url=allowed_project_url,
         enforce_project_origin=enforce_project_origin,
@@ -217,7 +277,7 @@ def validate_webhook_url(
                 code="WEBHOOK_DNS_FAILED",
             ) from exc
         infos = []
-    return raw, _check_resolved_ips(host, infos, allow_private)
+    return raw, _check_resolved_ips(host, infos, allow_private, allow_loopback=allow_loopback)
 
 
 async def validate_webhook_url_async(
@@ -229,7 +289,7 @@ async def validate_webhook_url_async(
     dns_timeout: float = 3.0,
 ) -> tuple[str, list[str]]:
     """异步校验 Webhook URL（使用带超时的异步 getaddrinfo，不阻塞事件循环，修复复核 P1-02）。"""
-    raw, host, port, allow_private, literal_ip = _validate_webhook_url_syntax(
+    raw, host, port, allow_private, allow_loopback, literal_ip = _validate_webhook_url_syntax(
         url,
         allowed_project_url=allowed_project_url,
         enforce_project_origin=enforce_project_origin,
@@ -260,7 +320,7 @@ async def validate_webhook_url_async(
                 code="WEBHOOK_DNS_FAILED",
             ) from exc
         infos = []
-    return raw, _check_resolved_ips(host, infos, allow_private)
+    return raw, _check_resolved_ips(host, infos, allow_private, allow_loopback=allow_loopback)
 
 
 class PinnedIPNetworkBackend(httpcore.AsyncNetworkBackend):
@@ -281,20 +341,27 @@ class PinnedIPNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: Optional[str] = None,
         socket_options=None,
     ) -> httpcore.AsyncNetworkStream:
-        norm_host = (host or "").strip().lower()
+        try:
+            norm_host = normalize_url_hostname(host)
+        except AppError as exc:
+            raise httpcore.ConnectError(str(exc)) from exc
         route = _PINNED_WEBHOOK_ROUTE.get()
 
         if route is None or route.host != norm_host:
             # 未通过 pin_webhook_host 审批的连接一律禁止（除非是受允许的显式白名单字面量 IP）
-            allow_priv = _host_matches_allowlist(norm_host, env.webhook_allowed_hosts) or env.webhook_allow_private_nets
+            explicit_allow = _host_matches_allowlist(norm_host, env.webhook_allowed_hosts)
+            allow_priv = explicit_allow or env.webhook_allow_private_nets
             try:
                 ip_obj = ipaddress.ip_address(norm_host)
             except ValueError as exc:
                 raise httpcore.ConnectError(f"Webhook 连接被拒：目标主机 '{norm_host}' 未绑定已批准 IP") from exc
-            if not allow_priv and _is_blocked_ip(str(ip_obj)):
+            ip_text = str(ip_obj)
+            if _is_forbidden_even_when_private_allowed(ip_text, allow_loopback=explicit_allow) or (
+                not allow_priv and _is_blocked_ip(ip_text)
+            ):
                 raise httpcore.ConnectError(f"Webhook 连接被拒：目标 IP '{norm_host}' 属于受限网段")
             return await self._inner.connect_tcp(
-                str(ip_obj),
+                ip_text,
                 port,
                 timeout=timeout,
                 local_address=local_address,
@@ -314,7 +381,9 @@ class PinnedIPNetworkBackend(httpcore.AsyncNetworkBackend):
 
         last_exc: Optional[Exception] = None
         for candidate_ip in route.ips:
-            if not route.allow_private and _is_blocked_ip(candidate_ip):
+            if _is_forbidden_even_when_private_allowed(candidate_ip, allow_loopback=route.allow_loopback) or (
+                not route.allow_private and _is_blocked_ip(candidate_ip)
+            ):
                 raise httpcore.ConnectError(f"Webhook 连接被拒：已解析 IP '{candidate_ip}' 属于受限网段")
             try:
                 return await self._inner.connect_tcp(
@@ -371,7 +440,7 @@ def validate_upstream_base_url(provider: str, url: str) -> str:
         return ""
     parsed = urlparse(raw)
     scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").strip().lower()
+    host = normalize_url_hostname(parsed.hostname or "", error_code="INVALID_UPSTREAM_URL")
     _safe_url_port(parsed, error_code="INVALID_UPSTREAM_URL")
     if not host or parsed.username or parsed.password:
         raise AppError("上游 Base URL 格式无效", status_code=422, code="INVALID_UPSTREAM_URL")

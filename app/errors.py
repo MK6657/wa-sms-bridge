@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+from app.log_redaction import redact_text
+
+logger = logging.getLogger(__name__)
 
 
 class AppError(Exception):
@@ -29,15 +34,16 @@ class AppError(Exception):
         self.details = details or {}
 
     def to_payload(self) -> dict[str, Any]:
+        safe_msg = redact_text(self.message)
         error: dict[str, Any] = {
             "code": self.code,
-            "message": self.message,
+            "message": safe_msg,
             "retryable": self.retryable,
         }
         if self.details:
             error["details"] = self.details
         # 保留 detail 顶层字段兼容旧客户端/FastAPI 习惯
-        return {"error": error, "detail": self.message}
+        return {"error": error, "detail": safe_msg}
 
 
 class AuthError(AppError):
@@ -102,7 +108,8 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(HTTPException)
     async def handle_http_exception(_request: Request, exc: HTTPException) -> JSONResponse:
-        message = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        raw_message = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        message = redact_text(raw_message)
         code_map = {
             400: "BAD_REQUEST",
             401: "UNAUTHORIZED",
@@ -122,6 +129,22 @@ def register_exception_handlers(app: FastAPI) -> None:
                     "message": message,
                     "retryable": exc.status_code in {429, 502, 503, 504},
                 },
-                "detail": exc.detail,
+                "detail": message if isinstance(exc.detail, str) else exc.detail,
+            },
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception("Unhandled server exception method=%s path=%s", request.method, request.url.path)
+        fallback = "服务器内部错误，请稍后重试"
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": fallback,
+                    "retryable": True,
+                },
+                "detail": fallback,
             },
         )

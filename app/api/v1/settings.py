@@ -194,10 +194,11 @@ async def get_recent_logs(
     if not log_path.exists():
         return {"path": str(log_path), "level": lvl or "ALL", "counts": {}, "entries": []}
     with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-        entries = [line.rstrip("\n") for line in deque(handle, maxlen=lines * 5 if lvl else lines)]
+        sampled = [redact_text(line.rstrip("\n")) for line in deque(handle, maxlen=lines * 5 if lvl else lines)]
+    counts = {name: sum(f"[{name}]" in line for line in sampled) for name in allowed}
     if lvl:
         marker = f"[{lvl}]"
-        entries = [line for line in entries if marker in line][-lines:]
-    entries = [redact_text(line) for line in entries]
-    counts = {name: sum(f"[{name}]" in line for line in entries) for name in allowed}
+        entries = [line for line in sampled if marker in line][-lines:]
+    else:
+        entries = sampled[-lines:]
     return {"path": str(log_path), "level": lvl or "ALL", "counts": counts, "entries": entries}

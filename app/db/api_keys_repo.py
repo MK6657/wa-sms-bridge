@@ -61,7 +61,18 @@ class ApiKeysRepo:
             "created_at": row.get("created_at") or "",
         }
         if include_secret:
-            item["webhook_secret"] = _decrypt_secret(str(row.get("webhook_secret_enc") or ""))
+            raw_enc = str(row.get("webhook_secret_enc") or "")
+            if raw_enc.startswith("e_"):
+                try:
+                    item["webhook_secret"] = env.decrypt_value(raw_enc[2:])
+                    item["webhook_secret_decrypt_error"] = False
+                except Exception:
+                    logger.warning("decrypt webhook_secret failed for project=%s", row.get("project_id"))
+                    item["webhook_secret"] = ""
+                    item["webhook_secret_decrypt_error"] = True
+            else:
+                item["webhook_secret"] = raw_enc
+                item["webhook_secret_decrypt_error"] = False
         if include_hash:
             item["key_hash"] = str(row.get("key_hash") or "")
         return item

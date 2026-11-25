@@ -7,7 +7,7 @@ project_id != '' 表示指定项目的私有黑名单，不影响其他项目。
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from app.db.connection import DatabaseConnection
 
 
@@ -16,6 +16,11 @@ def _phone_lookup_variants(phone: str) -> tuple[str, ...]:
     digits = re.sub(r"\D", "", raw)
     candidates = [c for c in dict.fromkeys((raw, f"+{digits}" if digits else "", digits)) if c]
     return tuple(candidates) if candidates else (raw,)
+
+
+def _norm_provider(provider: str, *, default: str = "smsbower") -> str:
+    cleaned = str(provider or "").strip().lower()
+    return cleaned or default
 
 
 class BlacklistRepo:
@@ -30,17 +35,18 @@ class BlacklistRepo:
         project_id: str = "",
     ) -> bool:
         """检查号码是否在全局黑名单或指定项目私有黑名单中（自动兼容 +E.164 与无加号纯数字格式）。"""
+        prov = _norm_provider(provider)
         variants = _phone_lookup_variants(phone)
         ph = ",".join("?" for _ in variants)
         if project_id:
             row = await self._conn.fetchone(
                 f"SELECT 1 AS ok FROM blacklist WHERE phone IN ({ph}) AND provider=? AND project_id IN ('', ?)",
-                (*variants, provider, project_id),
+                (*variants, prov, project_id),
             )
         else:
             row = await self._conn.fetchone(
                 f"SELECT 1 AS ok FROM blacklist WHERE phone IN ({ph}) AND provider=? AND project_id=''",
-                (*variants, provider),
+                (*variants, prov),
             )
         return row is not None
 
@@ -52,11 +58,51 @@ class BlacklistRepo:
         *,
         project_id: str = "",
     ) -> bool:
-        cur = await self._conn.write(
-            "INSERT OR IGNORE INTO blacklist (phone, provider, project_id, reason) VALUES (?, ?, ?, ?)",
-            (phone, provider, project_id or "", reason),
-        )
-        return int(cur.rowcount or 0) > 0
+        prov = _norm_provider(provider)
+        pid = project_id or ""
+        variants = _phone_lookup_variants(phone)
+        ph = ",".join("?" for _ in variants)
+        async with self._conn.transaction() as raw:
+            dup_cur = await raw.execute(
+                f"SELECT 1 FROM blacklist WHERE phone IN ({ph}) AND provider=? AND project_id=? LIMIT 1",
+                (*variants, prov, pid),
+            )
+            if (await dup_cur.fetchone()) is not None:
+                return False
+            cur = await raw.execute(
+                "INSERT OR IGNORE INTO blacklist (phone, provider, project_id, reason) VALUES (?, ?, ?, ?)",
+                (phone, prov, pid, reason),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    async def add_batch(
+        self,
+        phones: Iterable[str],
+        *,
+        reason: str = "",
+        provider: str = "smsbower",
+        project_id: str = "",
+    ) -> int:
+        prov = _norm_provider(provider)
+        pid = project_id or ""
+        added = 0
+        async with self._conn.transaction() as raw:
+            for phone in phones:
+                variants = _phone_lookup_variants(phone)
+                ph = ",".join("?" for _ in variants)
+                dup_cur = await raw.execute(
+                    f"SELECT 1 FROM blacklist WHERE phone IN ({ph}) AND provider=? AND project_id=? LIMIT 1",
+                    (*variants, prov, pid),
+                )
+                if (await dup_cur.fetchone()) is not None:
+                    continue
+                cur = await raw.execute(
+                    "INSERT OR IGNORE INTO blacklist (phone, provider, project_id, reason) VALUES (?, ?, ?, ?)",
+                    (phone, prov, pid, reason),
+                )
+                if int(cur.rowcount or 0) > 0:
+                    added += 1
+        return added
 
     async def list(
         self,
@@ -69,9 +115,9 @@ class BlacklistRepo:
         """project_id=None 返回全部（管理员）；project_id='' 仅全局；project_only=True 仅非空项目；project_id='proj' 仅该项目。"""
         clauses: list[str] = []
         params: list[Any] = []
-        if provider:
+        if provider and provider.strip():
             clauses.append("provider=?")
-            params.append(provider)
+            params.append(provider.strip().lower())
         if project_id is not None:
             clauses.append("project_id=?")
             params.append(project_id)
@@ -91,18 +137,21 @@ class BlacklistRepo:
         *,
         project_id: str = "",
     ) -> int:
+        prov = _norm_provider(provider)
+        variants = _phone_lookup_variants(phone)
+        ph = ",".join("?" for _ in variants)
         cur = await self._conn.write(
-            "DELETE FROM blacklist WHERE phone=? AND provider=? AND project_id=?",
-            (phone, provider, project_id or ""),
+            f"DELETE FROM blacklist WHERE phone IN ({ph}) AND provider=? AND project_id=?",
+            (*variants, prov, project_id or ""),
         )
         return int(cur.rowcount or 0)
 
     async def count(self, provider: str = "", *, project_id: Optional[str] = None) -> int:
         clauses: list[str] = []
         params: list[Any] = []
-        if provider:
+        if provider and provider.strip():
             clauses.append("provider=?")
-            params.append(provider)
+            params.append(provider.strip().lower())
         if project_id is not None:
             clauses.append("project_id=?")
             params.append(project_id)

@@ -86,14 +86,22 @@ def _format_parsed(
     country_calling_code: str = "",
     country_iso2: str = "",
 ) -> PhoneInput:
-    region = country_iso2.upper() if country_iso2 else phonenumbers.region_code_for_number(parsed) or ""
+    detected_region = phonenumbers.region_code_for_number(parsed) or ""
+    if country_iso2:
+        cand_region = country_iso2.upper()
+        if detected_region and detected_region != cand_region and not phonenumbers.is_valid_number_for_region(parsed, cand_region):
+            region = detected_region
+        else:
+            region = cand_region
+    else:
+        region = detected_region
     significant = phonenumbers.national_significant_number(parsed) or str(parsed.national_number)
     return PhoneInput(
         region=region,
         phone=significant,
         e164_number=phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164),
         country_calling_code=country_calling_code or str(parsed.country_code),
-        country_iso2=country_iso2 or region.lower(),
+        country_iso2=region.lower() if region else country_iso2,
     )
 
 
@@ -147,18 +155,14 @@ def build_phone_input(
         )
 
     if cc:
-        if raw_text.startswith("+"):
-            candidates = [(f"+{raw_digits}", False)]
-            after_cc = raw_digits[len(cc):] if raw_digits.startswith(cc) else ""
-            if after_cc.startswith("0") and after_cc.lstrip("0"):
-                candidates.append((f"+{cc}{after_cc.lstrip('0')}", False))
-        elif raw_digits.startswith(cc):
+        if raw_digits.startswith(cc):
             after_cc = raw_digits[len(cc):]
             candidates = [(f"+{raw_digits}", False)]
             if after_cc.startswith("0") and after_cc.lstrip("0"):
                 candidates.append((f"+{cc}{after_cc.lstrip('0')}", False))
-            # 仅当补上国家码后构成有效手机号（MOBILE）时才采用二次前缀，防止把带区号的短虚拟号误拼成固话
-            candidates.append((f"+{cc}{raw_digits}", True))
+            if not raw_text.startswith("+"):
+                # 仅当补上国家码后构成有效手机号（MOBILE）时才采用二次前缀，防止把带区号的短虚拟号误拼成固话
+                candidates.append((f"+{cc}{raw_digits}", True))
         else:
             candidates = [(f"+{cc}{raw_digits}", False)]
             if raw_digits.startswith("0") and raw_digits.lstrip("0"):
@@ -204,7 +208,7 @@ def build_phone_input(
         return _format_parsed(first_possible)
 
     national = raw_digits
-    if cc and raw_digits.startswith(cc):
+    if cc and raw_digits.startswith(cc) and len(raw_digits) > len(cc) + 6:
         national = raw_digits[len(cc):]
     e164 = f"+{cc}{national}" if cc else f"+{raw_digits}"
     return PhoneInput(

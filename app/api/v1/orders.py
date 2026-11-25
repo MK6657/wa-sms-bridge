@@ -10,6 +10,7 @@ from app.api.schemas import (
     CancelOrderRequest,
     CreateOrderRequest,
     ErrorEnvelopeResponse,
+    OrderListResponse,
     OrderResponse,
     ResolveReconciliationRequest,
 )
@@ -96,7 +97,7 @@ async def create_order(
     return order
 
 
-@router.get("")
+@router.get("", response_model=OrderListResponse)
 async def list_orders(
     status: str = Query(default="", description="状态筛选，多个以逗号分隔"),
     active_only: bool = Query(default=False, description="仅看进行中的订单"),

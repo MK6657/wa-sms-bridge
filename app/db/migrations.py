@@ -445,7 +445,7 @@ async def _migrate_v1_to_v2(conn: aiosqlite.Connection, applied: set[int]) -> No
                         created_at, updated_at, completed_at
                     )
                     SELECT
-                        order_id, idempotency_key, '', project_id, external_ref, provider,
+                        order_id, NULLIF(TRIM(idempotency_key), ''), '', project_id, external_ref, provider,
                         service, service_code, country_id, country_label, country_iso2, country_calling_code,
                         activation_id, phone_raw, phone_e164, phone_national, status, 1,
                         CASE WHEN status='completed' THEN 'completed' WHEN status='cancelled' THEN 'cancelled' ELSE 'none' END,
@@ -1058,6 +1058,61 @@ async def _migrate_v6_to_v7(
         await conn.execute("PRAGMA foreign_keys=ON")
 
 
+async def _migrate_v7_to_v8(conn: aiosqlite.Connection) -> None:
+    """v8 前向迁移：
+    1. sms_orders 新增 resend_base_digest（支持脱敏后重发防重且不落盘明文）；
+    2. 规范化历史 blacklist.provider 小写去重；
+    3. 补齐统计、自动脱敏与对账高频查询索引。
+    """
+    await conn.commit()
+    await conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await _ensure_v2_tables_and_indexes_in_tx(conn)
+            await conn.execute(PROJECTS_DDL)
+
+            ord_cols = await _table_columns(conn, "sms_orders")
+            if "resend_base_digest" not in ord_cols:
+                await conn.execute("ALTER TABLE sms_orders ADD COLUMN resend_base_digest TEXT NOT NULL DEFAULT ''")
+
+            if await _table_exists(conn, "blacklist"):
+                await conn.execute(
+                    """
+                    DELETE FROM blacklist
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM blacklist
+                        GROUP BY phone, LOWER(TRIM(provider)), project_id
+                    )
+                    """
+                )
+                await conn.execute(
+                    "UPDATE blacklist SET provider = LOWER(TRIM(provider)) WHERE provider != LOWER(TRIM(provider))"
+                )
+
+            for idx_sql in (
+                "CREATE INDEX IF NOT EXISTS idx_sms_orders_created_utc ON sms_orders(strftime('%Y-%m-%dT%H:%M:%f', created_at))",
+                "CREATE INDEX IF NOT EXISTS idx_sms_orders_unscrubbed ON sms_orders(code_scrubbed, status)",
+                "CREATE INDEX IF NOT EXISTS idx_sms_orders_review_settlement ON sms_orders(settlement_state)",
+                "CREATE INDEX IF NOT EXISTS idx_order_activations_ccy_review ON order_activations(currency_review_required) WHERE currency_review_required = 1",
+            ):
+                await conn.execute(idx_sql)
+
+            await _verify_schema_integrity(conn)
+            await conn.execute(
+                "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+                (8, "Keyed resend_base_digest, lowercase blacklist provider normalization, and query performance indexes"),
+            )
+            await conn.commit()
+            logger.info("database migration v8 applied and verified")
+        except BaseException:
+            await conn.rollback()
+            raise
+    finally:
+        await conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _payload_contains_code(event_type: str, raw_payload: str) -> bool:
     if event_type == "order.code_received":
         return True
@@ -1114,15 +1169,31 @@ async def _encrypt_legacy_plaintext_secrets(conn: aiosqlite.Connection) -> None:
         orders_enc = 0
         msgs_enc = 0
         keys_enc = 0
+        # 先清理已标记 code_scrubbed=1 却残留验证码字段的异常历史行
+        await conn.execute(
+            "UPDATE sms_orders SET latest_code='', resend_base_code='' "
+            "WHERE code_scrubbed=1 AND (latest_code != '' OR resend_base_code != '')"
+        )
+        await conn.execute(
+            "UPDATE sms_messages SET code='', raw_text='' "
+            "WHERE (code != '' OR raw_text != '') "
+            "AND order_id IN (SELECT order_id FROM sms_orders WHERE code_scrubbed=1)"
+        )
         if env.has_secret_key:
             cur = await conn.execute(
-                "SELECT order_id, latest_code FROM sms_orders WHERE latest_code != '' AND latest_code NOT LIKE 'e_%'"
+                "SELECT order_id, latest_code, resend_base_code FROM sms_orders "
+                "WHERE (latest_code != '' AND latest_code NOT LIKE 'e_%') "
+                "   OR (resend_base_code != '' AND resend_base_code NOT LIKE 'e_%')"
             )
             rows = await cur.fetchall()
             for row in rows:
+                lc = str(row["latest_code"] or "")
+                rb = str(row["resend_base_code"] or "")
+                enc_lc = f"e_{env.encrypt_value(lc)}" if lc and not lc.startswith("e_") else lc
+                enc_rb = f"e_{env.encrypt_value(rb)}" if rb and not rb.startswith("e_") else rb
                 await conn.execute(
-                    "UPDATE sms_orders SET latest_code=? WHERE order_id=?",
-                    (f"e_{env.encrypt_value(str(row['latest_code']))}", row["order_id"]),
+                    "UPDATE sms_orders SET latest_code=?, resend_base_code=? WHERE order_id=?",
+                    (enc_lc, enc_rb, row["order_id"]),
                 )
             orders_enc = len(rows)
 
@@ -1204,5 +1275,9 @@ async def run_migrations(conn: aiosqlite.Connection) -> None:
     if 7 not in applied:
         await _migrate_v6_to_v7(conn, had_v5_before=had_v5_before, had_v6_before=had_v6_before)
         applied.add(7)
+
+    if 8 not in applied:
+        await _migrate_v7_to_v8(conn)
+        applied.add(8)
 
     await _encrypt_legacy_plaintext_secrets(conn)

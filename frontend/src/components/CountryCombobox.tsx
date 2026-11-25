@@ -179,7 +179,7 @@ export function CountryCombobox({
             } else if (e.key === "ArrowUp") {
               e.preventDefault();
               setActiveIdx((i) => Math.max(i - 1, 0));
-            } else if (e.key === "Enter" && open && matches[activeIdx]) {
+            } else if (e.key === "Enter" && !e.nativeEvent.isComposing && open && matches[activeIdx]) {
               e.preventDefault();
               pick(matches[activeIdx]);
             }

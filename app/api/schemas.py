@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ErrorDetailModel(BaseModel):
@@ -98,6 +99,13 @@ class OrderResponse(BaseModel):
     completed_at: str = ""
 
 
+class OrderListResponse(BaseModel):
+    items: list[OrderResponse] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 30
+
+
 class AcquireStrategyRequest(BaseModel):
     target_price: Optional[float] = Field(default=None, gt=0, description="目标价格 ($)，必须大于 0")
     price_max: Optional[float] = Field(
@@ -165,6 +173,21 @@ def _validate_scopes_list(scopes: Optional[list[str]]) -> Optional[list[str]]:
     return cleaned
 
 
+def _check_json_depth(value: Any, *, max_depth: int = 6, current: int = 0) -> None:
+    if current > max_depth:
+        raise ValueError(f"metadata 嵌套层级不能超过 {max_depth} 层")
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if len(str(k)) > 128:
+                raise ValueError("metadata 键名长度不能超过 128 字符")
+            _check_json_depth(v, max_depth=max_depth, current=current + 1)
+    elif isinstance(value, (list, tuple)):
+        if len(value) > 200:
+            raise ValueError("metadata 数组元素数量不能超过 200")
+        for item in value:
+            _check_json_depth(item, max_depth=max_depth, current=current + 1)
+
+
 class CreateOrderRequest(BaseModel):
     provider: str = Field(default="", max_length=32, description="接码平台 ID（省略时自动使用服务端配置的默认平台）")
     service: str = Field(default="whatsapp", min_length=1, max_length=64, description="服务名（如 whatsapp/telegram/google/openai）或原生服务码")
@@ -178,6 +201,25 @@ class CreateOrderRequest(BaseModel):
     webhook_url: str = Field(default="", max_length=512, description="订单专属 Webhook 回调地址（项目需与管理员登记目标同源）")
     metadata: dict[str, Any] = Field(default_factory=dict, description="外部项目透传元数据")
 
+    @field_validator("country_fallback")
+    @classmethod
+    def validate_country_fallback_items(cls, items: list[str]) -> list[str]:
+        for item in items:
+            if len(str(item or "")) > 64:
+                raise ValueError("备选国家名称长度不能超过 64 字符")
+        return items
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata_bounds(cls, meta: dict[str, Any]) -> dict[str, Any]:
+        if not meta:
+            return {}
+        _check_json_depth(meta, max_depth=6)
+        encoded = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 8192:
+            raise ValueError("metadata 序列化体积不能超过 8KB")
+        return meta
+
 
 class CancelOrderRequest(BaseModel):
     blacklist: bool = Field(default=False, description="取消时是否加入黑名单（管理员写全局，项目密钥写本项目私有黑名单）")
@@ -186,7 +228,7 @@ class CancelOrderRequest(BaseModel):
 
 class BlacklistCreateRequest(BaseModel):
     phone: str = Field(..., min_length=3, max_length=32, description="手机号")
-    provider: str = Field(default="", description="平台 ID（留空使用服务端默认平台）")
+    provider: str = Field(default="", max_length=32, description="平台 ID（留空使用服务端默认平台）")
     reason: str = Field(default="", max_length=200, description="加入原因")
     scope: Literal["auto", "project", "global"] = Field(
         default="auto",
@@ -196,9 +238,17 @@ class BlacklistCreateRequest(BaseModel):
 
 class BlacklistBatchRequest(BaseModel):
     phones: list[str] = Field(..., min_length=1, max_length=200, description="手机号列表")
-    provider: str = Field(default="", description="平台 ID（留空使用服务端默认平台）")
+    provider: str = Field(default="", max_length=32, description="平台 ID（留空使用服务端默认平台）")
     reason: str = Field(default="批量加入", max_length=200, description="加入原因")
     scope: Literal["auto", "project", "global"] = Field(default="auto")
+
+    @field_validator("phones")
+    @classmethod
+    def validate_phone_items(cls, items: list[str]) -> list[str]:
+        for item in items:
+            if len(str(item or "")) > 32:
+                raise ValueError("单条手机号长度不能超过 32 字符")
+        return items
 
 
 class AdminLoginRequest(BaseModel):
@@ -261,12 +311,12 @@ class WebhookTestRequest(BaseModel):
 
 
 class SettingsUpdateRequest(BaseModel):
-    smsbower_api_key: Optional[str] = None
-    smsbower_base_url: Optional[str] = None
-    smsbower_default_country: Optional[int] = Field(default=None, ge=0)
-    five_sim_api_key: Optional[str] = None
-    hero_sms_api_key: Optional[str] = None
-    hero_sms_base_url: Optional[str] = None
+    smsbower_api_key: Optional[str] = Field(default=None, max_length=256)
+    smsbower_base_url: Optional[str] = Field(default=None, max_length=512)
+    smsbower_default_country: Optional[int] = Field(default=None, ge=0, le=999999)
+    five_sim_api_key: Optional[str] = Field(default=None, max_length=512)
+    hero_sms_api_key: Optional[str] = Field(default=None, max_length=256)
+    hero_sms_base_url: Optional[str] = Field(default=None, max_length=512)
     api_auth_required: Optional[bool] = None
     sms_code_retention_hours: Optional[int] = Field(default=None, ge=-1, le=8760)
     sms_code_mask_in_history: Optional[bool] = None

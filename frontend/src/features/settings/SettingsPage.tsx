@@ -90,8 +90,11 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
 
   useEffect(() => {
     loadSettings();
+  }, [loadSettings]);
+
+  useEffect(() => {
     loadLogs(false);
-  }, [loadSettings, loadLogs]);
+  }, [loadLogs]);
 
   const handleSaveProvider = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -124,6 +127,10 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
   };
 
   const handleTestConnection = async () => {
+    if (sbKey.trim() || heroKey.trim() || fiveSimKey.trim()) {
+      notify("检测到输入框中有尚未保存的新 API Key，请先点击「保存配置」再测试连通", "warn");
+      return;
+    }
     const prov = settings?.default_provider || "smsbower";
     setTestingConn(true);
     try {
@@ -379,19 +386,30 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
             </div>
 
             {settings?.active_providers.includes("herosms") ? (
-              <div className="space-y-2 border-t border-slate-100 pt-3">
-                <label className="block text-xs font-medium text-slate-700">HeroSMS API Key（已启用备用平台）</label>
-                <input
-                  type="password"
-                  value={heroKey}
-                  onChange={(e) => setHeroKey(e.target.value)}
-                  placeholder={
-                    settings.hero_sms_api_key_masked
-                      ? `已保存 (${settings.hero_sms_api_key_masked})，留空保持不变`
-                      : "输入 HeroSMS API Key"
-                  }
-                  className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
-                />
+              <div className="space-y-2.5 border-t border-slate-100 pt-3">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-700">HeroSMS API Key（已启用备用平台）</label>
+                  <input
+                    type="password"
+                    value={heroKey}
+                    onChange={(e) => setHeroKey(e.target.value)}
+                    placeholder={
+                      settings.hero_sms_api_key_masked
+                        ? `已保存 (${settings.hero_sms_api_key_masked})，留空保持不变`
+                        : "输入 HeroSMS API Key"
+                    }
+                    className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-700">HeroSMS Base URL</label>
+                  <input
+                    type="url"
+                    value={heroBaseUrl}
+                    onChange={(e) => setHeroBaseUrl(e.target.value)}
+                    className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
+                  />
+                </div>
               </div>
             ) : null}
 

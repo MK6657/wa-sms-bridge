@@ -38,6 +38,7 @@ class DatabaseConnection:
         self._write_lock = asyncio.Lock()
         self._read_lock = asyncio.Lock()
         self._retired_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_write_cleanup: Optional[asyncio.Task[Any]] = None
 
     @property
     def raw(self) -> aiosqlite.Connection:
@@ -275,32 +276,62 @@ class DatabaseConnection:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
+    async def _ensure_clean_write_conn_locked(self) -> aiosqlite.Connection:
+        conn = self.raw
+        if self._pending_write_cleanup is not None:
+            pending = self._pending_write_cleanup
+            self._pending_write_cleanup = None
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                self._pending_write_cleanup = pending
+                raise
+            except BaseException:
+                pass
+        if getattr(conn, "in_transaction", False) is True:
+            rb_task = asyncio.ensure_future(conn.rollback())
+            try:
+                await asyncio.shield(rb_task)
+            except asyncio.CancelledError:
+                self._pending_write_cleanup = rb_task
+                raise
+            except BaseException:
+                pass
+        return conn
+
+    async def _rollback_write_safely_locked(self, conn: aiosqlite.Connection) -> None:
+        rb_task = asyncio.ensure_future(conn.rollback())
+        try:
+            await asyncio.shield(rb_task)
+        except asyncio.CancelledError:
+            self._pending_write_cleanup = rb_task
+            raise
+        except BaseException:
+            pass
+
     async def write(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
         """Serialize execute+commit so cancellation cannot leak a transaction."""
         async with self._write_lock:
+            conn = await self._ensure_clean_write_conn_locked()
             try:
-                cursor = await self.raw.execute(sql, params)
-                await self.raw.commit()
+                cursor = await conn.execute(sql, params)
+                await conn.commit()
                 return cursor
             except BaseException:
-                try:
-                    await self.raw.rollback()
-                except Exception:
-                    pass
+                await self._rollback_write_safely_locked(conn)
                 raise
 
     @asynccontextmanager
     async def transaction(self):
         """Atomic multi-statement write transaction with cancellation-safe rollback."""
         async with self._write_lock:
+            conn = await self._ensure_clean_write_conn_locked()
+            await conn.execute("BEGIN IMMEDIATE")
             try:
-                yield self.raw
-                await self.raw.commit()
+                yield conn
+                await conn.commit()
             except BaseException:
-                try:
-                    await self.raw.rollback()
-                except Exception:
-                    pass
+                await self._rollback_write_safely_locked(conn)
                 raise
 
     async def health(self) -> bool:

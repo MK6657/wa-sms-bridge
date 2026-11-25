@@ -28,16 +28,18 @@ class GlobalCountryIndex:
 
     def __init__(self):
         self._cache: dict[str, Any] = {}  # iso → {平台名 → {id, name, cc}}
-        self._last_fetch: float = 0
+        self._last_fetch: Optional[float] = None
         self._refresh_task: Optional[asyncio.Task] = None
         self._refresh_task_forced: bool = False
+        self._generation: int = 0
 
     def invalidate(self) -> None:
-        self._last_fetch = 0
+        self._generation += 1
+        self._last_fetch = None
 
     async def refresh(self, force: bool = False):
         """刷新索引。从所有已注册 provider 拉取实时国家列表。"""
-        if not force and time.time() - self._last_fetch < CACHE_TTL:
+        if not force and self._last_fetch is not None and (time.monotonic() - self._last_fetch) < CACHE_TTL:
             return
 
         running = self._refresh_task
@@ -62,6 +64,7 @@ class GlobalCountryIndex:
         await asyncio.shield(task)
 
     async def _refresh_once(self, *, force: bool = False):
+        start_gen = self._generation
         provider_names = registry.list_providers()
 
         async def fetch_provider(name: str):
@@ -76,25 +79,32 @@ class GlobalCountryIndex:
 
         results = await asyncio.gather(*(fetch_provider(name) for name in provider_names))
         new_cache: dict[str, Any] = {}
-        failed_providers: set[str] = set()
+        transient_failed_providers: set[str] = set()
 
         for name, countries, error in results:
             if error is not None:
-                failed_providers.add(name)
-                level = logging.INFO if "API Key 未配置" in str(error) else logging.WARNING
+                err_text = str(error)
+                is_unconfigured = "API Key 未配置" in err_text or "鉴权失败" in err_text
+                if not is_unconfigured:
+                    transient_failed_providers.add(name)
+                level = logging.INFO if is_unconfigured else logging.WARNING
                 logger.log(level, "GlobalCountryIndex: 跳过 provider '%s': %s", name, error)
                 continue
             for country in countries:
                 iso = (country.get("iso") or "").lower()
                 if not iso:
                     continue
+                shared_aliases = [
+                    a for a in (country.get("aliases") or [])
+                    if a and not str(a).isdigit()
+                ]
                 entry = new_cache.setdefault(
                     iso,
                     {
                         "iso": iso,
                         "name": country.get("name", ""),
                         "name_zh": country.get("name_zh", ""),
-                        "aliases": list(country.get("aliases") or []),
+                        "aliases": list(shared_aliases),
                         "providers": {},
                     },
                 )
@@ -106,7 +116,18 @@ class GlobalCountryIndex:
                     "aliases": list(country.get("aliases") or []),
                     "available": True,
                 }
-                entry["providers"].setdefault(name, prov_record)
+                existing_primary = entry["providers"].get(name)
+                is_curr_virtual = "virtual" in str(prov_record["name"]).lower() or "虚拟" in str(prov_record["name_zh"])
+                if existing_primary is None:
+                    entry["providers"][name] = prov_record
+                else:
+                    was_virtual = "virtual" in str(existing_primary.get("name", "")).lower() or "虚拟" in str(existing_primary.get("name_zh", ""))
+                    if was_virtual and not is_curr_virtual:
+                        entry["providers"][name] = prov_record
+                        if country.get("name"):
+                            entry["name"] = country["name"]
+                        if country.get("name_zh"):
+                            entry["name_zh"] = country["name_zh"]
                 variants = entry.setdefault("provider_variants", {}).setdefault(name, [])
                 if not any(str(v.get("id")) == str(prov_record["id"]) for v in variants):
                     variants.append(prov_record)
@@ -116,12 +137,12 @@ class GlobalCountryIndex:
                     entry["name_zh"] = country["name_zh"]
                 entry["aliases"] = list(dict.fromkeys([
                     *entry.get("aliases", []),
-                    *(country.get("aliases") or []),
+                    *shared_aliases,
                 ]))
 
-        # Provider 暂时不可用时保留它上一次成功的国家映射，避免 UI 瞬间清空。
+        # Provider 暂时网络不可用时保留它上一次成功的国家映射，避免 UI 瞬间清空（已清除密钥或鉴权失败则不保留旧缓存）。
         for iso, previous in self._cache.items():
-            for name in failed_providers:
+            for name in transient_failed_providers:
                 provider_entry = previous.get("providers", {}).get(name)
                 if not provider_entry:
                     continue
@@ -139,7 +160,9 @@ class GlobalCountryIndex:
                 prev_variants = previous.get("provider_variants", {}).get(name) or [provider_entry]
                 entry.setdefault("provider_variants", {}).setdefault(name, list(prev_variants))
 
-        if new_cache or not self._cache:
+        if start_gen != self._generation:
+            return
+        if new_cache or not self._cache or not transient_failed_providers:
             self._cache = new_cache
         else:
             logger.warning(
@@ -147,7 +170,7 @@ class GlobalCountryIndex:
                 len(self._cache),
             )
         # 空索引不进入长 TTL，便于用户刚保存 API Key 后立即重试。
-        self._last_fetch = time.time() if self._cache else 0
+        self._last_fetch = time.monotonic() if self._cache else None
         logger.info(
             "GlobalCountryIndex 已刷新: %d 个国家, %d 个平台",
             len(self._cache),

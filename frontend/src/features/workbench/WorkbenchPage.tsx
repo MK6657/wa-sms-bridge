@@ -67,6 +67,7 @@ interface SavedPrefs {
   service?: string;
   customService?: string;
   countryId?: string;
+  countryByProvider?: Record<string, string>;
   targetPrice?: string;
   priceLock?: boolean;
   priceFloatEnabled?: boolean;
@@ -142,7 +143,12 @@ export function WorkbenchPage({
   const [pendingSubmitInfo, setPendingSubmitInfo] = useState<PendingSubmitAttempt | null>(null);
   const [busyByOrder, setBusyByOrder] = useState<Record<string, string>>({});
   const [sourceFilter, setSourceFilter] = useState<"all" | "console" | "external">("all");
-  const countriesLoadedRef = useRef(false);
+  const acquiringLockRef = useRef(false);
+  const busyOrderSetRef = useRef<Set<string>>(new Set());
+  const countryByProviderRef = useRef<Record<string, string>>({
+    ...(initialPrefs.countryId ? { smsbower: initialPrefs.countryId } : {}),
+    ...(initialPrefs.countryByProvider || {}),
+  });
 
   const activeProvider = health?.default_provider || "smsbower";
   const activeProviderLabel = activeProvider.toUpperCase();
@@ -189,19 +195,25 @@ export function WorkbenchPage({
   }, []);
 
   useEffect(() => {
-    setPriceSel((prev) => reconcileComboChange(prev, currentCombo));
+    setPriceSel((prev) => {
+      const next = reconcileComboChange(prev, currentCombo);
+      if (prev.selectedTier && !next.selectedTier && !next.manualTargetPrice.trim()) {
+        setPriceFloatEnabled(false);
+      }
+      return next;
+    });
   }, [currentCombo]);
 
   useEffect(() => {
-    const savedCountryId = countriesLoadedRef.current
-      ? selectedCountry
-        ? String(selectedCountry.id)
-        : ""
-      : initialPrefs.countryId ?? (selectedCountry ? String(selectedCountry.id) : "");
+    const savedCountryId =
+      countryByProviderRef.current[activeProvider] ??
+      (activeProvider === "smsbower" ? initialPrefs.countryId : undefined) ??
+      (selectedCountry ? String(selectedCountry.id) : "");
     const next: SavedPrefs = {
       service: selectedService,
       customService: useCustomService ? customService : "",
-      countryId: savedCountryId,
+      countryId: countryByProviderRef.current.smsbower ?? savedCountryId,
+      countryByProvider: { ...countryByProviderRef.current },
       targetPrice: priceSel.manualTargetPrice,
       priceLock: Boolean(priceSel.priceLock && Number(priceSel.manualTargetPrice) > 0),
       priceFloatEnabled,
@@ -218,6 +230,7 @@ export function WorkbenchPage({
       // ignore storage quota errors
     }
   }, [
+    activeProvider,
     selectedService,
     useCustomService,
     customService,
@@ -243,34 +256,43 @@ export function WorkbenchPage({
       })
       .catch(() => {});
 
-    if (!isConfigured) return;
+    if (!isConfigured) {
+      return () => {
+        active = false;
+      };
+    }
     api
       .getCountries(activeProvider)
       .then((res) => {
         if (!active) return;
-        countriesLoadedRef.current = true;
         setCountries(res.countries);
         const serverDefault =
           health?.default_country !== undefined && health?.default_country !== null
             ? String(health.default_country)
             : "52";
+        const savedForProvider = countryByProviderRef.current[activeProvider];
         const preferredId =
-          initialPrefs.countryId !== undefined && initialPrefs.countryId !== ""
-            ? initialPrefs.countryId
+          savedForProvider !== undefined && savedForProvider !== ""
+            ? savedForProvider
             : serverDefault;
         const matched = res.countries.find((c) => String(c.id) === preferredId);
         if (matched) {
+          countryByProviderRef.current[activeProvider] = String(matched.id);
           setSelectedCountry(matched);
         } else if (res.countries.length > 0) {
-          const stillValid = selectedCountry && res.countries.some((c) => String(c.id) === String(selectedCountry.id));
-          if (!stillValid) setSelectedCountry(res.countries[0]);
+          setSelectedCountry((prev) => {
+            const stillValid = prev && res.countries.some((c) => String(c.id) === String(prev.id));
+            const nextCountry = stillValid ? prev : res.countries[0];
+            countryByProviderRef.current[activeProvider] = String(nextCountry.id);
+            return nextCountry;
+          });
         }
       })
       .catch(() => {});
     return () => {
       active = false;
     };
-  }, [activeProvider, health?.default_country, initialPrefs.countryId, isConfigured]);
+  }, [activeProvider, health?.default_country, isConfigured]);
 
   const loadPrices = useCallback(
     async (force = false) => {
@@ -338,6 +360,7 @@ export function WorkbenchPage({
   }, [loadPrices, useCustomService]);
 
   const handleAcquire = async () => {
+    if (acquiringLockRef.current) return;
     if (isCustomEmpty) {
       notify("请输入自定义服务码，或点击右上角返回常用服务", "warn");
       return;
@@ -358,6 +381,7 @@ export function WorkbenchPage({
       return;
     }
 
+    acquiringLockRef.current = true;
     setAcquiring(true);
     try {
       const fallbacks = fallbackCountries
@@ -413,6 +437,7 @@ export function WorkbenchPage({
         notify(`${err instanceof Error ? err.message : "取号失败"}${oidHint}`, "error");
       }
     } finally {
+      acquiringLockRef.current = false;
       if (mountedRef.current) setAcquiring(false);
     }
   };
@@ -457,6 +482,8 @@ export function WorkbenchPage({
     fn: () => Promise<SmsOrder>,
     describeSuccess: string | ((updated: SmsOrder) => { text: string; tone: "success" | "warn" | "info" }),
   ) => {
+    if (busyOrderSetRef.current.has(orderId)) return;
+    busyOrderSetRef.current.add(orderId);
     setBusyByOrder((prev) => ({ ...prev, [orderId]: actionKey }));
     try {
       const updated = await fn();
@@ -471,6 +498,7 @@ export function WorkbenchPage({
     } catch (err) {
       notify(err instanceof Error ? err.message : "操作失败", "error");
     } finally {
+      busyOrderSetRef.current.delete(orderId);
       setBusyByOrder((prev) => {
         const next = { ...prev };
         delete next[orderId];
@@ -670,7 +698,7 @@ export function WorkbenchPage({
                   type="text"
                   value={customService}
                   onChange={(e) => setCustomService(e.target.value)}
-                  placeholder="输入原生服务码，如 wa / tg / go / ot"
+                  placeholder="输入原生服务码，如 wa / tg / go / wx / ot"
                   className="input-surface font-mono-code w-full rounded-xl px-3.5 py-2.5 text-sm"
                 />
               ) : (
@@ -681,8 +709,9 @@ export function WorkbenchPage({
                       : [
                           { id: "whatsapp", label: "WhatsApp", code: "wa", popular: true },
                           { id: "telegram", label: "Telegram", code: "tg", popular: true },
-                          { id: "google", label: "Google", code: "go", popular: true },
-                          { id: "openai", label: "OpenAI", code: "dr", popular: true },
+                          { id: "google", label: "Google / Gmail", code: "go", popular: true },
+                          { id: "apple", label: "Apple / Apple ID", code: "wx", popular: true },
+                          { id: "openai", label: "OpenAI / ChatGPT", code: "dr", popular: true },
                           { id: "discord", label: "Discord", code: "ds", popular: true },
                         ]
                     ).map((svc) => {
@@ -735,7 +764,10 @@ export function WorkbenchPage({
                 countries={countries}
                 selected={selectedCountry}
                 provider={activeProvider}
-                onSelect={(c) => setSelectedCountry(c)}
+                onSelect={(c) => {
+                  countryByProviderRef.current[activeProvider] = String(c.id);
+                  setSelectedCountry(c);
+                }}
               />
             </div>
 
@@ -807,7 +839,11 @@ export function WorkbenchPage({
                           step="0.01"
                           min="0.0001"
                           value={resolvedPrice.displayValue}
-                          onChange={(e) => setPriceSel((prev) => setManualPrice(prev, e.target.value))}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setPriceSel((prev) => setManualPrice(prev, val));
+                            if (!val.trim()) setPriceFloatEnabled(false);
+                          }}
                           placeholder="留空按市价"
                           className="input-surface font-mono-code w-full rounded-lg py-1.5 pl-6 pr-2.5 text-xs"
                         />
@@ -1055,7 +1091,7 @@ export function WorkbenchPage({
                   key={order.order_id}
                   order={order}
                   busyAction={busyByOrder[order.order_id] || null}
-                  supportsResend={order.provider !== "5sim"}
+                  supportsResend={order.provider === "smsbower" || order.provider === "herosms"}
                   onResend={(id) =>
                     runOrderAction(id, "resend", () => api.resendSms(id), `已请求 ${order.provider.toUpperCase()} 重发短信`)
                   }
