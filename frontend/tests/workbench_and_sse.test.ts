@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parseApiErrorResponse } from "../src/api/client.ts";
+import {
+  type TrackedOrderVersion,
+  mergeActiveOrderSnapshot,
+  recordOrderState,
+  shouldLogoutOnSilentAuthCheck,
+} from "../src/api/orderSync.ts";
 import { SseReconnectTracker, buildStreamUrl, extractEventCursor } from "../src/api/sseCursor.ts";
+import type { SmsOrder } from "../src/api/types.ts";
 import {
   WorkbenchIdempotencyController,
   describeOrderSubmitOutcome,
@@ -440,4 +447,158 @@ test("v8 审计补充: parseApiErrorResponse 准确透传 CSRF_REJECTED 与 AUTH
   assert.equal(rateErr.status, 429);
   assert.equal(rateErr.code, "AUTH_RATE_LIMITED");
   assert.equal(rateErr.retryable, true);
+});
+
+// ── v9 全盘审查补充：脱敏水位防复活、活跃列表在途快照并发合并、静默会话防误登出 ──
+
+function makeMockOrder(overrides: Partial<SmsOrder> & { order_id: string }): SmsOrder {
+  return {
+    order_id: overrides.order_id,
+    project_id: overrides.project_id ?? "web-console",
+    external_ref: "",
+    provider: "smsbower",
+    service: "whatsapp",
+    service_code: "wa",
+    country_id: "52",
+    country_label: "泰国",
+    country_iso2: "TH",
+    country_calling_code: "66",
+    activation_id: "act_1",
+    phone_raw: "66812345678",
+    phone_e164: "+66812345678",
+    phone_national: "812345678",
+    status: overrides.status ?? "waiting_code",
+    version: overrides.version ?? 1,
+    latest_code: overrides.latest_code ?? "",
+    code_scrubbed: overrides.code_scrubbed ?? false,
+    code_scrub_version: overrides.code_scrub_version ?? 0,
+    code_count: overrides.code_count ?? 0,
+    max_price: null,
+    cost: 0.15,
+    cost_is_estimated: false,
+    currency: "USD",
+    wait_timeout: 180,
+    expires_at: "2026-12-01T00:00:00Z",
+    attempts_used: 1,
+    error_code: "",
+    error_message: "",
+    webhook_url: "",
+    metadata: {},
+    messages: [],
+    created_at: "2026-11-27T00:00:00Z",
+    updated_at: "2026-11-27T00:00:00Z",
+    completed_at: "",
+  };
+}
+
+test("v9 审查: recordOrderState 严格拦截同版本号但落后 code_scrub_version 的旧明文快照复活", () => {
+  const map = new Map<string, TrackedOrderVersion>();
+
+  // 1. 收到验证码 (version=3, scrub_version=0)
+  const withCode = makeMockOrder({
+    order_id: "ord_scrub_1",
+    status: "code_received",
+    version: 3,
+    latest_code: "884920",
+    code_scrubbed: false,
+    code_scrub_version: 0,
+  });
+  assert.equal(recordOrderState(withCode, map), true);
+
+  // 2. 订单被脱敏清理 (version 仍为 3 或更新，code_scrub_version 升至 1)
+  const scrubbed = makeMockOrder({
+    order_id: "ord_scrub_1",
+    status: "code_received",
+    version: 3,
+    latest_code: "",
+    code_scrubbed: true,
+    code_scrub_version: 1,
+  });
+  assert.equal(recordOrderState(scrubbed, map), true);
+
+  // 3. 迟到的旧轮询回包 (version=3, code_scrub_version=0, 携带旧明文验证码) -> 必须被拒绝！
+  assert.equal(recordOrderState(withCode, map), false);
+
+  // 4. 若用户点击「再收一条短信」收到新验证码 (version=5, code_scrub_version=2, code_scrubbed=false) -> 允许正常更新
+  const freshResend = makeMockOrder({
+    order_id: "ord_scrub_1",
+    status: "code_received",
+    version: 5,
+    latest_code: "119203",
+    code_scrubbed: false,
+    code_scrub_version: 2,
+  });
+  assert.equal(recordOrderState(freshResend, map), true);
+});
+
+test("v9 审查: mergeActiveOrderSnapshot 保留在途 listOrders 请求发出后新建的本地活跃订单", () => {
+  const versionMap = new Map<string, TrackedOrderVersion>();
+  const mutatedSeqById = new Map<string, number>();
+
+  const existingOrder = makeMockOrder({ order_id: "ord_old", status: "waiting_code", version: 2 });
+  recordOrderState(existingOrder, versionMap);
+  mutatedSeqById.set("ord_old", 1);
+
+  // T0: listOrders 请求发出时，本地变更水位为 1
+  const snapshotStartSeq = 1;
+
+  // T1: 请求在途期间，用户新建了 ord_new (水位升至 2)
+  const newlyCreated = makeMockOrder({ order_id: "ord_new", status: "acquiring", version: 1 });
+  recordOrderState(newlyCreated, versionMap);
+  mutatedSeqById.set("ord_new", 2);
+  const currentLocal = [newlyCreated, existingOrder];
+
+  // T2: 在途旧快照返回，仅包含 ord_old（尚未包含 ord_new）
+  const snapshotItems = [makeMockOrder({ order_id: "ord_old", status: "code_received", version: 3, latest_code: "654321" })];
+
+  const merged = mergeActiveOrderSnapshot(
+    currentLocal,
+    snapshotItems,
+    snapshotStartSeq,
+    mutatedSeqById,
+    versionMap,
+  );
+  assert.deepEqual(
+    merged.map((o) => o.order_id),
+    ["ord_new", "ord_old"],
+  );
+  assert.equal(merged[1].latest_code, "654321");
+});
+
+test("v9 审查: shouldLogoutOnSilentAuthCheck 仅在明确 401/403 或非管理员时登出，网络闪断与 5xx 保持会话", () => {
+  assert.equal(shouldLogoutOnSilentAuthCheck({ ok: false, httpStatus: undefined }), false);
+  assert.equal(shouldLogoutOnSilentAuthCheck({ ok: false, httpStatus: 502 }), false);
+  assert.equal(shouldLogoutOnSilentAuthCheck({ ok: false, httpStatus: 503 }), false);
+  assert.equal(shouldLogoutOnSilentAuthCheck({ ok: false, httpStatus: 401 }), true);
+  assert.equal(shouldLogoutOnSilentAuthCheck({ ok: false, httpStatus: 403 }), true);
+  assert.equal(
+    shouldLogoutOnSilentAuthCheck({
+      ok: true,
+      status: {
+        password_required: true,
+        api_auth_required: true,
+        direct_loopback: false,
+        authenticated: true,
+        is_admin: true,
+        project_id: "web-console",
+        can_bootstrap_local_session: false,
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    shouldLogoutOnSilentAuthCheck({
+      ok: true,
+      status: {
+        password_required: true,
+        api_auth_required: true,
+        direct_loopback: false,
+        authenticated: false,
+        is_admin: false,
+        project_id: "",
+        can_bootstrap_local_session: false,
+      },
+    }),
+    true,
+  );
 });

@@ -77,10 +77,19 @@ class PricingService:
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._generation: int = 0
+        self._key_generations: dict[str, int] = {}
 
     def invalidate(self) -> None:
         self._generation += 1
+        self._key_generations.clear()
         self._cache.clear()
+
+    @staticmethod
+    def _clone_snapshot(snapshot: dict[str, Any], *, cached: bool) -> dict[str, Any]:
+        cloned = dict(snapshot, cached=cached)
+        if isinstance(snapshot.get("entries"), list):
+            cloned["entries"] = [dict(e) for e in snapshot["entries"]]
+        return cloned
 
     async def get_price_snapshot(
         self,
@@ -101,16 +110,19 @@ class PricingService:
         if not force and self._cache_ttl > 0:
             cached = self._cache.get(cache_key)
             if cached and (now - cached[0]) < self._cache_ttl:
-                return dict(cached[1], cached=True)
+                return self._clone_snapshot(cached[1], cached=True)
 
         existing = self._inflight.get(cache_key)
         if not force and existing is not None and not existing.done():
             result = await asyncio.shield(existing)
-            return dict(result, cached=True)
+            return self._clone_snapshot(result, cached=True)
 
         if force:
-            self._generation += 1
-        gen = self._generation
+            self._key_generations[cache_key] = self._key_generations.get(cache_key, 0) + 1
+            if len(self._key_generations) > 1024:
+                self._key_generations.pop(next(iter(self._key_generations)), None)
+        global_gen = self._generation
+        key_gen = self._key_generations.get(cache_key, 0)
 
         async def _fetch() -> dict[str, Any]:
             raw_entries = await provider.get_prices(cid, service_code)
@@ -123,7 +135,11 @@ class PricingService:
                 "service_code": service_code,
                 **summary,
             }
-            if self._cache_ttl > 0 and gen == self._generation:
+            if (
+                self._cache_ttl > 0
+                and global_gen == self._generation
+                and key_gen == self._key_generations.get(cache_key, 0)
+            ):
                 now_mono = time.monotonic()
                 if len(self._cache) >= 512 and cache_key not in self._cache:
                     expired_keys = [k for k, (ts, _) in self._cache.items() if (now_mono - ts) >= self._cache_ttl]
@@ -145,4 +161,4 @@ class PricingService:
 
         task.add_done_callback(_cleanup)
         result = await asyncio.shield(task)
-        return dict(result, cached=False)
+        return self._clone_snapshot(result, cached=False)

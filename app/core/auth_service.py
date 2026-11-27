@@ -38,15 +38,19 @@ SESSION_COOKIE_NAME = "sms_hub_session"
 CSRF_HEADER_NAME = "x-sms-hub-csrf"
 DEFAULT_SCOPES = ["orders:rw", "prices:r", "blacklist:rw", "events:r"]
 UNSAFE_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "testserver", "test"})
+ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+ASGI_TEST_HOSTS = frozenset({"testserver", "test"})
 PROXY_FORWARD_HEADERS = (
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
+    "x-forwarded-server",
     "x-real-ip",
     "forwarded",
     "cf-connecting-ip",
     "true-client-ip",
+    "via",
+    "cdn-loop",
 )
 
 
@@ -144,11 +148,56 @@ def _canonicalize_origin(origin_or_url: str) -> str:
     return f"{scheme}://{host_fmt}:{port}"
 
 
+def _ip_in_trusted_proxies(host_str: str) -> bool:
+    cand = (host_str or "").strip().lower()
+    if not cand or not env.trusted_proxy_ips:
+        return False
+    if cand.startswith("[") and cand.endswith("]"):
+        cand = cand[1:-1]
+    if "%" in cand:
+        cand = cand.split("%", 1)[0]
+    try:
+        ip_obj = ipaddress.ip_address(cand)
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            ip_obj = ip_obj.ipv4_mapped
+    except ValueError:
+        return cand in env.trusted_proxy_ips
+    for rule in env.trusted_proxy_ips:
+        r = rule.strip()
+        if not r:
+            continue
+        try:
+            if "/" in r:
+                net = ipaddress.ip_network(r, strict=False)
+                if ip_obj in net:
+                    return True
+            else:
+                target_ip = ipaddress.ip_address(r)
+                if isinstance(target_ip, ipaddress.IPv6Address) and target_ip.ipv4_mapped is not None:
+                    target_ip = target_ip.ipv4_mapped
+                if ip_obj == target_ip:
+                    return True
+        except ValueError:
+            if cand == r.lower():
+                return True
+    return False
+
+
+def _is_trusted_proxy_client(request: Request) -> bool:
+    client_host = (getattr(request.client, "host", "") or "").strip()
+    return _ip_in_trusted_proxies(client_host)
+
+
 def _allowed_browser_origins(request: Request) -> set[str]:
     allowed: set[str] = set()
-    fwd_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    from_trusted_proxy = _is_trusted_proxy_client(request)
+    fwd_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower() if from_trusted_proxy else ""
     scheme = fwd_proto if fwd_proto in {"http", "https"} else (request.url.scheme or "http").lower()
-    host_hdr = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+    host_hdr = (
+        (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+        if from_trusted_proxy
+        else (request.headers.get("host") or "").split(",")[0].strip()
+    )
     if host_hdr:
         same_origin = _canonicalize_origin(f"{scheme}://{host_hdr}")
         if same_origin:
@@ -156,7 +205,7 @@ def _allowed_browser_origins(request: Request) -> set[str]:
     req_origin = _canonicalize_origin(f"{request.url.scheme}://{request.url.netloc}")
     if req_origin:
         allowed.add(req_origin)
-    for cfg_origin in env.cors_origins:
+    for cfg_origin in env.admin_trusted_origins:
         if cfg_origin and cfg_origin != "*":
             canon = _canonicalize_origin(cfg_origin)
             if canon:
@@ -170,9 +219,9 @@ def enforce_browser_csrf(request: Request) -> None:
         return
 
     allowed_origins = _allowed_browser_origins(request)
-    explicit_cors = {
+    explicit_admin_origins = {
         _canonicalize_origin(o)
-        for o in env.cors_origins
+        for o in env.admin_trusted_origins
         if o and o != "*" and _canonicalize_origin(o)
     }
 
@@ -181,7 +230,7 @@ def enforce_browser_csrf(request: Request) -> None:
     canon_origin = _canonicalize_origin(raw_origin) if raw_origin else ""
 
     if sec_fetch_site and sec_fetch_site not in {"same-origin", "none"}:
-        if not (canon_origin and canon_origin in explicit_cors):
+        if not (canon_origin and canon_origin in explicit_admin_origins):
             raise ForbiddenError("跨站写请求已被 CSRF 安全策略拦截", code="CSRF_REJECTED")
 
     if raw_origin:
@@ -206,22 +255,32 @@ def is_direct_loopback(request: Request) -> bool:
         if request.headers.get(header_name):
             return False
     client_host = (getattr(request.client, "host", "") or "").strip().lower()
-    if client_host != "testclient" and not _is_loopback_ip_literal(client_host):
+    is_asgi_test = client_host == "testclient"
+    if not is_asgi_test and not _is_loopback_ip_literal(client_host):
         return False
 
     host_only = _extract_host_without_port(request.headers.get("host") or "")
-    if host_only and host_only not in ALLOWED_LOOPBACK_HOSTS and not _is_loopback_ip_literal(host_only):
-        return False
+    if host_only:
+        allowed_hosts = ALLOWED_LOOPBACK_HOSTS | ASGI_TEST_HOSTS
+        if host_only not in allowed_hosts and not _is_loopback_ip_literal(host_only):
+            return False
 
     sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
     if sec_fetch_site and sec_fetch_site not in {"same-origin", "none"}:
         return False
 
+    allowed_origins = _allowed_browser_origins(request)
     raw_origin = (request.headers.get("origin") or "").strip()
     if raw_origin:
         canon_origin = _canonicalize_origin(raw_origin)
-        if not canon_origin or canon_origin not in _allowed_browser_origins(request):
+        if not canon_origin or canon_origin not in allowed_origins:
             return False
+    else:
+        raw_referer = (request.headers.get("referer") or "").strip()
+        if raw_referer:
+            canon_referer = _canonicalize_origin(raw_referer)
+            if not canon_referer or canon_referer not in allowed_origins:
+                return False
 
     return True
 
@@ -244,7 +303,7 @@ class CallerContext:
         return self.is_admin
 
     def has_scope(self, scope: str) -> bool:
-        if self.is_admin or "*" in self.scopes:
+        if self.is_admin:
             return True
         if scope in self.scopes:
             return True
@@ -252,6 +311,11 @@ class CallerContext:
             prefix, action = scope.split(":", 1)
             if action in {"r", "w"} and f"{prefix}:rw" in self.scopes:
                 return True
+        if "*" in self.scopes:
+            # 非管理员项目密钥的通配符仅覆盖租户级接码权限，绝不隐式授予全局黑名单或下层插件权限
+            if scope == "blacklist:global" or scope.startswith("wa:"):
+                return False
+            return True
         return False
 
 
@@ -260,20 +324,28 @@ class AuthService:
 
     _LOGIN_WINDOW_SECONDS = 60.0
     _LOGIN_MAX_FAILURES = 10
+    _GLOBAL_MAX_FAILURES = 40
+    _EPOCH_CACHE_TTL_SECONDS = 2.0
+    _TOUCH_INTERVAL_SECONDS = 60.0
 
     def __init__(self, db: Database):
         self._db = db
         self._bg_tasks: set[asyncio.Task] = set()
         self._session_epoch: Optional[int] = None
+        self._session_epoch_fetched_at: float = 0.0
         self._failed_logins: dict[str, deque[float]] = {}
+        self._global_failed_logins: deque[float] = deque()
+        self._last_touch_mono: dict[str, float] = {}
 
     async def _get_session_epoch(self) -> int:
-        if self._session_epoch is None:
+        now = time.monotonic()
+        if self._session_epoch is None or (now - self._session_epoch_fetched_at) >= self._EPOCH_CACHE_TTL_SECONDS:
             raw = await self._db.config.get("admin_session_epoch", "1")
             try:
                 self._session_epoch = max(1, int(str(raw).strip()))
             except ValueError:
                 self._session_epoch = 1
+            self._session_epoch_fetched_at = now
         return self._session_epoch
 
     async def is_auth_required(self) -> bool:
@@ -289,15 +361,41 @@ class AuthService:
         return bool(env.console_admin_password)
 
     def _client_rate_limit_key(self, request: Request) -> str:
-        if self.password_configured():
-            xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-            if xff:
-                return xff
-        return (getattr(request.client, "host", "") or "unknown").strip()
+        peer_host = (getattr(request.client, "host", "") or "unknown").strip()
+        if _ip_in_trusted_proxies(peer_host):
+            xff_parts = [p.strip() for p in (request.headers.get("x-forwarded-for") or "").split(",") if p.strip()]
+            for candidate in reversed(xff_parts):
+                if not _ip_in_trusted_proxies(candidate):
+                    return candidate[:64]
+            real_ip = (request.headers.get("x-real-ip") or "").strip()
+            if real_ip:
+                return real_ip[:64]
+        return peer_host[:64]
+
+    def _prune_login_buckets(self, now: float) -> None:
+        while self._global_failed_logins and now - self._global_failed_logins[0] > self._LOGIN_WINDOW_SECONDS:
+            self._global_failed_logins.popleft()
+        expired_keys: list[str] = []
+        for k, b in self._failed_logins.items():
+            while b and now - b[0] > self._LOGIN_WINDOW_SECONDS:
+                b.popleft()
+            if not b:
+                expired_keys.append(k)
+        for k in expired_keys:
+            self._failed_logins.pop(k, None)
 
     def check_login_rate_limit(self, request: Request) -> None:
         key = self._client_rate_limit_key(request)
         now = time.monotonic()
+        while self._global_failed_logins and now - self._global_failed_logins[0] > self._LOGIN_WINDOW_SECONDS:
+            self._global_failed_logins.popleft()
+        if len(self._global_failed_logins) >= self._GLOBAL_MAX_FAILURES:
+            raise AppError(
+                "当前登录失败请求过于频繁，请 1 分钟后再试",
+                status_code=429,
+                code="AUTH_RATE_LIMITED",
+                retryable=True,
+            )
         bucket = self._failed_logins.get(key)
         if not bucket:
             return
@@ -320,21 +418,29 @@ class AuthService:
             self._failed_logins.pop(key, None)
             return
         now = time.monotonic()
+        self._global_failed_logins.append(now)
         if len(self._failed_logins) >= 1024 and key not in self._failed_logins:
-            oldest_key = next(iter(self._failed_logins))
-            self._failed_logins.pop(oldest_key, None)
+            self._prune_login_buckets(now)
+            if len(self._failed_logins) >= 1024:
+                oldest_key = next(iter(self._failed_logins))
+                self._failed_logins.pop(oldest_key, None)
         bucket = self._failed_logins.setdefault(key, deque())
         while bucket and now - bucket[0] > self._LOGIN_WINDOW_SECONDS:
             bucket.popleft()
         bucket.append(now)
-        logger.warning("管理员控制台登录失败 source=%s failures_in_window=%d", key, len(bucket))
+        safe_key = re.sub(r"[\r\n\t\x00-\x1f\x7f]", "_", key)[:64]
+        logger.warning("管理员控制台登录失败 source=%s failures_in_window=%d", safe_key, len(bucket))
 
     async def issue_admin_cookie(self, response: Response, *, request: Request) -> int:
         ttl = env.admin_session_ttl_seconds
         expires_at = int(time.time()) + ttl
         epoch = await self._get_session_epoch()
         token = _sign_session_token(expires_at, epoch=epoch)
-        fwd_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        fwd_proto = (
+            (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+            if _is_trusted_proxy_client(request)
+            else ""
+        )
         is_https = (
             (request.url.scheme or "").lower() == "https"
             or env.admin_cookie_secure
@@ -356,9 +462,15 @@ class AuthService:
         if cookie_token:
             epoch = await self._get_session_epoch()
             if _verify_session_token(cookie_token, current_epoch=epoch):
-                new_epoch = epoch + 1
-                self._session_epoch = new_epoch
-                await self._db.config.set("admin_session_epoch", str(new_epoch))
+                await self._db.conn.write(
+                    "INSERT INTO config (key, value, updated_at) VALUES ('admin_session_epoch', '2', datetime('now')) "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    "value = CAST(MAX(1, CAST(COALESCE(NULLIF(value, ''), '1') AS INTEGER)) + 1 AS TEXT), "
+                    "updated_at = datetime('now')"
+                )
+                self._session_epoch = None
+                self._session_epoch_fetched_at = 0.0
+                await self._get_session_epoch()
         response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
 
     def clear_admin_cookie(self, response: Response) -> None:
@@ -530,9 +642,15 @@ class AuthService:
                 raise AuthError("无效的 API Key", code="AUTH_INVALID_KEY")
             if not record.get("enabled"):
                 raise AuthError("该 API Key 已被停用", code="AUTH_KEY_DISABLED")
-            touch_task = asyncio.create_task(self._safe_touch(record["project_id"]))
-            self._bg_tasks.add(touch_task)
-            touch_task.add_done_callback(self._bg_tasks.discard)
+            pid_touch = str(record["project_id"])
+            now_mono = time.monotonic()
+            if (now_mono - self._last_touch_mono.get(pid_touch, 0.0)) >= self._TOUCH_INTERVAL_SECONDS:
+                if len(self._last_touch_mono) >= 1024 and pid_touch not in self._last_touch_mono:
+                    self._last_touch_mono.pop(next(iter(self._last_touch_mono)), None)
+                self._last_touch_mono[pid_touch] = now_mono
+                touch_task = asyncio.create_task(self._safe_touch(pid_touch))
+                self._bg_tasks.add(touch_task)
+                touch_task.add_done_callback(self._bg_tasks.discard)
             # 复核 P1-06: 保留数据库中的精确权限列表，绝不在清空权限([])后回退到 DEFAULT_SCOPES
             raw_scopes = record.get("scopes")
             resolved_scopes = list(raw_scopes) if isinstance(raw_scopes, list) else []

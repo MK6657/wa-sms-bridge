@@ -1,10 +1,11 @@
 """Pydantic 数据模型。"""
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Optional
 
 
 class RegisterRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     country: str = Field(default="", description="主要国家名/ID，如 russia / 0")
     country_fallback: list = Field(default_factory=list, description="备用国家 ID/名列表")
     service: str = Field(default="whatsapp", description="服务用途")

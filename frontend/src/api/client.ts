@@ -122,7 +122,25 @@ export const api = {
     }),
   adminLogout: () => request<{ ok: boolean }>("/api/v1/auth/logout", { method: "POST" }),
 
-  getHealth: () => request<HealthResponse>("/api/v1/health"),
+  getHealth: async (): Promise<HealthResponse> => {
+    const resp = await fetch("/api/v1/health", { credentials: "same-origin" });
+    const text = await resp.text();
+    let data: Record<string, unknown> = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { detail: text };
+      }
+    }
+    if (typeof data.ok === "boolean" && typeof data.db === "boolean") {
+      return data as unknown as HealthResponse;
+    }
+    if (!resp.ok) {
+      throw parseApiErrorResponse(resp.status, data);
+    }
+    return data as unknown as HealthResponse;
+  },
 
   getProviders: () =>
     request<{ default_provider: string; active: string[]; catalog: ProviderDescriptor[] }>(
@@ -303,6 +321,7 @@ export const api = {
     payload: {
       state: "refund_confirmed" | "unrefundable" | "completed" | "manual_resolved";
       note?: string;
+      actual_cost?: number;
       refund_amount?: number;
       currency?: string;
     },

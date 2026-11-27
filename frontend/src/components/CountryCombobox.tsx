@@ -150,6 +150,10 @@ export function CountryCombobox({
         <input
           ref={inputRef}
           type="text"
+          role="combobox"
+          aria-expanded={open}
+          aria-autocomplete="list"
+          aria-controls="country-combobox-listbox"
           value={open ? query : formatCountryDisplay(selected)}
           onFocus={() => {
             setOpen(true);
@@ -195,7 +199,11 @@ export function CountryCombobox({
       </div>
 
       {open && (
-        <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-40 max-h-72 overflow-y-auto rounded-xl border border-slate-200/95 bg-white p-1.5 shadow-[0_12px_32px_-8px_rgba(15,23,42,0.18),0_2px_6px_rgba(15,23,42,0.06)]">
+        <div
+          id="country-combobox-listbox"
+          role="listbox"
+          className="absolute left-0 right-0 top-[calc(100%+6px)] z-40 max-h-72 overflow-y-auto rounded-xl border border-slate-200/95 bg-white p-1.5 shadow-[0_12px_32px_-8px_rgba(15,23,42,0.18),0_2px_6px_rgba(15,23,42,0.06)]"
+        >
           {matches.length === 0 ? (
             <div className="px-3 py-6 text-center text-xs text-slate-400">
               未找到匹配国家，支持输入中文、英文、ISO、+区号 或 #ID
@@ -212,10 +220,12 @@ export function CountryCombobox({
                     itemRefs.current[idx] = el;
                   }}
                   type="button"
+                  role="option"
+                  aria-selected={isSelected}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    pick(c);
                   }}
+                  onClick={() => pick(c)}
                   onMouseEnter={() => setActiveIdx(idx)}
                   className={`flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${
                     isActive

@@ -235,6 +235,8 @@ V2_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_sms_orders_status ON sms_orders(status)",
     "CREATE INDEX IF NOT EXISTS idx_sms_orders_project ON sms_orders(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_sms_orders_created ON sms_orders(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sms_orders_status_created ON sms_orders(status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sms_orders_project_created ON sms_orders(project_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sms_orders_phone ON sms_orders(phone_e164)",
     "CREATE INDEX IF NOT EXISTS idx_sms_messages_order ON sms_messages(order_id, seq)",
     "CREATE INDEX IF NOT EXISTS idx_order_activations_order ON order_activations(order_id, attempt_no)",
@@ -304,7 +306,8 @@ async def _rebuild_sms_messages_in_tx(conn: aiosqlite.Connection) -> None:
     await conn.execute(SMS_MESSAGES_DDL)
     await conn.execute(
         "INSERT INTO sms_messages (id, order_id, seq, code, raw_text, received_at) "
-        "SELECT id, order_id, seq, code, raw_text, received_at FROM _sms_messages_rebuild"
+        "SELECT id, order_id, seq, code, raw_text, received_at FROM _sms_messages_rebuild "
+        "WHERE order_id IN (SELECT order_id FROM sms_orders)"
     )
     await conn.execute("DROP TABLE _sms_messages_rebuild")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_messages_order ON sms_messages(order_id, seq)")
@@ -324,7 +327,8 @@ async def _rebuild_order_activations_in_tx(conn: aiosqlite.Connection) -> None:
         ") SELECT "
         "id, order_id, attempt_no, provider, country_id, service_code, activation_id, "
         "phone_raw, phone_e164, state, quoted_max_price, actual_cost, last_error, created_at, updated_at "
-        "FROM _order_activations_rebuild"
+        "FROM _order_activations_rebuild "
+        "WHERE order_id IN (SELECT order_id FROM sms_orders)"
     )
     await conn.execute("DROP TABLE _order_activations_rebuild")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_order_activations_order ON order_activations(order_id, attempt_no)")
@@ -1139,6 +1143,7 @@ async def _encrypt_legacy_plaintext_secrets(conn: aiosqlite.Connection) -> None:
             FROM webhook_deliveries w
             LEFT JOIN sms_orders o ON o.order_id = w.order_id
             WHERE w.payload_scrubbed = 0 AND w.payload_json != '' AND w.payload_json != '{}'
+              AND (w.contains_code = 1 OR w.event_type = 'order.code_received' OR w.payload_json LIKE '%latest_code%')
             """
         )
         wh_rows = [dict(r) for r in await cur.fetchall()]
@@ -1223,8 +1228,9 @@ async def _encrypt_legacy_plaintext_secrets(conn: aiosqlite.Connection) -> None:
                 )
             keys_enc = len(key_rows)
 
-        if orders_enc or msgs_enc or keys_enc or wh_scrubbed or wh_encrypted:
+        if getattr(conn, "in_transaction", False):
             await conn.commit()
+        if orders_enc or msgs_enc or keys_enc or wh_scrubbed or wh_encrypted:
             logger.info(
                 "历史敏感数据迁移完成: orders=%d messages=%d webhook_secrets=%d outbox_encrypted=%d outbox_scrubbed=%d",
                 orders_enc,

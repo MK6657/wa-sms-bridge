@@ -20,6 +20,7 @@ import type {
   CountryOption,
   HealthResponse,
   PriceSnapshot,
+  ProviderDescriptor,
   ServiceOption,
   SmsOrder,
   StatsResponse,
@@ -49,6 +50,7 @@ import {
 interface WorkbenchPageProps {
   health: HealthResponse | null;
   balance: number | null;
+  balanceCurrency?: string;
   balanceError: string;
   balanceLoading: boolean;
   onRefreshBalance: () => void;
@@ -90,6 +92,7 @@ function loadPrefs(): SavedPrefs {
 export function WorkbenchPage({
   health,
   balance,
+  balanceCurrency = "USD",
   balanceError,
   balanceLoading,
   onRefreshBalance,
@@ -106,6 +109,10 @@ export function WorkbenchPage({
 
   const [services, setServices] = useState<ServiceOption[]>([]);
   const [countries, setCountries] = useState<CountryOption[]>([]);
+  const [countriesReadyProvider, setCountriesReadyProvider] = useState<string>("smsbower");
+  const [providerCapsById, setProviderCapsById] = useState<
+    Record<string, ProviderDescriptor["capabilities"]>
+  >({});
   const [selectedService, setSelectedService] = useState(initialPrefs.service || "whatsapp");
   const [customService, setCustomService] = useState(initialPrefs.customService || "");
   const [useCustomService, setUseCustomService] = useState(Boolean(initialPrefs.customService));
@@ -129,7 +136,9 @@ export function WorkbenchPage({
     manualTargetPrice: initialPrefs.targetPrice || "",
     priceLock: Boolean(initialPrefs.priceLock && Number(initialPrefs.targetPrice) > 0),
   }));
-  const [priceFloatEnabled, setPriceFloatEnabled] = useState(Boolean(initialPrefs.priceFloatEnabled));
+  const [priceFloatEnabled, setPriceFloatEnabled] = useState(() =>
+    Boolean(initialPrefs.priceFloatEnabled && Number(initialPrefs.targetPrice) > 0),
+  );
   const [priceFloatPercent, setPriceFloatPercent] = useState(initialPrefs.priceFloatPercent || "10");
   const [continuousPoll, setContinuousPoll] = useState(Boolean(initialPrefs.continuousPoll));
   const [maxAttempts, setMaxAttempts] = useState(initialPrefs.maxAttempts || "2");
@@ -152,10 +161,14 @@ export function WorkbenchPage({
 
   const activeProvider = health?.default_provider || "smsbower";
   const activeProviderLabel = activeProvider.toUpperCase();
-  const isCustomEmpty = useCustomService && !customService.trim();
-  const effectiveService = useCustomService
-    ? customService.trim()
-      ? `custom:${customService.trim()}`
+  const supportsCustomService =
+    providerCapsById[activeProvider]?.supports_custom_service ?? activeProvider !== "5sim";
+  const cleanCustomService = customService.trim().replace(/^custom:/i, "").trim();
+  const effectiveUseCustom = useCustomService && supportsCustomService;
+  const isCustomEmpty = effectiveUseCustom && !cleanCustomService;
+  const effectiveService = effectiveUseCustom
+    ? cleanCustomService
+      ? `custom:${cleanCustomService}`
       : ""
     : selectedService;
 
@@ -205,18 +218,38 @@ export function WorkbenchPage({
   }, [currentCombo]);
 
   useEffect(() => {
+    let active = true;
+    api
+      .getProviders()
+      .then((res) => {
+        if (!active) return;
+        const map: Record<string, ProviderDescriptor["capabilities"]> = {};
+        for (const item of res.catalog || []) {
+          if (item?.id && item.capabilities) {
+            map[item.id] = item.capabilities;
+          }
+        }
+        setProviderCapsById(map);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [activeProvider]);
+
+  useEffect(() => {
     const savedCountryId =
       countryByProviderRef.current[activeProvider] ??
       (activeProvider === "smsbower" ? initialPrefs.countryId : undefined) ??
       (selectedCountry ? String(selectedCountry.id) : "");
     const next: SavedPrefs = {
       service: selectedService,
-      customService: useCustomService ? customService : "",
+      customService: effectiveUseCustom ? cleanCustomService : "",
       countryId: countryByProviderRef.current.smsbower ?? savedCountryId,
       countryByProvider: { ...countryByProviderRef.current },
       targetPrice: priceSel.manualTargetPrice,
       priceLock: Boolean(priceSel.priceLock && Number(priceSel.manualTargetPrice) > 0),
-      priceFloatEnabled,
+      priceFloatEnabled: Boolean(priceFloatEnabled && (resolvedPrice.value ?? 0) > 0),
       priceFloatPercent,
       continuousPoll,
       maxAttempts,
@@ -232,12 +265,13 @@ export function WorkbenchPage({
   }, [
     activeProvider,
     selectedService,
-    useCustomService,
-    customService,
+    effectiveUseCustom,
+    cleanCustomService,
     selectedCountry,
     initialPrefs.countryId,
     priceSel.manualTargetPrice,
     priceSel.priceLock,
+    resolvedPrice.value,
     priceFloatEnabled,
     priceFloatPercent,
     continuousPoll,
@@ -275,7 +309,9 @@ export function WorkbenchPage({
           savedForProvider !== undefined && savedForProvider !== ""
             ? savedForProvider
             : serverDefault;
-        const matched = res.countries.find((c) => String(c.id) === preferredId);
+        const matched =
+          res.countries.find((c) => String(c.id) === preferredId) ||
+          res.countries.find((c) => (c.iso || "").toLowerCase() === "th");
         if (matched) {
           countryByProviderRef.current[activeProvider] = String(matched.id);
           setSelectedCountry(matched);
@@ -287,12 +323,18 @@ export function WorkbenchPage({
             return nextCountry;
           });
         }
+        setCountriesReadyProvider(activeProvider);
       })
-      .catch(() => {});
+      .catch(() => {
+        if (active) setCountriesReadyProvider(activeProvider);
+      });
     return () => {
       active = false;
     };
   }, [activeProvider, health?.default_country, isConfigured]);
+
+  const isCountrySyncedForProvider =
+    activeProvider === "smsbower" || countriesReadyProvider === activeProvider;
 
   const loadPrices = useCallback(
     async (force = false) => {
@@ -300,7 +342,7 @@ export function WorkbenchPage({
       priceAbortRef.current = null;
       const reqSeq = ++priceReqSeqRef.current;
 
-      if (!selectedCountry || !isConfigured || !effectiveService) {
+      if (!selectedCountry || !isConfigured || !effectiveService || !isCountrySyncedForProvider) {
         setPriceSnapshot(null);
         setPriceError("");
         setPriceLoading(false);
@@ -589,10 +631,10 @@ export function WorkbenchPage({
             </button>
           </div>
           <div className="font-mono-code mt-2.5 text-2xl font-bold tracking-tight text-slate-900">
-            {balance !== null ? formatMoney(balance) : "-"}
+            {balance !== null ? formatMoney(balance, balanceCurrency || "USD") : "-"}
           </div>
           <div className="mt-1 truncate text-[11px] text-slate-400">
-            {balanceError ? balanceError : "主活接码账户 · USD"}
+            {balanceError ? balanceError : `主活接码账户 · ${balanceCurrency || "USD"}`}
           </div>
         </div>
 
@@ -684,16 +726,18 @@ export function WorkbenchPage({
                   </span>
                   目标业务
                 </label>
-                <button
-                  type="button"
-                  onClick={() => setUseCustomService((v) => !v)}
-                  className="cursor-pointer text-xs font-medium text-indigo-600 transition hover:text-indigo-700"
-                >
-                  {useCustomService ? "返回常用服务" : "自定义服务码"}
-                </button>
+                {supportsCustomService ? (
+                  <button
+                    type="button"
+                    onClick={() => setUseCustomService((v) => !v)}
+                    className="cursor-pointer text-xs font-medium text-indigo-600 transition hover:text-indigo-700"
+                  >
+                    {effectiveUseCustom ? "返回常用服务" : "自定义服务码"}
+                  </button>
+                ) : null}
               </div>
 
-              {useCustomService ? (
+              {effectiveUseCustom ? (
                 <input
                   type="text"
                   value={customService}
@@ -742,10 +786,14 @@ export function WorkbenchPage({
                       options={otherServiceOptions}
                       placeholder={`更多常用服务（Facebook / TikTok / Apple / 通用 ot 等 ${otherServiceOptions.length} 项）`}
                       activeHighlight={isOtherServiceSelected}
-                      footerAction={{
-                        label: "找不到？直接输入自定义服务码 →",
-                        onClick: () => setUseCustomService(true),
-                      }}
+                      footerAction={
+                        supportsCustomService
+                          ? {
+                              label: "找不到？直接输入自定义服务码 →",
+                              onClick: () => setUseCustomService(true),
+                            }
+                          : undefined
+                      }
                     />
                   ) : null}
                 </div>
@@ -1091,7 +1139,18 @@ export function WorkbenchPage({
                   key={order.order_id}
                   order={order}
                   busyAction={busyByOrder[order.order_id] || null}
-                  supportsResend={order.provider === "smsbower" || order.provider === "herosms"}
+                  supportsResend={
+                    providerCapsById[order.provider]?.supports_resend ??
+                    (order.provider === "smsbower" || order.provider === "herosms")
+                  }
+                  onExpireCheck={(id) => {
+                    api
+                      .getOrder(id)
+                      .then((latest) => {
+                        if (mountedRef.current) onOrderMutated(latest);
+                      })
+                      .catch(() => {});
+                  }}
                   onResend={(id) =>
                     runOrderAction(id, "resend", () => api.resendSms(id), `已请求 ${order.provider.toUpperCase()} 重发短信`)
                   }

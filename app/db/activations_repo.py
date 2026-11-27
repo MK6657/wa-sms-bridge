@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+import re
+from typing import Any, Callable, Iterable, Optional
 
 from app.db.connection import DatabaseConnection
 
@@ -32,11 +33,34 @@ class ActivationsRepo:
         quoted_max_price: Optional[float] = None,
         currency: str = "",
         currency_source: str = "",
+        reuse_unpurchased_row_id: Optional[int] = None,
     ) -> int:
-        """取号前先落盘购买意图，防止进程崩溃或响应丢失后无法追踪。"""
+        """取号前先落盘购买意图，防止进程崩溃或响应丢失后无法追踪；持续轮询连续无号时安全原地复用未购买意图行。"""
         now = _utc_now_iso()
         norm_ccy = _normalize_currency(currency, fallback="")
         ccy_src = (currency_source or ("explicit" if norm_ccy else "")).strip()
+        if reuse_unpurchased_row_id is not None and reuse_unpurchased_row_id > 0:
+            upd = await self._conn.write(
+                "UPDATE order_activations SET attempt_no=?, provider=?, country_id=?, service_code=?, "
+                "state='purchasing', quoted_max_price=?, currency=?, currency_source=?, "
+                "cost_status='unknown', estimated_cost=NULL, last_error='', updated_at=? "
+                "WHERE id=? AND order_id=? AND COALESCE(activation_id, '') = '' "
+                "AND actual_cost IS NULL AND state IN ('no_numbers', 'failed')",
+                (
+                    attempt_no,
+                    provider,
+                    str(country_id),
+                    service_code,
+                    quoted_max_price,
+                    norm_ccy,
+                    ccy_src,
+                    now,
+                    int(reuse_unpurchased_row_id),
+                    order_id,
+                ),
+            )
+            if (upd.rowcount or 0) == 1:
+                return int(reuse_unpurchased_row_id)
         cur = await self._conn.write(
             "INSERT INTO order_activations ("
             "order_id, attempt_no, provider, country_id, service_code, state, quoted_max_price, "
@@ -147,7 +171,7 @@ class ActivationsRepo:
                 return False
             await raw.execute(
                 "UPDATE sms_orders SET activation_id=?, phone_raw=?, cost=?, actual_cost=?, "
-                "cost_status=?, currency=?, updated_at=? WHERE order_id=?",
+                "cost_status=?, currency=?, version=version+1, updated_at=? WHERE order_id=?",
                 (
                     activation_id,
                     phone_raw,
@@ -423,12 +447,14 @@ class ActivationsRepo:
         *,
         state: str,
         note: str = "",
+        actual_cost: Optional[float] = None,
         refund_amount: Optional[float] = None,
         currency: Optional[str] = None,
         outbox_entry_builder=None,
         result_meta: Optional[dict[str, Any]] = None,
         scrub_if_terminal: bool = False,
         scrub_result: Optional[dict[str, int]] = None,
+        on_scrub_committed: Optional[Callable[[dict[str, int]], None]] = None,
     ) -> tuple[Optional[dict[str, Any]], bool]:
         """在同一事务内受条件保护地人工核销激活台账并同步推进父订单终态与 Outbox（修复 v6 P1-03 & v7 P1-02 / P1-03）。
 
@@ -444,6 +470,9 @@ class ActivationsRepo:
         guard = "" if state == "refund_confirmed" else " AND state != 'refund_confirmed'"
         sets = ["state=?", "last_error=?", "updated_at=?"]
         params: list[Any] = [state, note.strip() or f"管理员人工核销为 {state}", now]
+        if actual_cost is not None:
+            sets.extend(["actual_cost=?", "cost_status='actual'"])
+            params.append(float(actual_cost))
         if refund_amount is not None:
             sets.extend(["refund_amount=?", "refund_amount_status='verified'", "refund_amount_source='manual_resolve'"])
             params.append(float(refund_amount))
@@ -452,12 +481,14 @@ class ActivationsRepo:
                 "refund_amount_status=CASE WHEN refund_amount IS NOT NULL AND refund_amount_status='verified' "
                 "THEN 'verified' ELSE 'unknown' END"
             )
-        # v7 复核 P1-03: 仅在明确提供有效且非 UNKNOWN 的币种时才清除 currency_review_required，普通结算核销绝不误消待核对标记！
+        # v7 复核 P1-03: 仅在明确提供有效 3 位字母 ISO 币种且非 UNKNOWN 时才清除 currency_review_required！
         norm_ccy = _normalize_currency(currency, fallback="")
-        if norm_ccy and norm_ccy != "UNKNOWN":
+        valid_iso_ccy = bool(norm_ccy and norm_ccy != "UNKNOWN" and re.fullmatch(r"[A-Z]{3}", norm_ccy))
+        if valid_iso_ccy:
             sets.extend(["currency=?", "currency_source='manual_resolve'", "currency_review_required=0"])
             params.append(norm_ccy)
 
+        committed_scrub: dict[str, int] = {}
         async with self._conn.transaction() as raw:
             cur_get = await raw.execute("SELECT * FROM order_activations WHERE id=?", (row_id,))
             existing_raw = await cur_get.fetchone()
@@ -488,7 +519,16 @@ class ActivationsRepo:
                 # 当父订单已绑定具体 activation_id 时，核销早期无 activation_id 的 uncertain_purchase 绝不能提前终结父订单！
                 matches_primary = (not ord_aid) if not act_aid else ((not ord_aid) or (ord_aid == act_aid))
 
-                if matches_primary and norm_ccy and norm_ccy != "UNKNOWN":
+                if matches_primary and actual_cost is not None:
+                    await raw.execute(
+                        "UPDATE sms_orders SET cost=?, actual_cost=?, cost_status='actual', cost_is_estimated=0, updated_at=? WHERE order_id=?",
+                        (float(actual_cost), float(actual_cost), now, order_id),
+                    )
+                    ord_row["cost"] = float(actual_cost)
+                    ord_row["actual_cost"] = float(actual_cost)
+                    ord_row["cost_status"] = "actual"
+
+                if matches_primary and valid_iso_ccy:
                     cur_ord_ccy = _normalize_currency(str(ord_row.get("currency") or ""), fallback="UNKNOWN")
                     if cur_ord_ccy == "UNKNOWN" or (act_aid and ord_aid == act_aid):
                         await raw.execute(
@@ -508,7 +548,7 @@ class ActivationsRepo:
 
                 if matches_primary and (
                     cur_settlement in {"uncertain", "complete_uncertain", "complete_failed", "code_persist_failed"}
-                    or cur_status in {"compensation_pending", "cancelling"}
+                    or cur_status in {"compensation_pending", "cancelling", "acquiring"}
                     or (
                         cur_status in {"code_received", "waiting_code", "waiting_next_code"}
                         and state in {"completed", "refund_confirmed", "unrefundable", "manual_resolved"}
@@ -516,7 +556,14 @@ class ActivationsRepo:
                 ):
                     new_status = cur_status
                     completed_at = str(ord_row.get("completed_at") or "")
-                    if cur_status in {"compensation_pending", "cancelling", "code_received", "waiting_code", "waiting_next_code"}:
+                    if cur_status in {
+                        "compensation_pending",
+                        "cancelling",
+                        "acquiring",
+                        "code_received",
+                        "waiting_code",
+                        "waiting_next_code",
+                    }:
                         if state == "completed":
                             new_status = "completed"
                         elif state in {"refund_confirmed", "unrefundable"}:
@@ -558,8 +605,11 @@ class ActivationsRepo:
                         await WebhooksRepo.scrub_for_orders_in_tx(raw, [order_id], now)
                         v_cur = await raw.execute("SELECT code_scrub_version FROM sms_orders WHERE order_id=?", (order_id,))
                         v_row = await v_cur.fetchone()
-                        if v_row is not None and scrub_result is not None:
-                            scrub_result[order_id] = int(v_row["code_scrub_version"] or 1)
+                        if v_row is not None:
+                            ver_val = int(v_row["code_scrub_version"] or 1)
+                            committed_scrub[order_id] = ver_val
+                            if scrub_result is not None:
+                                scrub_result[order_id] = ver_val
                     else:
                         if is_terminal_now:
                             await raw.execute(
@@ -592,6 +642,8 @@ class ActivationsRepo:
                             if result_meta is not None:
                                 result_meta["outbox_enqueued"] = True
 
+        if committed_scrub and on_scrub_committed is not None:
+            on_scrub_committed(committed_scrub)
         updated = await self.get(row_id)
         return updated, True
 
@@ -633,22 +685,23 @@ class ActivationsRepo:
 
         return await self._conn.fetchall(
             f"""
-            SELECT oa.*
-            FROM order_activations oa
-            LEFT JOIN sms_orders o ON o.order_id = oa.order_id
-            WHERE oa.activation_id != ''
-              AND (
-                  oa.state = 'refund_pending'
-                  OR (
-                      oa.state = 'active'
-                      AND COALESCE(o.settlement_state, '') NOT IN ('code_persist_failed', 'manual_resolved')
-                      AND (
-                          COALESCE(o.status, 'cancelled') IN ('cancelled', 'expired', 'failed', 'compensation_pending')
-                          OR {acquiring_cond}
-                      )
+            SELECT * FROM (
+                SELECT oa.*
+                FROM order_activations oa
+                WHERE oa.state = 'refund_pending' AND oa.activation_id != ''
+                UNION ALL
+                SELECT oa.*
+                FROM order_activations oa
+                LEFT JOIN sms_orders o ON o.order_id = oa.order_id
+                WHERE oa.state = 'active'
+                  AND oa.activation_id != ''
+                  AND COALESCE(o.settlement_state, '') NOT IN ('code_persist_failed', 'manual_resolved')
+                  AND (
+                      COALESCE(o.status, 'cancelled') IN ('cancelled', 'expired', 'failed', 'compensation_pending')
+                      OR {acquiring_cond}
                   )
-              )
-            ORDER BY oa.id ASC
+            )
+            ORDER BY id ASC
             """,
             params,
         )

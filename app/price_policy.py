@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Optional
 
 
-PRICE_EPSILON = 0.0001
+PRICE_EPSILON = 1e-6
 _QUANT_4 = Decimal("0.0001")
 
 
@@ -99,12 +99,19 @@ def locked_price_available(entries: list[dict[str, Any]], target_price: Any) -> 
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
+        raw_cost = next((entry.get(k) for k in ("cost", "price", "Price") if entry.get(k) is not None), None)
+        raw_cnt_val = next((entry.get(k) for k in ("count", "qty", "Qty", "quantity") if entry.get(k) is not None), 0)
         try:
-            cost = float(entry.get("cost"))  # type: ignore[arg-type]
-            raw_cnt = float(entry.get("count") or 0)
-            if not math.isfinite(cost) or not math.isfinite(raw_cnt):
+            cost = float(raw_cost)  # type: ignore[arg-type]
+            if not math.isfinite(cost):
                 continue
-            count = int(raw_cnt)
+            if isinstance(raw_cnt_val, str) and raw_cnt_val.strip().lower() == "few":
+                count = 1
+            else:
+                raw_cnt = float(raw_cnt_val or 0)
+                if not math.isfinite(raw_cnt):
+                    continue
+                count = int(raw_cnt)
         except (TypeError, ValueError, OverflowError):
             continue
         if abs(cost - target) <= PRICE_EPSILON:

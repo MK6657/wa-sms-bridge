@@ -17,7 +17,7 @@ from app.config import env
 from app.core.auth_service import AuthService, CallerContext
 from app.core.url_guard import validate_wa_app_url
 from app.dependencies import get_caller
-from app.errors import UpstreamError
+from app.errors import ForbiddenError, UpstreamError
 from app.models import RegisterRequest
 from app.orchestrator import RegisterOrchestrator
 from app.plugins.base import IntegrationPlugin
@@ -102,25 +102,32 @@ class WhatsappWaPlugin(IntegrationPlugin):
                 return {"enabled": False, "ok": False, "status": "disabled"}
             if not self._started:
                 return {"enabled": True, "started": False, "ok": False, "status": "startup_failed"}
-            return {"enabled": True, "started": True, **(await self.health())}
+            raw_h = await self.health()
+            if not caller.is_admin:
+                return {"enabled": True, "started": True, "ok": bool(raw_h.get("ok"))}
+            return {"enabled": True, "started": True, **raw_h}
 
         @r.post("/register")
         async def wa_plugin_register(req: RegisterRequest, caller: CallerContext = Depends(get_caller)):
             AuthService.ensure_scope(caller, "wa:w")
             self._require_enabled()
             assert self.orch is not None
+            if req.proxy and req.proxy.strip() and not caller.is_admin:
+                raise ForbiddenError("仅管理员可指定自定义出站代理地址")
             raw_svc = str(req.service or "whatsapp").strip().lower()
             if raw_svc.startswith("custom:") or canonical_service(req.service) != "whatsapp":
                 raise HTTPException(400, "whatsapp_wa 插件仅支持 WhatsApp 自动注册")
+            prov_name = (req.provider or "smsbower").strip().lower()
+            fallback_country = "thailand" if prov_name == "5sim" else "52"
             task_id = f"task_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}_{uuid4().hex[:6]}"
             return await self.orch.start_registration(
                 task_id=task_id,
-                country=req.country or "52",
+                country=req.country or fallback_country,
                 country_fallback=req.country_fallback,
                 max_attempts=req.max_attempts,
                 price_max=req.price_max,
                 wait_timeout=req.wait_timeout,
-                provider_name=req.provider or "smsbower",
+                provider_name=prov_name,
                 service="whatsapp",
                 target_price=req.target_price,
                 price_lock_enabled=req.price_lock_enabled,

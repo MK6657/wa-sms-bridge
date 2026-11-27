@@ -11,6 +11,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 import urllib.parse
 from typing import Any, Optional
 
@@ -21,6 +22,7 @@ from app.providers.base import (
     Activation,
     NoNumbersError,
     BalanceError,
+    ProviderCapabilities,
     PurchaseUncertainError,
     SmsCancelledError,
     SmsExpiredError,
@@ -66,14 +68,34 @@ COUNTRY_ALIASES = {
     "kz": "kazakhstan", "哈萨克斯坦": "kazakhstan",
     "ph": "philippines", "菲律宾": "philippines",
     "mm": "myanmar", "缅甸": "myanmar",
+    "ci": "ivorycoast", "cotedivoire": "ivorycoast", "ivorycoast": "ivorycoast", "科特迪瓦": "ivorycoast",
+    "sv": "salvador", "elsalvador": "salvador", "salvador": "salvador", "萨尔瓦多": "salvador",
+    "ae": "uae", "uae": "uae", "unitedarabemirates": "uae", "阿联酋": "uae",
+    "cz": "czech", "czech": "czech", "czechia": "czech", "czechrepublic": "czech", "捷克": "czech",
+    "tl": "easttimor", "easttimor": "easttimor", "timorleste": "easttimor", "东帝汶": "easttimor",
+    "cd": "drcongo", "drcongo": "drcongo", "democraticrepublicofthecongo": "drcongo",
+    "hk": "hongkong", "hongkong": "hongkong", "香港": "hongkong",
+    "tw": "taiwan", "taiwan": "taiwan", "台湾": "taiwan",
+    "kr": "southkorea", "southkorea": "southkorea", "韩国": "southkorea",
+    "sa": "saudiarabia", "saudiarabia": "saudiarabia", "沙特阿拉伯": "saudiarabia",
+    "nz": "newzealand", "newzealand": "newzealand", "新西兰": "newzealand",
+    "lk": "srilanka", "srilanka": "srilanka", "斯里兰卡": "srilanka",
+    "mk": "northmacedonia", "northmacedonia": "northmacedonia",
+    "ba": "bosnia", "bosnia": "bosnia", "bosniaandherzegovina": "bosnia",
 }
 
 
+def _strip_accents_ascii(text: str) -> str:
+    norm = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in norm if not unicodedata.combining(ch))
+
+
 def normalize_country_id(value: Any, fallback: str = "") -> str:
-    """归一化国家 ID（纯小写字母数字）。"""
+    """归一化国家 ID（纯小写字母数字，兼容变音符号与 5sim 原生 slug）。"""
     raw = str(value or "").strip()
-    raw_lower = raw.lower()
-    alias = COUNTRY_ALIASES.get(raw_lower) or COUNTRY_ALIASES.get(re.sub(r"[^a-z0-9]+", "", raw_lower))
+    raw_lower = _strip_accents_ascii(raw).lower()
+    compact = re.sub(r"[^a-z0-9]+", "", raw_lower)
+    alias = COUNTRY_ALIASES.get(raw.lower()) or COUNTRY_ALIASES.get(raw_lower) or COUNTRY_ALIASES.get(compact)
     if alias:
         return alias
 
@@ -84,13 +106,13 @@ def normalize_country_id(value: Any, fallback: str = "") -> str:
         cc_digits = re.sub(r"\D", "", raw_lower)
         if cc_digits:
             iso_hint = cc_to_iso(cc_digits)
-    elif raw_lower:
-        iso_hint = name_to_iso(raw)
+    elif raw:
+        iso_hint = name_to_iso(raw) or name_to_iso(raw_lower)
     if iso_hint:
         mapped = COUNTRY_ALIASES.get(iso_hint)
         if mapped:
             return mapped
-        en_name = iso_to_name(iso_hint, "en")
+        en_name = _strip_accents_ascii(iso_to_name(iso_hint, "en"))
         slug = re.sub(r"[^a-z0-9]+", "", en_name.lower())
         if slug:
             return COUNTRY_ALIASES.get(slug, slug)
@@ -128,6 +150,12 @@ class FiveSimProvider(BaseSmsProvider):
     """5sim API 封装。"""
 
     provider_id = "5sim"
+    capabilities = ProviderCapabilities(
+        supports_resend=False,
+        supports_price_lock=True,
+        supports_custom_service=True,
+        supports_exact_price_lock=True,
+    )
 
     def __init__(self, api_key_getter, base_url: str = BASE_URL, *, country_cache_ttl: float = 1800.0):
         self._api_key_getter = api_key_getter
@@ -211,13 +239,38 @@ class FiveSimProvider(BaseSmsProvider):
         return bal
 
     async def resolve_country(self, country: str) -> tuple[Any, str]:
-        """5sim 国家 ID 是字符串（如 philippines），不是数字。"""
+        """5sim 国家 ID 是字符串（如 philippines），不是数字；未知虚构国家名显式拒绝。"""
+        from app.countries import cc_to_iso, name_to_iso
+
         raw = str(country or "").strip()
         if not raw or raw.isdigit():
             raise ValueError(f"无效的 5sim 国家: {country}")
+        raw_lower = _strip_accents_ascii(raw).lower()
+        compact = re.sub(r"[^a-z0-9]+", "", raw_lower)
+        cached_ids = {str(c.get("id", "")).lower(): c for c in self._countries_cache if c.get("id")}
+        if raw_lower in cached_ids:
+            hit = cached_ids[raw_lower]
+            return raw_lower, COUNTRY_CN.get(raw_lower) or hit.get("name") or raw_lower
         cid = normalize_country_id(raw, "")
         if not cid:
             raise ValueError(f"无效的 5sim 国家: {country}")
+        if cid in cached_ids:
+            hit = cached_ids[cid]
+            return cid, COUNTRY_CN.get(cid) or hit.get("name") or cid
+        known_alias = (
+            raw.lower() in COUNTRY_ALIASES
+            or raw_lower in COUNTRY_ALIASES
+            or compact in COUNTRY_ALIASES
+            or cid in COUNTRY_CN
+            or cid in COUNTRY_ALIASES.values()
+        )
+        known_iso = bool(
+            (cc_to_iso(re.sub(r"\D", "", raw)) if raw.startswith("+") else "")
+            or name_to_iso(raw)
+            or name_to_iso(raw_lower)
+        )
+        if not known_alias and not known_iso:
+            raise ValueError(f"未知 5sim 国家: {country}")
         label = COUNTRY_CN.get(cid, cid)
         return cid, label
 
@@ -357,14 +410,22 @@ class FiveSimProvider(BaseSmsProvider):
             raise PurchaseUncertainError(f"5sim 取号连接中断，结果未知，已停止自动重试以避免重复扣费: {exc}") from exc
 
         if not resp.is_success:
-            text = resp.text.strip()
-            msg = text[:100]
+            msg = ""
+            try:
+                err_payload = resp.json()
+                if isinstance(err_payload, dict):
+                    msg = str(err_payload.get("message") or err_payload.get("error") or "")
+            except Exception:
+                pass
+            if not msg:
+                msg = resp.text.strip()[:200] or str(resp.status_code)
             if resp.status_code >= 500:
                 raise PurchaseUncertainError(
                     f"5sim 取号遇到服务端异常 (HTTP {resp.status_code})，结果未知，已停止自动重试以避免重复扣费"
                 )
-            if "country" in msg.lower() and "incorrect" in msg.lower():
-                raise NoNumbersError(f"5sim 该国家无可用产品: {msg}")
+            msg_low = msg.lower()
+            if ("country" in msg_low and "incorrect" in msg_low) or "not found" in msg_low or "no free" in msg_low:
+                raise NoNumbersError(f"5sim 无可用号码或产品不可用: {msg}")
             self._raise_api_error(resp.status_code, msg)
 
         # 5sim 有时返回纯文本（如"no free phones"）；但空响应或非法 JSON 可能是网关截断，按不确定购买处理防重复扣费！
@@ -582,6 +643,12 @@ class FiveSimProvider(BaseSmsProvider):
                 raise SmsExpiredError(f"5sim 激活已失效: {e}")
             except SmsCancelledError:
                 raise
+            except SmsProviderError as exc:
+                err_low = str(exc).lower()
+                if any(tok in err_low for tok in ("401", "403", "api key 未配置", "unauthorized")):
+                    raise
+                logger.warning("5sim 轮询查码暂时异常，稍后重试: %s", exc)
+                status, code = "WAIT", ""
 
             if status == "OK" and code:
                 return code
@@ -595,7 +662,7 @@ class FiveSimProvider(BaseSmsProvider):
                 raise SmsTimeoutError(f"5sim 等码超时 ({timeout}s)")
 
             delay = 3 if elapsed < 36 else (5 if elapsed < 96 else 8)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(min(delay, max(0.05, timeout - elapsed)))
 
     async def normalize_phone(self, raw_phone: str, country_id: Any) -> "PhoneInput":
         """5sim 号码格式：国际格式直接 + 前缀。"""

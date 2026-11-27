@@ -94,6 +94,16 @@ NAME_TO_ISO: dict[str, str] = {
     "el salvador": "sv",
     "bosnia": "ba",
     "bosnia and herzegovina": "ba",
+    "oman": "om",
+    "niger": "ne",
+    "mali": "ml",
+    "chad": "td",
+    "togo": "tg",
+    "benin": "bj",
+    "gabon": "ga",
+    "congo": "cg",
+    "qatar": "qa",
+    "kuwait": "kw",
 }
 
 ZH_TO_ISO: dict[str, str] = {

@@ -42,8 +42,10 @@ class GlobalCountryIndex:
         if not force and self._last_fetch is not None and (time.monotonic() - self._last_fetch) < CACHE_TTL:
             return
 
-        running = self._refresh_task
-        if running and not running.done():
+        while True:
+            running = self._refresh_task
+            if not (running and not running.done()):
+                break
             running_was_forced = self._refresh_task_forced
             await asyncio.shield(running)
             if not force or running_was_forced:

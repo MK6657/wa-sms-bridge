@@ -116,10 +116,13 @@ def resolve_country_id(value: str | int) -> tuple[int, str]:
         info = COUNTRIES.get(cid, {})
         return cid, info.get("eng", f"Country #{cid}")
     iso_hint = name_to_iso(raw_str)
-    if iso_hint and iso_hint in ALIASES:
-        cid = ALIASES[iso_hint]
-        return cid, COUNTRIES[cid]["eng"]
-    allow_sub = len(key) >= 4 or any(ord(ch) > 127 for ch in key)
+    if iso_hint:
+        if iso_hint in ALIASES:
+            cid = ALIASES[iso_hint]
+            return cid, COUNTRIES[cid]["eng"]
+        raise ValueError(f"未知国家: {value}")
+    cjk_len = sum(1 for ch in key if ord(ch) > 127)
+    allow_sub = len(key) >= 4 or cjk_len >= 2
     if allow_sub:
         for cid, info in COUNTRIES.items():
             if key in info["eng"].lower() or key in info["chn"]:
@@ -233,7 +236,7 @@ class SmsBowerProvider(BaseSmsProvider):
                 cid = int(item["id"]) if str(item.get("id", "")).isdigit() else item.get("id")
                 return cid, item.get("name") or str(cid)
 
-        # 第二趟：ISO2 映射匹配（非虚拟查询优先物理主线路）
+        # 第二趟：ISO2 映射匹配（非虚拟查询优先物理主线路；若已明确识别为某标准国家但该平台无此 ISO，绝不降级子串误配邻国！）
         if iso_hint:
             iso_matches = [item for item in countries if str(item.get("iso", "")).lower() == iso_hint]
             if iso_matches:
@@ -251,14 +254,16 @@ class SmsBowerProvider(BaseSmsProvider):
                     chosen = virt[0] if virt else iso_matches[0]
                 cid = int(chosen["id"]) if str(chosen.get("id", "")).isdigit() else chosen.get("id")
                 return cid, chosen.get("name") or str(cid)
+            raise ValueError(f"未知国家: {country}")
 
-        allow_sub = len(key) >= 4 or any(ord(ch) > 127 for ch in key)
+        cjk_len = sum(1 for ch in key if ord(ch) > 127)
+        allow_sub = len(key) >= 4 or cjk_len >= 2
         if allow_sub:
             for item in countries:
                 names = [item.get("name"), item.get("name_zh"), *(item.get("aliases") or [])]
                 normalized_names = [normalize_name(value) for value in names if value]
                 if key and any(
-                    (len(value) >= 4 or any(ord(c) > 127 for c in value)) and (key in value)
+                    (len(value) >= 4 or sum(1 for c in value if ord(c) > 127) >= 2) and (key in value)
                     for value in normalized_names
                     if value
                 ):
@@ -431,6 +436,8 @@ class SmsBowerProvider(BaseSmsProvider):
                 self._countries_generation += 1
             gen = self._countries_generation
             text = await self._get(action="getCountries")
+            if text.strip().upper() in {"BAD_KEY", "NO_KEY"} or "BAD_KEY" in text.upper():
+                raise SmsProviderError(f"SMSBower 鉴权失败: {text[:100]}")
             try:
                 data = json.loads(text)
             except json.JSONDecodeError:
@@ -518,7 +525,7 @@ class SmsBowerProvider(BaseSmsProvider):
 
         def first_count(obj: dict, names: tuple[str, ...]) -> int:
             for name in names:
-                if name in obj:
+                if name in obj and obj.get(name) is not None:
                     return as_count(obj.get(name))
             return 0
 
@@ -779,14 +786,11 @@ class SmsBowerProvider(BaseSmsProvider):
             if status == "UNKNOWN":
                 logger.warning("SMSBower 未知状态码，继续等待: %s", code)
 
-            if elapsed < 60:
-                delay = 3
-            elif elapsed < 180:
-                delay = 5
-            else:
-                delay = 8
-
-            await asyncio.sleep(delay)
+            elapsed = asyncio.get_running_loop().time() - start
+            if elapsed >= timeout:
+                raise SmsTimeoutError(f"等码超时 ({timeout}s), activation={activation_id}")
+            delay = 3 if elapsed < 60 else (5 if elapsed < 180 else 8)
+            await asyncio.sleep(min(delay, max(0.05, timeout - elapsed)))
 
     async def request_additional_sms(self, activation_id: str) -> str:
         """请求重新发送短信（status=3）。"""

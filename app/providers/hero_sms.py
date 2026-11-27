@@ -214,9 +214,14 @@ class HeroSmsProvider(BaseSmsProvider):
                 self._countries_generation += 1
             gen = self._countries_generation
             text = await self._get(action="getPricesV3")
+            if text.strip().upper() in {"BAD_KEY", "NO_KEY"} or "BAD_KEY" in text.upper():
+                raise SmsProviderError(f"HeroSMS 鉴权失败: {text[:100]}")
             if not text.startswith("{"):
                 return _hero_static_rows()
             try:
+                from app.countries import iso_to_cc, iso_to_name
+                from app.providers.smsbower import COUNTRIES as SB_COUNTRIES, COUNTRY_ISO2 as SB_ISO2
+
                 data = json.loads(text)
                 result = []
                 for cid_str in (data or {}).keys():
@@ -224,10 +229,11 @@ class HeroSmsProvider(BaseSmsProvider):
                         continue
                     cid = int(cid_str)
                     static = HERO_COUNTRIES.get(cid, {})
-                    name = static.get("eng") or f"Country #{cid}"
-                    name_zh = static.get("chn", "")
-                    cc = static.get("cc", "")
-                    iso = static.get("iso", "")
+                    sb_info = SB_COUNTRIES.get(cid, {}) if not static else {}
+                    iso = static.get("iso") or (SB_ISO2.get(cid, "") if not static else "")
+                    name = static.get("eng") or sb_info.get("eng") or (iso_to_name(iso, "en") if iso else "") or f"Country #{cid}"
+                    name_zh = static.get("chn") or sb_info.get("chn") or (iso_to_name(iso, "zh") if iso else "")
+                    cc = static.get("cc") or sb_info.get("cc") or (iso_to_cc(iso) if iso else "")
                     result.append({
                         "id": cid,
                         "name": name,
@@ -291,17 +297,17 @@ class HeroSmsProvider(BaseSmsProvider):
 
         key = raw.lower()
         compact = re.sub(r"[^a-z0-9]+", "", key)
+        iso_hint = name_to_iso(raw)
         cid = HERO_ALIASES.get(key)
         if cid is None and compact:
             cid = HERO_ALIASES.get(compact)
-        if cid is None:
-            iso_hint = name_to_iso(raw)
-            if iso_hint:
-                cid = HERO_ALIASES.get(iso_hint)
+        if cid is None and iso_hint:
+            cid = HERO_ALIASES.get(iso_hint)
         if cid is not None:
             return cid, _hero_label(cid)
 
-        allow_sub = len(key) >= 4 or any(ord(ch) > 127 for ch in key)
+        cjk_len = sum(1 for ch in key if ord(ch) > 127)
+        allow_sub = (not iso_hint) and (len(key) >= 4 or cjk_len >= 2)
         if allow_sub:
             for item in _hero_static_rows():
                 fields = [
@@ -318,7 +324,6 @@ class HeroSmsProvider(BaseSmsProvider):
 
         try:
             countries = await self.get_countries()
-            iso_hint = name_to_iso(raw)
             for item in countries:
                 fields = {
                     str(item.get("name", "")).strip().lower(),
@@ -362,13 +367,16 @@ class HeroSmsProvider(BaseSmsProvider):
                             except (ValueError, TypeError, OverflowError):
                                 pass
                     if cost is not None and not isinstance(obj.get("providers"), (dict, list)):
-                        raw_cnt = next((obj.get(ck) for ck in ("count", "Qty", "qty", "quantity") if ck in obj), 0)
+                        raw_cnt = next(
+                            (obj.get(ck) for ck in ("count", "Qty", "qty", "quantity") if obj.get(ck) is not None),
+                            0,
+                        )
                         count = _as_count(raw_cnt)
                         prices.append({"cost": cost, "count": count, "in_stock": count > 0})
                         return
                     for k, v in obj.items():
                         is_price_key = bool(re.fullmatch(r"\d+(?:\.\d+)?", str(k)))
-                        has_count = isinstance(v, dict) and any(ck in v for ck in ("count", "Qty", "qty", "quantity"))
+                        has_count = isinstance(v, dict) and any(v.get(ck) is not None for ck in ("count", "Qty", "qty", "quantity"))
                         if is_price_key and (isinstance(v, (int, float, str)) or has_count):
                             try:
                                 k_cost = float(k)
@@ -376,7 +384,7 @@ class HeroSmsProvider(BaseSmsProvider):
                                 k_cost = 0.0
                             if math.isfinite(k_cost) and k_cost > 0 and not (depth == 0 and k_cost >= 5 and "." not in str(k)):
                                 cnt = _as_count(v) if isinstance(v, (int, float, str)) else _as_count(
-                                    next((v.get(ck) for ck in ("count", "Qty", "qty", "quantity") if ck in v), 0)
+                                    next((v.get(ck) for ck in ("count", "Qty", "qty", "quantity") if v.get(ck) is not None), 0)
                                 )
                                 prices.append({"cost": round(k_cost, 4), "count": cnt, "in_stock": cnt > 0})
                                 continue
@@ -555,7 +563,7 @@ class HeroSmsProvider(BaseSmsProvider):
             if elapsed >= timeout:
                 raise SmsTimeoutError(f"HeroSMS 等码超时 ({timeout}s)")
             delay = 3 if elapsed < 36 else (5 if elapsed < 96 else 8)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(min(delay, max(0.05, timeout - elapsed)))
 
     async def normalize_phone(self, raw_phone: str, country_id: Any) -> "PhoneInput":
         from app.phone_normalizer import build_phone_input, resolve_country_metadata

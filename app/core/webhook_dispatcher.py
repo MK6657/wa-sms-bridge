@@ -77,6 +77,7 @@ class WebhookDispatcher:
             transport=self._transport,
         )
         self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._test_semaphore = asyncio.Semaphore(min(2, self._max_concurrency))
         self._wakeup = asyncio.Event()
         self._worker_task: Optional[asyncio.Task] = None
         self._inflight: set[asyncio.Task] = set()
@@ -399,7 +400,7 @@ class WebhookDispatcher:
         if secret:
             headers["X-SMS-Signature"] = compute_webhook_signature(secret, body)
 
-        async with self._semaphore:
+        async with self._test_semaphore:
             with pin_webhook_host(
                 parsed_host,
                 approved_ips,

@@ -102,9 +102,19 @@ class _Subscriber:
 class EventBus:
     """无外部依赖的 asyncio 广播总线 + 500 条有界历史环供 SSE 断线补发。"""
 
-    def __init__(self, *, max_queue_size: int = 128, history_size: int = 500):
+    def __init__(
+        self,
+        *,
+        max_queue_size: int = 128,
+        history_size: int = 500,
+        max_subscribers: int = 256,
+        max_subscribers_per_project: int = 32,
+    ):
         self._max_queue_size = max_queue_size
-        self._history: deque[BusEvent] = deque(maxlen=max(10, history_size))
+        self._history_size = max(10, history_size)
+        self._history: deque[BusEvent] = deque(maxlen=self._history_size)
+        self._max_subscribers = max(8, int(max_subscribers))
+        self._max_subscribers_per_project = max(4, int(max_subscribers_per_project))
         self._sub_map: dict[int, _Subscriber] = {}
         self._live_refs: dict[str, list[weakref.ref[BusEvent]]] = {}
         self._scrubbed_up_to_seq: dict[str, int] = {}
@@ -187,7 +197,18 @@ class EventBus:
             bucket = self._live_refs.setdefault(resolved_oid, [])
             bucket.append(weakref.ref(item))
             if len(bucket) > 32:
-                self._live_refs[resolved_oid] = [r for r in bucket if r() is not None]
+                alive = [r for r in bucket if r() is not None]
+                if alive:
+                    self._live_refs[resolved_oid] = alive
+                else:
+                    self._live_refs.pop(resolved_oid, None)
+            max_ref_keys = max(1024, self._history_size * 2)
+            if len(self._live_refs) > max_ref_keys:
+                dead_keys = [k for k, refs in self._live_refs.items() if not any(r() is not None for r in refs)]
+                for k in dead_keys:
+                    self._live_refs.pop(k, None)
+                while len(self._live_refs) > max_ref_keys:
+                    self._live_refs.pop(next(iter(self._live_refs)), None)
 
         self._history.append(item)
         for sub in list(self._sub_map.values()):
@@ -311,6 +332,24 @@ class EventBus:
         project_id: str = "",
         credential_project_id: str = "",
     ) -> AsyncIterator[tuple[asyncio.Queue[BusEvent], asyncio.Event]]:
+        from app.errors import AppError
+
+        if len(self._sub_map) >= self._max_subscribers:
+            raise AppError(
+                "实时事件流总并发连接数已达上限，请稍后重试",
+                status_code=429,
+                code="TOO_MANY_STREAMS",
+                retryable=True,
+            )
+        if credential_project_id and credential_project_id != "__admin__":
+            proj_cnt = sum(1 for s in self._sub_map.values() if s.credential_project_id == credential_project_id)
+            if proj_cnt >= self._max_subscribers_per_project:
+                raise AppError(
+                    "当前项目实时事件流并发连接数已达上限，请复用现有 SSE 连接",
+                    status_code=429,
+                    code="TOO_MANY_PROJECT_STREAMS",
+                    retryable=True,
+                )
         sub_id = self._next_sub_id
         self._next_sub_id += 1
         queue: asyncio.Queue[BusEvent] = asyncio.Queue(maxsize=self._max_queue_size)

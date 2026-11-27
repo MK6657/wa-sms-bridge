@@ -52,13 +52,18 @@ class RetentionService:
 
     async def run_scrub_once(self, *, retention_hours: Optional[int] = None) -> int:
         hours = await self.get_retention_hours() if retention_hours is None else int(retention_hours)
-        scrubbed_versions = await self._db.orders.scrub_expired_codes_with_versions(hours)
+        scrubbed_versions, non_terminal_ids = await self._db.orders.scrub_expired_codes_detailed(
+            hours,
+            on_scrub_committed=lambda vers: self._order_service.on_orders_scrubbed(
+                list(vers.keys()),
+                scrub_versions=vers,
+            ),
+        )
         if scrubbed_versions:
-            self._order_service.on_orders_scrubbed(
-                list(scrubbed_versions.keys()),
-                scrub_versions=scrubbed_versions,
-            )
-            for oid, ver in scrubbed_versions.items():
+            for oid in non_terminal_ids:
+                ver = scrubbed_versions.get(oid)
+                if ver is None:
+                    continue
                 try:
                     refreshed = await self._db.orders.get(oid, include_messages=True, include_activations=False)
                     if refreshed is not None and refreshed.get("status") not in {"completed", "cancelled", "expired", "failed"}:

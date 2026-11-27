@@ -11,6 +11,14 @@ from typing import Any, Iterable, Optional
 from app.db.connection import DatabaseConnection
 
 
+def _canonical_phone(phone: str) -> str:
+    raw = str(phone or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if digits:
+        return f"+{digits}" if raw.startswith("+") else digits
+    return raw
+
+
 def _phone_lookup_variants(phone: str) -> tuple[str, ...]:
     raw = str(phone or "").strip()
     digits = re.sub(r"\D", "", raw)
@@ -60,6 +68,7 @@ class BlacklistRepo:
     ) -> bool:
         prov = _norm_provider(provider)
         pid = project_id or ""
+        canonical = _canonical_phone(phone)
         variants = _phone_lookup_variants(phone)
         ph = ",".join("?" for _ in variants)
         async with self._conn.transaction() as raw:
@@ -71,7 +80,7 @@ class BlacklistRepo:
                 return False
             cur = await raw.execute(
                 "INSERT OR IGNORE INTO blacklist (phone, provider, project_id, reason) VALUES (?, ?, ?, ?)",
-                (phone, prov, pid, reason),
+                (canonical, prov, pid, reason),
             )
             return int(cur.rowcount or 0) > 0
 
@@ -88,6 +97,9 @@ class BlacklistRepo:
         added = 0
         async with self._conn.transaction() as raw:
             for phone in phones:
+                canonical = _canonical_phone(phone)
+                if not canonical:
+                    continue
                 variants = _phone_lookup_variants(phone)
                 ph = ",".join("?" for _ in variants)
                 dup_cur = await raw.execute(
@@ -98,7 +110,7 @@ class BlacklistRepo:
                     continue
                 cur = await raw.execute(
                     "INSERT OR IGNORE INTO blacklist (phone, provider, project_id, reason) VALUES (?, ?, ?, ?)",
-                    (phone, prov, pid, reason),
+                    (canonical, prov, pid, reason),
                 )
                 if int(cur.rowcount or 0) > 0:
                     added += 1

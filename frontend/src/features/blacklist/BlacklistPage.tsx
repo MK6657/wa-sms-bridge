@@ -9,6 +9,16 @@ interface BlacklistPageProps {
   defaultProvider?: string;
 }
 
+function normalizeBlacklistPhoneInput(raw: string): string {
+  const withoutExt = raw.replace(/\s*(?:ext\.?|x|#)\s*\d+$/i, "").trim();
+  if (!withoutExt) return "";
+  const digits = withoutExt.replace(/\D/g, "");
+  if (digits.length < 5 || digits.length > 20) return "";
+  if (withoutExt.startsWith("+")) return `+${digits}`;
+  if (withoutExt.startsWith("00") && digits.length >= 7) return `+${digits.slice(2)}`;
+  return digits;
+}
+
 export function BlacklistPage({ defaultProvider = "smsbower" }: BlacklistPageProps) {
   const { notify } = useToast();
   const [entries, setEntries] = useState<BlacklistEntry[]>([]);
@@ -37,10 +47,14 @@ export function BlacklistPage({ defaultProvider = "smsbower" }: BlacklistPagePro
 
   const parsedPhones = useMemo(
     () =>
-      phonesText
-        .split(/[\r\n,;，]+/)
-        .map((s) => s.trim())
-        .filter((s) => s.replace(/\D/g, "").length >= 5),
+      Array.from(
+        new Set(
+          phonesText
+            .split(/[\r\n,;，]+/)
+            .map(normalizeBlacklistPhoneInput)
+            .filter(Boolean),
+        ),
+      ),
     [phonesText],
   );
 

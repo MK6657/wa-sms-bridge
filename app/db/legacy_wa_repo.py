@@ -139,7 +139,7 @@ class LegacyWaRepo:
         currency: str = "USD",
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        numeric_cost = float(cost or 0)
+        numeric_cost = round(float(cost or 0), 4)
         async with self._conn.transaction() as raw:
             await raw.execute(
                 "INSERT INTO registration_history (task_id, provider, phone, country_id, country_label, "
@@ -154,7 +154,7 @@ class LegacyWaRepo:
             )
             await raw.execute(
                 "UPDATE task_state SET successes_done=?, target_success_count=?, "
-                "cost_total=cost_total+?, account_commit_state='committed', "
+                "cost_total=ROUND(cost_total+?, 4), account_commit_state='committed', "
                 "wa_account_id=?, verification_request_id=?, updated_at=? WHERE task_id=?",
                 (
                     int(success_count), int(target_success_count), numeric_cost,
@@ -189,8 +189,8 @@ class LegacyWaRepo:
         providers = {
             row["provider"]: {
                 "success_count": int(row["success_count"] or 0),
-                "cost_total": float(row["cost_total"] or 0),
-                "avg_cost": float(row["avg_cost"]) if row["avg_cost"] is not None else None,
+                "cost_total": round(float(row["cost_total"] or 0), 4),
+                "avg_cost": round(float(row["avg_cost"]), 4) if row["avg_cost"] is not None else None,
                 "estimated_count": int(row["estimated_count"] or 0),
             }
             for row in rows
@@ -200,17 +200,24 @@ class LegacyWaRepo:
             "day_start_utc": start_utc.isoformat(),
             "providers": providers,
             "success_count": sum(item["success_count"] for item in providers.values()),
-            "cost_total": sum(item["cost_total"] for item in providers.values()),
+            "cost_total": round(sum(item["cost_total"] for item in providers.values()), 4),
             "estimated_count": sum(item["estimated_count"] for item in providers.values()),
         }
 
     async def cancel_stale_tasks(self) -> int:
         stale = await self._conn.fetchall("SELECT task_id, activation_id FROM task_state WHERE status='running'")
+        if not stale:
+            return 0
         for row in stale:
             logger.warning(
                 "recovery: marking stale task %s as cancelled (activation=%s)",
                 row["task_id"],
                 row["activation_id"],
             )
-            await self.update_task(row["task_id"], status="cancelled", error="container restart recovery")
-        return len(stale)
+        now = datetime.now(timezone.utc).isoformat()
+        cur = await self._conn.write(
+            "UPDATE task_state SET status='cancelled', error='container restart recovery', updated_at=? "
+            "WHERE status='running'",
+            (now,),
+        )
+        return int(cur.rowcount or len(stale))

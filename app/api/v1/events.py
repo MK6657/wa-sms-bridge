@@ -29,7 +29,7 @@ async def stream_events(
 ):
     AuthService.ensure_scope(caller, "events:r")
     effective_project = project_id if caller.is_admin else caller.project_id
-    cred_project = "" if caller.is_admin else caller.project_id
+    cred_project = "__admin__" if caller.is_admin else caller.project_id
     cursor = (last_event_id_header or last_event_id_query or "").strip()
 
     async def _still_authorized() -> bool:
@@ -66,10 +66,12 @@ async def stream_events(
                 )
                 yield f"event: resync_required\ndata: {resync_payload}\n\n"
 
-            # 断线重连回放阶段：每条推送前复核凭据有效性（修复补充 P1-03：密钥撤销同步停止历史回放）
+            # 断线重连回放阶段：revoke_event 即时响应撤销，并按批次复核数据库凭据（避免 500 次 N+1 查询阻塞）
             seen_ids: set[str] = set()
-            for missed in missed_events:
-                if event_bus.is_closed or revoke_event.is_set() or not await _still_authorized():
+            for idx, missed in enumerate(missed_events):
+                if event_bus.is_closed or revoke_event.is_set():
+                    return
+                if idx > 0 and idx % 50 == 0 and not await _still_authorized():
                     return
                 seen_ids.add(missed.id)
                 payload = json.dumps(missed.to_payload(), ensure_ascii=False)

@@ -24,6 +24,10 @@ export default defineConfig({
       "/api": {
         target: "http://127.0.0.1:9090",
         changeOrigin: true,
+        headers: {
+          Origin: "http://127.0.0.1:9090",
+          Referer: "http://127.0.0.1:9090/",
+        },
       },
       "/docs": {
         target: "http://127.0.0.1:9090",

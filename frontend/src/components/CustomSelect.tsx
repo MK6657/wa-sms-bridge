@@ -220,8 +220,8 @@ export function CustomSelect({
                   onMouseEnter={() => setActiveIdx(idx)}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    selectItem(opt.value);
                   }}
+                  onClick={() => selectItem(opt.value)}
                   className={`flex w-full cursor-pointer items-start justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${
                     isActive
                       ? "bg-emerald-50/90 text-emerald-950"
@@ -273,6 +273,8 @@ export function CustomSelect({
                 type="button"
                 onMouseDown={(e) => {
                   e.preventDefault();
+                }}
+                onClick={() => {
                   setOpen(false);
                   footerAction.onClick();
                 }}

@@ -113,15 +113,48 @@ def _host_matches_allowlist(host: str, allowlist: Iterable[str]) -> bool:
     return False
 
 
+_NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
+_NAT64_LOCAL = ipaddress.IPv6Network("64:ff9b:1::/48")
+_AWS_IPV6_IMDS = ipaddress.IPv6Address("fd00:ec2::254")
+_ALIBABA_IMDS_V4 = ipaddress.IPv4Address("100.100.100.200")
+
+
+def _extract_embedded_ipv4(ip: ipaddress.IPv6Address) -> tuple[ipaddress.IPv4Address, ...]:
+    """解包所有常见 IPv6 过渡/转换机制中内嵌的 IPv4 地址（防 6to4 / Teredo / NAT64 / v4-compat SSRF 绕过）。"""
+    embedded: list[ipaddress.IPv4Address] = []
+    if ip.ipv4_mapped is not None:
+        embedded.append(ip.ipv4_mapped)
+    if ip.sixtofour is not None:
+        embedded.append(ip.sixtofour)
+    if ip.teredo is not None:
+        server_v4, client_v4 = ip.teredo
+        embedded.extend([server_v4, client_v4])
+    if ip in _NAT64_WELL_KNOWN or ip in _NAT64_LOCAL:
+        embedded.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    elif 1 < int(ip) <= 0xFFFFFFFF:
+        # IPv4-compatible IPv6 (::x.x.x.x, excluding ::1)
+        embedded.append(ipaddress.IPv4Address(int(ip)))
+    return tuple(embedded)
+
+
 def _is_forbidden_even_when_private_allowed(ip_str: str, *, allow_loopback: bool = False) -> bool:
-    """即使放行私有网段，也绝不允许链路本地(169.254 云元数据)、未指定(0.0.0.0/::)、组播；回环仅限显式主机白名单。"""
+    """即使放行私有网段，也绝不允许链路本地/云元数据(169.254/fd00:ec2::254/100.100.100.200)、未指定、组播、保留段；回环仅限显式主机白名单。"""
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip == _AWS_IPV6_IMDS:
+            return True
+        for v4 in _extract_embedded_ipv4(ip):
+            if _is_forbidden_even_when_private_allowed(str(v4), allow_loopback=allow_loopback):
+                return True
+    elif ip == _ALIBABA_IMDS_V4:
+        return True
+
     if ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+        return True
+    if isinstance(ip, ipaddress.IPv4Address) and ip.is_reserved:
         return True
     if ip.is_loopback and not allow_loopback:
         return True
@@ -133,8 +166,14 @@ def _is_blocked_ip(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip == _AWS_IPV6_IMDS:
+            return True
+        for v4 in _extract_embedded_ipv4(ip):
+            if _is_blocked_ip(str(v4)):
+                return True
+    elif ip == _ALIBABA_IMDS_V4:
+        return True
     return bool(
         (not ip.is_global)
         or ip.is_private
@@ -234,9 +273,16 @@ def _validate_webhook_url_syntax(
     return raw, host, port, allow_private, allow_loopback, literal_ip
 
 
-def _check_resolved_ips(host: str, infos: list, allow_private: bool, *, allow_loopback: bool = False) -> list[str]:
+def _check_resolved_ips(
+    host: str,
+    infos: list,
+    allow_private: bool,
+    *,
+    allow_loopback: bool = False,
+    allow_empty: bool = False,
+) -> list[str]:
     ips = list(dict.fromkeys(str(info[4][0]) for info in infos if info and info[4]))
-    if not ips and not allow_private:
+    if not ips and not allow_empty:
         raise AppError(f"Webhook 主机 '{host}' 无有效解析地址", status_code=422, code="WEBHOOK_DNS_FAILED")
     for ip_str in ips:
         if _is_forbidden_even_when_private_allowed(ip_str, allow_loopback=allow_loopback) or (
@@ -270,14 +316,20 @@ def validate_webhook_url(
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        if not allow_private:
+        if not allow_loopback:
             raise AppError(
                 f"Webhook 主机 '{host}' DNS 解析失败: {exc}",
                 status_code=422,
                 code="WEBHOOK_DNS_FAILED",
             ) from exc
         infos = []
-    return raw, _check_resolved_ips(host, infos, allow_private, allow_loopback=allow_loopback)
+    return raw, _check_resolved_ips(
+        host,
+        infos,
+        allow_private,
+        allow_loopback=allow_loopback,
+        allow_empty=allow_loopback,
+    )
 
 
 async def validate_webhook_url_async(
@@ -313,14 +365,20 @@ async def validate_webhook_url_async(
             retryable=True,
         ) from exc
     except socket.gaierror as exc:
-        if not allow_private:
+        if not allow_loopback:
             raise AppError(
                 f"Webhook 主机 '{host}' DNS 解析失败: {exc}",
                 status_code=422,
                 code="WEBHOOK_DNS_FAILED",
             ) from exc
         infos = []
-    return raw, _check_resolved_ips(host, infos, allow_private, allow_loopback=allow_loopback)
+    return raw, _check_resolved_ips(
+        host,
+        infos,
+        allow_private,
+        allow_loopback=allow_loopback,
+        allow_empty=allow_loopback,
+    )
 
 
 class PinnedIPNetworkBackend(httpcore.AsyncNetworkBackend):
@@ -368,19 +426,29 @@ class PinnedIPNetworkBackend(httpcore.AsyncNetworkBackend):
                 socket_options=socket_options,
             )
 
-        if not route.ips:
-            if route.allow_private:
-                return await self._inner.connect_tcp(
-                    norm_host,
-                    port,
-                    timeout=timeout,
-                    local_address=local_address,
-                    socket_options=socket_options,
+        candidate_ips = route.ips
+        if not candidate_ips:
+            # 绝不将未解析主机名直接传给底层 connect_tcp（彻底封堵二次解析 DNS Rebinding）！
+            if not route.allow_private:
+                raise httpcore.ConnectError(f"Webhook 连接被拒：主机 '{norm_host}' 无已批准的解析 IP")
+            try:
+                infos = await asyncio.wait_for(
+                    asyncio.get_running_loop().getaddrinfo(norm_host, port, type=socket.SOCK_STREAM),
+                    timeout=min(3.0, float(timeout)) if timeout else 3.0,
                 )
-            raise httpcore.ConnectError(f"Webhook 连接被拒：主机 '{norm_host}' 无已批准的解析 IP")
+                resolved = _check_resolved_ips(
+                    norm_host,
+                    infos,
+                    route.allow_private,
+                    allow_loopback=route.allow_loopback,
+                    allow_empty=False,
+                )
+            except Exception as exc:
+                raise httpcore.ConnectError(f"Webhook 连接前解析或安全复核失败 ('{norm_host}'): {exc}") from exc
+            candidate_ips = tuple(resolved)
 
         last_exc: Optional[Exception] = None
-        for candidate_ip in route.ips:
+        for candidate_ip in candidate_ips:
             if _is_forbidden_even_when_private_allowed(candidate_ip, allow_loopback=route.allow_loopback) or (
                 not route.allow_private and _is_blocked_ip(candidate_ip)
             ):
@@ -465,7 +533,7 @@ def validate_upstream_base_url(provider: str, url: str) -> str:
 
 
 def validate_wa_app_url(url: str) -> str:
-    """校验 wa-app 地址格式（仅管理员可修改）。"""
+    """校验 wa-app 地址格式与高危云元数据/未指定/组播地址拦截（仅管理员可修改）。"""
     raw = (url or "").strip().rstrip("/")
     parsed = urlparse(raw)
     _safe_url_port(parsed, error_code="INVALID_WA_URL")
@@ -473,4 +541,15 @@ def validate_wa_app_url(url: str) -> str:
         raise AppError("wa-app 地址必须为有效的 http:// 或 https:// URL", status_code=422, code="INVALID_WA_URL")
     if parsed.username or parsed.password:
         raise AppError("wa-app 地址不允许内嵌凭据", status_code=422, code="INVALID_WA_URL")
+    norm_host = normalize_url_hostname(parsed.hostname or "", error_code="INVALID_WA_URL")
+    try:
+        ip_obj = ipaddress.ip_address(norm_host)
+        if _is_forbidden_even_when_private_allowed(str(ip_obj), allow_loopback=True):
+            raise AppError(
+                f"wa-app 地址 '{norm_host}' 属于禁止访问的元数据/未指定/组播地址段",
+                status_code=422,
+                code="INVALID_WA_URL",
+            )
+    except ValueError:
+        pass
     return raw

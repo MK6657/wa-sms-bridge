@@ -147,6 +147,7 @@ async def resolve_reconciliation_item(
         activation_row_id,
         state=req.state,
         note=req.note,
+        actual_cost=req.actual_cost,
         refund_amount=req.refund_amount,
         currency=req.currency,
     )

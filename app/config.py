@@ -144,6 +144,10 @@ class Config:
         self.admin_session_ttl_seconds: int = max(300, _env_int("ADMIN_SESSION_TTL_SECONDS", 86400))
         self.admin_cookie_secure: bool = _env_bool("ADMIN_COOKIE_SECURE", False)
         self.api_auth_required: bool = _env_bool("API_AUTH_REQUIRED", False)
+        self.trusted_proxy_ips: list[str] = (
+            _env_list("TRUSTED_PROXY_IPS", ()) if os.environ.get("TRUSTED_PROXY_IPS") else []
+        )
+        self.admin_trusted_origins: list[str] = _env_origins("ADMIN_TRUSTED_ORIGINS")
 
         # ── 出站安全边界（SSRF 防护）─────────────────────────
         self.webhook_allowed_hosts: list[str] = _env_list("WEBHOOK_ALLOWED_HOSTS", ()) if os.environ.get("WEBHOOK_ALLOWED_HOSTS") else []
@@ -162,7 +166,7 @@ class Config:
 
         # ── 可选插件与旧版 API 兼容（默认关闭）──────────────────
         self.enable_wa_plugin: bool = _env_bool("ENABLE_WA_PLUGIN", False)
-        self.enable_legacy_api: bool = _env_bool("ENABLE_LEGACY_API", self.enable_wa_plugin)
+        self.enable_legacy_api: bool = _env_bool("ENABLE_LEGACY_API", False)
         self.wa_app_url: str = os.environ.get("WA_APP_URL", "http://host.docker.internal:18080").rstrip("/")
         self.wa_app_api_token: str = os.environ.get("WA_APP_API_TOKEN", "")
         self.wa_app_api_username: str = os.environ.get("WA_APP_API_USERNAME", "")
@@ -189,6 +193,24 @@ class Config:
         """生成不可逆带密钥 HMAC-SHA256 摘要（用于脱敏后重发防重比对，不落盘明文）。"""
         base = self._secret_key.encode("utf-8") if self._secret_key else self._ephemeral_session_secret
         return hmac.new(base, f"{namespace}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def verify_hmac_digest(self, namespace: str, value: str, expected_hex: str) -> bool:
+        """校验带密钥 HMAC-SHA256 摘要，兼容 BRIDGE_SECRET_KEY_PREVIOUS 平滑轮换。"""
+        if not expected_hex:
+            return False
+        msg = f"{namespace}:{value}".encode("utf-8")
+        if self._secret_key:
+            bases = [self._secret_key.encode("utf-8")]
+            for prev in self._previous_secret_keys:
+                enc = prev.encode("utf-8")
+                if enc and enc not in bases:
+                    bases.append(enc)
+        else:
+            bases = [self._ephemeral_session_secret]
+        return any(
+            hmac.compare_digest(hmac.new(base, msg, hashlib.sha256).hexdigest(), expected_hex)
+            for base in bases
+        )
 
     def _require_secret_bytes(self) -> bytes:
         raw = self._secret_key.encode("utf-8") if self._secret_key else b""
@@ -223,11 +245,14 @@ class Config:
 
     def decrypt_value(self, encrypted: str) -> str:
         """解密 v2 或旧版 v1 Fernet 密文，支持 BRIDGE_SECRET_KEY_PREVIOUS 平滑轮换。"""
-        raw = base64.urlsafe_b64decode(encrypted.encode("utf-8"))
+        try:
+            raw = base64.urlsafe_b64decode(encrypted.encode("utf-8"))
+        except Exception as exc:
+            raise InvalidToken("Invalid base64 ciphertext") from exc
         candidates = self._candidate_secret_bytes()
         last_exc: Exception | None = None
 
-        # 优先按 v2 ("v2" + 16B salt + Fernet token "gAAAA...") 解密
+        # 优先按 v2 ("v2" + 16B salt + Fernet token "gAAAA...") 解密；失败即报错，绝不回落触发 100k PBKDF2！
         if (
             raw.startswith(_V2_CIPHERTEXT_PREFIX)
             and len(raw) > 24
@@ -240,9 +265,10 @@ class Config:
                     return Fernet(key).decrypt(v2_token).decode("utf-8")
                 except InvalidToken as exc:
                     last_exc = exc
+            raise last_exc or InvalidToken("Invalid v2 ciphertext")
 
-        # 回退兼容旧版 v1 (16B salt + Fernet token)，利用 LRU 缓存消除重复 PBKDF2 开销
-        if len(raw) > 16:
+        # 回退兼容旧版 v1 (16B salt + Fernet token "gAAAA...")，校验 Fernet 头后再执行缓存 PBKDF2
+        if len(raw) > 24 and raw[16:21] == b"gAAAA":
             v1_salt, v1_token = raw[:16], raw[16:]
             for secret_bytes in candidates:
                 try:

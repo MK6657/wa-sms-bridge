@@ -66,7 +66,9 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
   const [clearEditSecret, setClearEditSecret] = useState(false);
   const [showEditSecret, setShowEditSecret] = useState(false);
   const [editScopes, setEditScopes] = useState<string[]>([]);
+  const [initialCustomScopes, setInitialCustomScopes] = useState<string[]>([]);
   const [savingEdit, setSavingEdit] = useState(false);
+  const [togglingId, setTogglingId] = useState("");
 
   // 轮转与删除确认
   const [rotateTarget, setRotateTarget] = useState<ProjectApiKey | null>(null);
@@ -112,9 +114,16 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
   useEffect(() => {
     if (active) {
       load();
+    } else {
+      setJustCreatedKey(null);
+    }
+  }, [active, load]);
+
+  useEffect(() => {
+    if (active) {
       loadDeliveries();
     }
-  }, [active, load, loadDeliveries]);
+  }, [active, loadDeliveries]);
 
   const toggleAuthMode = async () => {
     const next = !authRequired;
@@ -161,12 +170,16 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
   };
 
   const handleToggleEnabled = async (item: ProjectApiKey) => {
+    if (togglingId === item.project_id) return;
+    setTogglingId(item.project_id);
     try {
       await api.updateProjectKey(item.project_id, { enabled: !item.enabled });
       notify(item.enabled ? `已停用 ${item.name}` : `已启用 ${item.name}`, "info");
       load();
     } catch (err) {
       notify(err instanceof Error ? err.message : "更新状态失败", "error");
+    } finally {
+      setTogglingId("");
     }
   };
 
@@ -178,7 +191,9 @@ export function IntegrationsPage({ active = true }: { active?: boolean }) {
     setEditWebhookSecret("");
     setClearEditSecret(false);
     setShowEditSecret(false);
-    setEditScopes(Array.isArray(item.scopes) ? [...item.scopes] : SCOPE_META.map((s) => s.id));
+    const currentScopes = Array.isArray(item.scopes) ? [...item.scopes] : SCOPE_META.map((s) => s.id);
+    setEditScopes(currentScopes);
+    setInitialCustomScopes(currentScopes.filter((sc) => !SCOPE_META.some((m) => m.id === sc)));
   };
 
   const handleSaveEdit = async (e: React.FormEvent) => {
@@ -637,7 +652,7 @@ es.addEventListener("order.expired", (ev) => {
                 <span className="font-medium text-slate-600">接口权限：</span>
                 {[
                   ...SCOPE_META,
-                  ...editScopes
+                  ...Array.from(new Set([...initialCustomScopes, ...editScopes]))
                     .filter((sc) => !SCOPE_META.some((m) => m.id === sc))
                     .map((sc) => ({ id: sc, label: "自定义权限" })),
                 ].map((sc) => {
@@ -785,8 +800,9 @@ es.addEventListener("order.expired", (ev) => {
                     <td className="whitespace-nowrap px-4 py-3">
                       <button
                         type="button"
+                        disabled={togglingId === item.project_id}
                         onClick={() => handleToggleEnabled(item)}
-                        className={`cursor-pointer rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${
+                        className={`cursor-pointer rounded-full border px-2.5 py-0.5 text-[11px] font-medium disabled:opacity-50 ${
                           item.enabled
                             ? "border-emerald-200 bg-emerald-50 text-emerald-700"
                             : "border-slate-200 bg-slate-100 text-slate-500"

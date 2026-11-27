@@ -23,6 +23,7 @@ interface ActiveOrderCardProps {
   onResend: (orderId: string) => void;
   onComplete: (orderId: string) => void;
   onCancel: (orderId: string, blacklist: boolean) => void;
+  onExpireCheck?: (orderId: string) => void;
 }
 
 export function ActiveOrderCard({
@@ -32,6 +33,7 @@ export function ActiveOrderCard({
   onResend,
   onComplete,
   onCancel,
+  onExpireCheck,
 }: ActiveOrderCardProps) {
   const { notify } = useToast();
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -48,11 +50,35 @@ export function ActiveOrderCard({
     : 0;
 
   useEffect(() => {
-    setNowMs(Date.now());
-    if (!isWaiting) return;
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [isWaiting, order.expires_at]);
+    const startNow = Date.now();
+    setNowMs(startNow);
+    if (!isWaiting || !Number.isFinite(expiresMs)) return;
+
+    let timer: number | undefined;
+    if (startNow < expiresMs) {
+      timer = window.setInterval(() => {
+        const cur = Date.now();
+        setNowMs(cur);
+        if (cur >= expiresMs && timer !== undefined) {
+          window.clearInterval(timer);
+          timer = undefined;
+        }
+      }, 1000);
+    }
+
+    let expireProbeTimer: number | undefined;
+    if (onExpireCheck) {
+      const delayMs = Math.max(1500, expiresMs - startNow + 3000);
+      expireProbeTimer = window.setTimeout(() => {
+        onExpireCheck(order.order_id);
+      }, delayMs);
+    }
+
+    return () => {
+      if (timer !== undefined) window.clearInterval(timer);
+      if (expireProbeTimer !== undefined) window.clearTimeout(expireProbeTimer);
+    };
+  }, [isWaiting, expiresMs, order.order_id, onExpireCheck]);
 
   useEffect(() => {
     if (!confirmBlacklist) return;

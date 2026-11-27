@@ -21,15 +21,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY --from=frontend-builder /build/app/web_dist ./app/web_dist
 
-RUN mkdir -p /data && adduser --disabled-password --gecos "" appuser && chown -R appuser:appuser /app /data
+RUN mkdir -p /data \
+    && adduser --uid 10001 --disabled-password --gecos "" appuser \
+    && chown -R appuser:appuser /data
 USER appuser
 
 EXPOSE 9090
 
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV BRIDGE_DATA_DIR=/data
 ENV LOG_LEVEL=INFO
 ENV ACTIVE_PROVIDERS=smsbower
 ENV DEFAULT_PROVIDER=smsbower
 ENV ENABLE_WA_PLUGIN=false
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090", "--timeout-graceful-shutdown", "5"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090", "--timeout-graceful-shutdown", "3"]

@@ -61,7 +61,7 @@ export function useOrderStream(
 
       source.addEventListener("connected", (raw) => {
         setConnected(true);
-        const { isReconnect } = tracker.markConnected();
+        tracker.markConnected();
         let resyncRequired = false;
         try {
           const info = JSON.parse((raw as MessageEvent).data || "{}") as { resync_required?: boolean };
@@ -72,7 +72,8 @@ export function useOrderStream(
         if (resyncRequired) {
           // 服务端紧接着会推送独立 resync_required 事件，此处仅重置游标避免重复拉取两次快照
           tracker.resetCursor();
-        } else if (isReconnect) {
+        } else {
+          // 首次建连与断线重连均补拉一次快照，消除初始 HTTP 加载与 EventSource 订阅之间的事件时间窗空隙
           reconnectRef.current?.();
         }
       });

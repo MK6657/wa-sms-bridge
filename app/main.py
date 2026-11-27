@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import logging
 import os
@@ -373,7 +374,7 @@ def create_app(
             if not skip_startup_probe:
                 for pname, prov in reg.all_instances().items():
                     try:
-                        bal = await prov.get_balance()
+                        bal = await asyncio.wait_for(prov.get_balance(), timeout=3.0)
                         logger.info("活跃平台 %s 就绪，余额: $%.2f", pname, bal)
                     except Exception as exc:
                         if _missing_api_key_error(exc):
@@ -401,14 +402,24 @@ def create_app(
         lifespan=lifespan,
     )
 
-    if env.cors_origins:
+    cors_list = list(dict.fromkeys([*env.admin_trusted_origins, *env.cors_origins]))
+    if cors_list:
+        allow_creds = bool(env.admin_trusted_origins) and "*" not in env.admin_trusted_origins and not env.cors_origins
         application.add_middleware(
             CORSMiddleware,
-            allow_origins=env.cors_origins,
-            allow_credentials="*" not in env.cors_origins,
+            allow_origins=env.admin_trusted_origins if allow_creds else cors_list,
+            allow_credentials=allow_creds,
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    @application.middleware("http")
+    async def security_headers_middleware(request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
 
     register_exception_handlers(application)
     application.include_router(v1_router)

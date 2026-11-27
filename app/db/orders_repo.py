@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from app.config import env
 from app.db.connection import DatabaseConnection
@@ -156,7 +157,7 @@ class OrdersRepo:
         order["idempotency_error_code"] = str(order.get("idempotency_error_code") or "")
         order["idempotency_error_message"] = str(order.get("idempotency_error_message") or "")
         order["latest_code"] = "" if order["code_scrubbed"] else _decrypt_code(str(order.get("latest_code") or ""))
-        order["resend_base_code"] = _decrypt_code(str(order.get("resend_base_code") or ""))
+        order["resend_base_code"] = "" if order["code_scrubbed"] else _decrypt_code(str(order.get("resend_base_code") or ""))
         order["resend_base_digest"] = str(order.get("resend_base_digest") or "")
         try:
             order["metadata"] = json.loads(order.get("metadata_json") or "{}")
@@ -342,10 +343,12 @@ class OrdersRepo:
         order_id: str,
         *,
         outbox_entry: Optional[dict[str, Any]] = None,
+        include_messages: bool = True,
+        include_activations: bool = True,
         **kwargs: Any,
     ) -> Optional[dict[str, Any]]:
         if not kwargs and not outbox_entry:
-            return await self.get(order_id, include_messages=True, include_activations=True)
+            return await self.get(order_id, include_messages=include_messages, include_activations=include_activations)
         sets: list[str] = []
         values: list[Any] = []
         for field_name, val in kwargs.items():
@@ -364,7 +367,7 @@ class OrdersRepo:
             if outbox_entry:
                 await self._insert_outbox_in_tx(raw, outbox_entry, now)
 
-        return await self.get(order_id, include_messages=True, include_activations=True)
+        return await self.get(order_id, include_messages=include_messages, include_activations=include_activations)
 
     async def transition_status(
         self,
@@ -376,6 +379,7 @@ class OrdersRepo:
         tx_hook=None,
         scrub_in_tx: bool = False,
         scrub_result: Optional[dict[str, int]] = None,
+        on_scrub_committed: Optional[Callable[[dict[str, int]], None]] = None,
         **kwargs: Any,
     ) -> Optional[dict[str, Any]]:
         """条件 CAS 原子状态切换：同事务完成订单切换、激活台账同步（tx_hook）、可选即刻脱敏与 Outbox 入队。"""
@@ -396,6 +400,7 @@ class OrdersRepo:
         placeholders = ",".join("?" for _ in expected_statuses)
         values.append(order_id)
         values.extend(expected_statuses)
+        committed_scrub: dict[str, int] = {}
 
         async with self._conn.transaction() as raw:
             cur = await raw.execute(
@@ -427,11 +432,14 @@ class OrdersRepo:
                         (order_id,),
                     )
                     await WebhooksRepo.scrub_for_orders_in_tx(raw, [order_id], now)
+                    committed_scrub[order_id] = new_ver
                     if scrub_result is not None:
                         scrub_result[order_id] = new_ver
             if outbox_entry:
                 await self._insert_outbox_in_tx(raw, outbox_entry, now)
 
+        if committed_scrub and on_scrub_committed is not None:
+            on_scrub_committed(committed_scrub)
         return await self.get(order_id, include_messages=True, include_activations=True)
 
     async def append_code(
@@ -624,10 +632,16 @@ class OrdersRepo:
         )
         return [self._hydrate_order(r, []) for r in rows if r is not None]  # type: ignore[misc]
 
-    async def scrub_order_code_with_version(self, order_id: str) -> Optional[int]:
+    async def scrub_order_code_with_version(
+        self,
+        order_id: str,
+        *,
+        on_scrub_committed: Optional[Callable[[dict[str, int]], None]] = None,
+    ) -> Optional[int]:
         """原子脱敏单笔订单并递增 code_scrub_version，返回新的脱敏版本号（不存在则返回 None）。"""
         now = _utc_now_iso()
         closed_ph = ",".join("?" for _ in CLOSED_ORDER_STATUSES)
+        new_ver: Optional[int] = None
         async with self._conn.transaction() as raw:
             pre_cur = await raw.execute(
                 "SELECT status, latest_code, resend_base_digest FROM sms_orders WHERE order_id=?",
@@ -660,89 +674,144 @@ class OrdersRepo:
                 (order_id,),
             )
             v_row = await v_cur.fetchone()
-            return int((v_row["code_scrub_version"] if v_row else 1) or 1)
+            new_ver = int((v_row["code_scrub_version"] if v_row else 1) or 1)
+
+        if new_ver is not None and on_scrub_committed is not None:
+            on_scrub_committed({order_id: new_ver})
+        return new_ver
 
     async def scrub_order_code(self, order_id: str) -> bool:
         return (await self.scrub_order_code_with_version(order_id)) is not None
 
-    async def scrub_expired_codes_with_versions(self, retention_hours: int) -> dict[str, int]:
-        """独立验证码留存清理（修复 P1-06、复核 P0-02、v6 P0-01/P2-04 及 TOCTOU/compensation_pending 留存漏洞）：
-        - retention_hours < 0：不自动清理
-        - 候选筛选与原子脱敏全部在同一写事务内完成，杜绝筛选后新到重发短信被误擦除的 TOCTOU 竞态
-        - 覆盖终态订单、超期 code_received 订单，以及持码滞留的 compensation_pending / cancelling / completing 订单
-        - 同一事务递增 code_scrub_version、清空 sms_messages 与 webhook_deliveries，返回 {order_id: new_version}
-        """
+    async def scrub_expired_codes_detailed(
+        self,
+        retention_hours: int,
+        *,
+        on_scrub_committed: Optional[Callable[[dict[str, int]], None]] = None,
+    ) -> tuple[dict[str, int], set[str]]:
+        """分批原子清理超期验证码，保留在途订单重发防重摘要，并返回 (versions, non_terminal_ids)。"""
         if retention_hours < 0:
-            return {}
+            return {}, set()
         now = _utc_now()
         now_iso = now.isoformat()
         cutoff_iso = (now - timedelta(hours=retention_hours)).isoformat()
         closed_ph = ",".join("?" for _ in CLOSED_ORDER_STATUSES)
         pending_statuses = ("compensation_pending", "cancelling", "completing")
         pending_ph = ",".join("?" for _ in pending_statuses)
+        chunk_limit = 500
 
         versions: dict[str, int] = {}
-        async with self._conn.transaction() as raw:
-            closed_cur = await raw.execute(
-                f"SELECT order_id FROM sms_orders "
-                f"WHERE status IN ({closed_ph}) AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
-                f"AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(completed_at, ''), updated_at)) "
-                f" <= strftime('%Y-%m-%dT%H:%M:%f', ?)",
-                (*CLOSED_ORDER_STATUSES, cutoff_iso),
-            )
-            closed_rows = await closed_cur.fetchall()
+        non_terminal_ids: set[str] = set()
 
-            # 持码滞留的待补偿/取消中/完成中订单也必须遵循留存期限（retention_hours==0 时立即纳入清理）
-            pending_cur = await raw.execute(
-                f"SELECT order_id FROM sms_orders "
-                f"WHERE status IN ({pending_ph}) AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
-                f"AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(code_received_at, ''), updated_at)) "
-                f" <= strftime('%Y-%m-%dT%H:%M:%f', ?)",
-                (*pending_statuses, cutoff_iso),
-            )
-            pending_rows = await pending_cur.fetchall()
-
-            if retention_hours > 0:
-                open_cur = await raw.execute(
-                    "SELECT order_id FROM sms_orders "
-                    "WHERE status='code_received' AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
-                    "AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(code_received_at, ''), updated_at)) "
-                    " <= strftime('%Y-%m-%dT%H:%M:%f', ?)",
-                    (cutoff_iso,),
+        while True:
+            chunk_versions: dict[str, int] = {}
+            async with self._conn.transaction() as raw:
+                closed_cur = await raw.execute(
+                    f"SELECT order_id, status, latest_code, resend_base_digest FROM sms_orders "
+                    f"WHERE status IN ({closed_ph}) AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
+                    f"AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(completed_at, ''), updated_at)) "
+                    f" <= strftime('%Y-%m-%dT%H:%M:%f', ?) LIMIT ?",
+                    (*CLOSED_ORDER_STATUSES, cutoff_iso, chunk_limit),
                 )
-            else:
-                open_cur = await raw.execute(
-                    "SELECT order_id FROM sms_orders "
-                    "WHERE status='code_received' AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
-                    "AND ((expires_at != '' AND strftime('%Y-%m-%dT%H:%M:%f', expires_at) <= strftime('%Y-%m-%dT%H:%M:%f', ?)) "
-                    "     OR (expires_at = '' AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(code_received_at, ''), updated_at)) "
-                    "         <= strftime('%Y-%m-%dT%H:%M:%f', ?)))",
-                    (now_iso, (now - timedelta(minutes=15)).isoformat()),
+                closed_rows = await closed_cur.fetchall()
+
+                rem_after_closed = max(0, chunk_limit - len(closed_rows))
+                pending_rows = []
+                if rem_after_closed > 0:
+                    pending_cur = await raw.execute(
+                        f"SELECT order_id, status, latest_code, resend_base_digest FROM sms_orders "
+                        f"WHERE status IN ({pending_ph}) AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
+                        f"AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(code_received_at, ''), updated_at)) "
+                        f" <= strftime('%Y-%m-%dT%H:%M:%f', ?) LIMIT ?",
+                        (*pending_statuses, cutoff_iso, rem_after_closed),
+                    )
+                    pending_rows = await pending_cur.fetchall()
+
+                rem_after_pending = max(0, rem_after_closed - len(pending_rows))
+                open_rows = []
+                if rem_after_pending > 0:
+                    if retention_hours > 0:
+                        open_cur = await raw.execute(
+                            "SELECT order_id, status, latest_code, resend_base_digest FROM sms_orders "
+                            "WHERE status='code_received' AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
+                            "AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(code_received_at, ''), updated_at)) "
+                            " <= strftime('%Y-%m-%dT%H:%M:%f', ?) LIMIT ?",
+                            (cutoff_iso, rem_after_pending),
+                        )
+                    else:
+                        open_cur = await raw.execute(
+                            "SELECT order_id, status, latest_code, resend_base_digest FROM sms_orders "
+                            "WHERE status='code_received' AND code_scrubbed=0 AND (latest_code != '' OR code_count > 0) "
+                            "AND ((expires_at != '' AND strftime('%Y-%m-%dT%H:%M:%f', expires_at) <= strftime('%Y-%m-%dT%H:%M:%f', ?)) "
+                            "     OR (expires_at = '' AND strftime('%Y-%m-%dT%H:%M:%f', COALESCE(NULLIF(code_received_at, ''), updated_at)) "
+                            "         <= strftime('%Y-%m-%dT%H:%M:%f', ?))) LIMIT ?",
+                            (now_iso, (now - timedelta(minutes=15)).isoformat(), rem_after_pending),
+                        )
+                    open_rows = await open_cur.fetchall()
+
+                candidate_rows = (*closed_rows, *pending_rows, *open_rows)
+                if not candidate_rows:
+                    break
+
+                seen_batch: dict[str, dict[str, Any]] = {}
+                for r in candidate_rows:
+                    oid = str(r["order_id"])
+                    if oid not in seen_batch:
+                        seen_batch[oid] = dict(r)
+                ids = list(seen_batch.keys())
+
+                # 对非终态订单（如 code_received）若尚无 resend_base_digest，先补算 HMAC 摘要再擦除明文验证码，防止后续重发误收旧码！
+                for oid, rdict in seen_batch.items():
+                    st = str(rdict.get("status") or "")
+                    if st not in CLOSED_ORDER_STATUSES:
+                        non_terminal_ids.add(oid)
+                        if not str(rdict.get("resend_base_digest") or ""):
+                            plain_lc = _decrypt_code(str(rdict.get("latest_code") or ""))
+                            if plain_lc:
+                                await raw.execute(
+                                    "UPDATE sms_orders SET resend_base_digest=? WHERE order_id=?",
+                                    (_compute_resend_digest(oid, plain_lc), oid),
+                                )
+
+                id_ph = ",".join("?" for _ in ids)
+                await raw.execute(
+                    f"UPDATE sms_orders SET latest_code='', resend_base_code='', "
+                    f"resend_base_digest=CASE WHEN status IN ({closed_ph}) THEN '' ELSE resend_base_digest END, "
+                    f"code_scrubbed=1, code_scrub_version=code_scrub_version+1, updated_at=? "
+                    f"WHERE order_id IN ({id_ph})",
+                    (*CLOSED_ORDER_STATUSES, now_iso, *ids),
                 )
-            open_rows = await open_cur.fetchall()
+                await raw.execute(
+                    f"UPDATE sms_messages SET code='', raw_text='' WHERE order_id IN ({id_ph})",
+                    tuple(ids),
+                )
+                await WebhooksRepo.scrub_for_orders_in_tx(raw, ids, now_iso)
+                v_cur = await raw.execute(
+                    f"SELECT order_id, code_scrub_version FROM sms_orders WHERE order_id IN ({id_ph})",
+                    tuple(ids),
+                )
+                for row in await v_cur.fetchall():
+                    chunk_versions[str(row["order_id"])] = int(row["code_scrub_version"] or 1)
 
-            ids = list(dict.fromkeys([str(r["order_id"]) for r in (*closed_rows, *pending_rows, *open_rows)]))
-            if not ids:
-                return {}
+            versions.update(chunk_versions)
+            if chunk_versions and on_scrub_committed is not None:
+                on_scrub_committed(chunk_versions)
+            if len(chunk_versions) < chunk_limit:
+                break
 
-            id_ph = ",".join("?" for _ in ids)
-            await raw.execute(
-                f"UPDATE sms_orders SET latest_code='', resend_base_code='', resend_base_digest='', code_scrubbed=1, "
-                f"code_scrub_version=code_scrub_version+1, updated_at=? "
-                f"WHERE order_id IN ({id_ph})",
-                (now_iso, *ids),
-            )
-            await raw.execute(
-                f"UPDATE sms_messages SET code='', raw_text='' WHERE order_id IN ({id_ph})",
-                tuple(ids),
-            )
-            await WebhooksRepo.scrub_for_orders_in_tx(raw, ids, now_iso)
-            v_cur = await raw.execute(
-                f"SELECT order_id, code_scrub_version FROM sms_orders WHERE order_id IN ({id_ph})",
-                tuple(ids),
-            )
-            for row in await v_cur.fetchall():
-                versions[str(row["order_id"])] = int(row["code_scrub_version"] or 1)
+        return versions, non_terminal_ids
+
+    async def scrub_expired_codes_with_versions(
+        self,
+        retention_hours: int,
+        *,
+        on_scrub_committed: Optional[Callable[[dict[str, int]], None]] = None,
+    ) -> dict[str, int]:
+        """独立验证码留存清理：返回 {order_id: new_version}。"""
+        versions, _ = await self.scrub_expired_codes_detailed(
+            retention_hours,
+            on_scrub_committed=on_scrub_committed,
+        )
         return versions
 
     async def scrub_expired_codes_with_ids(self, retention_hours: int) -> list[str]:
@@ -776,6 +845,7 @@ class OrdersRepo:
             SELECT
                 o.order_id, o.project_id, o.service, o.service_code, o.status, o.refund_state,
                 o.activation_id, o.code_count, o.cost, o.actual_cost, o.cost_status,
+                strftime('%Y-%m-%dT%H:%M:%f', o.created_at) AS _norm_created_utc,
                 COALESCE(NULLIF(UPPER(TRIM(o.currency)), ''), 'UNKNOWN') AS currency,
                 CASE
                     WHEN o.code_count > 0 OR EXISTS (SELECT 1 FROM sms_messages m WHERE m.order_id = o.order_id)
@@ -784,7 +854,12 @@ class OrdersRepo:
                 EXISTS (
                     SELECT 1 FROM order_activations oa
                     WHERE oa.order_id = o.order_id
-                      AND (COALESCE(oa.activation_id, '') != '' OR oa.actual_cost IS NOT NULL)
+                      AND (
+                          COALESCE(oa.activation_id, '') != ''
+                          OR oa.actual_cost IS NOT NULL
+                          OR oa.refund_amount IS NOT NULL
+                          OR oa.state IN ('completed', 'unrefundable', 'refund_confirmed')
+                      )
                 ) AS has_act_ledger
             FROM sms_orders o
             {where_ord}
@@ -797,6 +872,7 @@ class OrdersRepo:
             f"""
             SELECT
                 oa.order_id, o.project_id, o.service, o.service_code,
+                strftime('%Y-%m-%dT%H:%M:%f', o.created_at) AS _norm_created_utc,
                 oa.activation_id, oa.state, oa.actual_cost, oa.estimated_cost, oa.quoted_max_price,
                 oa.cost_status, oa.refund_amount, oa.refund_amount_status,
                 oa.currency_review_required,
@@ -819,6 +895,8 @@ class OrdersRepo:
             {"AND" if where_ord else "WHERE"} (
                 COALESCE(oa.activation_id, '') != ''
                 OR oa.actual_cost IS NOT NULL
+                OR oa.refund_amount IS NOT NULL
+                OR oa.state IN ('completed', 'unrefundable', 'refund_confirmed')
             )
             """,
             tuple(ord_params),
@@ -893,11 +971,21 @@ class OrdersRepo:
                 store[key] = bucket
             return bucket
 
+        def _finite_opt(raw_val: Any) -> Optional[float]:
+            if raw_val is None:
+                return None
+            try:
+                num = float(raw_val)
+                return num if math.isfinite(num) else None
+            except (TypeError, ValueError, OverflowError):
+                return None
+
         # 1. 有激活台账的订单：按每一次真实购买的激活明细记账
         orders_with_act_cost: set[tuple[str, str]] = {
             (str(a.get("order_id") or ""), str(a.get("activation_id") or "").strip())
             for a in activations
-            if a.get("actual_cost") is not None or (str(a.get("cost_status") or "") == "estimated" and a.get("estimated_cost") is not None)
+            if _finite_opt(a.get("actual_cost")) is not None
+            or (str(a.get("cost_status") or "") == "estimated" and _finite_opt(a.get("estimated_cost")) is not None)
         }
         merged_parent_cost: set[tuple[str, str]] = set()
 
@@ -905,8 +993,14 @@ class OrdersRepo:
             state = str(act.get("state") or "")
             act_id = str(act.get("activation_id") or "").strip()
             oid = str(act.get("order_id") or "")
-            act_cost = act.get("actual_cost")
-            if not act_id and act_cost is None:
+            act_cost = _finite_opt(act.get("actual_cost"))
+            ref_amt = _finite_opt(act.get("refund_amount"))
+            if (
+                not act_id
+                and act_cost is None
+                and ref_amt is None
+                and state not in {"completed", "unrefundable", "refund_confirmed"}
+            ):
                 continue
 
             ccy = str(act.get("currency") or "UNKNOWN")
@@ -916,7 +1010,7 @@ class OrdersRepo:
                 currency_review_count += 1
 
             c_status = str(act.get("cost_status") or "unknown")
-            est_cost = act.get("estimated_cost")
+            est_cost = _finite_opt(act.get("estimated_cost"))
             if (
                 act_cost is None
                 and c_status == "unknown"
@@ -926,18 +1020,19 @@ class OrdersRepo:
                 and (oid, act_id) not in merged_parent_cost
             ):
                 p_status = str(act.get("order_cost_status") or "unknown")
-                if p_status == "actual" and act.get("order_actual_cost") is not None:
-                    act_cost = act.get("order_actual_cost")
+                p_act = _finite_opt(act.get("order_actual_cost"))
+                p_est = _finite_opt(act.get("order_cost"))
+                if p_status == "actual" and p_act is not None:
+                    act_cost = p_act
                     c_status = "actual"
                     merged_parent_cost.add((oid, act_id))
-                elif p_status == "estimated" and act.get("order_cost") is not None:
-                    est_cost = act.get("order_cost")
+                elif p_status == "estimated" and p_est is not None:
+                    est_cost = p_est
                     c_status = "estimated"
                     merged_parent_cost.add((oid, act_id))
 
             if est_cost is None and c_status == "estimated" and act_id:
-                est_cost = act.get("quoted_max_price")
-            ref_amt = act.get("refund_amount")
+                est_cost = _finite_opt(act.get("quoted_max_price"))
             is_refunded = state == "refund_confirmed"
             has_sms = bool(act.get("order_has_sms"))
 
@@ -992,8 +1087,8 @@ class OrdersRepo:
             status = str(o.get("status") or "")
             ref = str(o.get("refund_state") or "none")
             c_status = str(o.get("cost_status") or "unknown")
-            act_cost = o.get("actual_cost")
-            est_cost = o.get("cost")
+            act_cost = _finite_opt(o.get("actual_cost"))
+            est_cost = _finite_opt(o.get("cost"))
             ccy = str(o.get("currency") or "UNKNOWN")
             has_sms = bool(o.get("has_sms"))
             is_refunded = ref == "confirmed"
@@ -1209,12 +1304,18 @@ class OrdersRepo:
             act_row_raw = await act_cur.fetchone()
             active_orders = int((dict(act_row_raw) if act_row_raw else {}).get("cnt") or 0)
 
-            today_orders, today_acts = await self._collect_financial_rows(
-                raw, since_iso=today_start_utc, project_id=project_id
+            ts_cur = await raw.execute(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%f', ?) AS norm_today",
+                (today_start_utc,),
             )
+            ts_row = await ts_cur.fetchone()
+            norm_today_ts = str((dict(ts_row) if ts_row else {}).get("norm_today") or today_start_utc)
+
             win_orders, win_acts = await self._collect_financial_rows(
                 raw, since_iso=window_start_utc, project_id=project_id
             )
+            today_orders = [o for o in win_orders if str(o.get("_norm_created_utc") or "") >= norm_today_ts]
+            today_acts = [a for a in win_acts if str(a.get("_norm_created_utc") or "") >= norm_today_ts]
 
         fx_kwargs = {
             "fx_rates": fx_rates,

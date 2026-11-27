@@ -26,6 +26,7 @@ export function ToggleSwitch({
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={label || undefined}
       disabled={disabled}
       onClick={() => {
         if (!disabled) onChange(!checked);

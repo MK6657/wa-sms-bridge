@@ -47,12 +47,18 @@ _QUERY_SECRET_PATTERNS = (
     re.compile(r"(?i)(sms_hub_session=)[^;\s,]+"),
     re.compile(r"(?i)(authorization:\s*(?:bearer|basic)\s+)[^\s,;]+"),
     re.compile(r"(?i)(x-api-key:\s*)[^\s,;]+"),
+    re.compile(r"(?i)(cookie:\s*)[^\r\n]+"),
 )
 
 _URL_EMBEDDED_CRED_PATTERN = re.compile(r"(?i)(://[^/:\s@]+:)[^@\s/]+(@)")
+_JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 
 _FULL_REDACT_FIELD_NAMES = frozenset({
     "api_key",
+    "x-api-key",
+    "authorization",
+    "cookie",
+    "sms_hub_session",
     "token",
     "password",
     "secret",
@@ -61,6 +67,8 @@ _FULL_REDACT_FIELD_NAMES = frozenset({
     "sms_code",
     "latest_code",
     "code",
+    "otp",
+    "verification_code",
     "raw_text",
     "webhook_secret",
     "challenge_data",
@@ -68,24 +76,24 @@ _FULL_REDACT_FIELD_NAMES = frozenset({
 
 _SENSITIVE_FIELD_PATTERN = re.compile(
     r"(?i)\b(?P<name>activation|activation_id|wa_account_id|verification_request_id|login_state_id|"
-    r"challenge_data|api_key|token|password|secret|secret_key|bridge_secret_key|"
-    r"sms_code|latest_code|code|raw_text|webhook_secret)=(?P<val>[^\s,;)\]}]+)"
+    r"challenge_data|api_key|x-api-key|authorization|cookie|sms_hub_session|token|password|secret|secret_key|bridge_secret_key|"
+    r"sms_code|latest_code|code|otp|verification_code|raw_text|webhook_secret)=(?P<val>[^\s,;)\]}]+)"
 )
 
 _JSON_SENSITIVE_FIELD_PATTERN = re.compile(
     r"(?i)(?P<prefix>[\"']?(?P<name>activation|activation_id|wa_account_id|verification_request_id|login_state_id|"
-    r"challenge_data|api_key|token|password|secret|secret_key|bridge_secret_key|"
-    r"sms_code|latest_code|code|raw_text|webhook_secret)[\"']?\s*:\s*)(?P<q>[\"'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"
+    r"challenge_data|api_key|x-api-key|authorization|cookie|sms_hub_session|token|password|secret|secret_key|bridge_secret_key|"
+    r"sms_code|latest_code|code|otp|verification_code|raw_text|webhook_secret)[\"']?\s*:\s*)(?P<q>[\"'])(?P<val>(?:\\.|(?!(?P=q)).)*)(?P=q)"
 )
 _JSON_NUMERIC_CODE_FIELD_PATTERN = re.compile(
-    r"(?i)(?P<prefix>[\"']?(?:sms_code|latest_code|code)[\"']?\s*:\s*)(?P<val>\d{3,10})\b"
+    r"(?i)(?P<prefix>[\"']?(?:sms_code|latest_code|code|otp|verification_code)[\"']?\s*:\s*)(?P<val>\d{3,10})\b"
 )
 _JSON_PHONE_FIELD_PATTERN = re.compile(
     r"(?i)(?P<prefix>[\"']?(?:phone|phone_number|e164_number|phone_e164|phone_raw)[\"']?\s*:\s*)(?P<q>[\"'])(?P<val>[+]?\d[\d\s().-]{6,}\d)(?P=q)"
 )
 _ACCESS_NUMBER_PATTERN = re.compile(r"(?i)(ACCESS_NUMBER:)([^:\s]+):([+]?\d[\d\s().-]{6,}\d)")
-_STATUS_OK_PATTERN = re.compile(r"(?i)(STATUS_OK:)([^\s,;]+)")
-_STATUS_WAIT_RETRY_PATTERN = re.compile(r"(?i)(STATUS_WAIT_RETRY:)([^\s,;]+)")
+_STATUS_OK_PATTERN = re.compile(r"(?i)(STATUS_OK:)([^\r\n]+)")
+_STATUS_WAIT_RETRY_PATTERN = re.compile(r"(?i)(STATUS_WAIT_RETRY:)([^\r\n]+)")
 _PROJECT_KEY_PATTERN = re.compile(r"\bsms_k_[A-Za-z0-9_-]{8,}\b")
 _ACTIVATION_WORD_PATTERN = re.compile(r"(?i)\b(activation)\s+([A-Za-z0-9_.:-]{6,})")
 _PHONE_FIELD_PATTERN = re.compile(r"(?i)\b(phone|phone_number|e164_number|phone_e164|phone_raw)=([+]?\d[\d\s().-]{6,}\d)")
@@ -104,6 +112,7 @@ def redact_text(value: Any) -> str:
     for pattern in _QUERY_SECRET_PATTERNS:
         text = pattern.sub(r"\1***", text)
 
+    text = _JWT_PATTERN.sub("***", text)
     text = _PROJECT_KEY_PATTERN.sub(lambda m: mask_identifier(m.group(0)), text)
     text = _STATUS_OK_PATTERN.sub(r"\1***", text)
     text = _STATUS_WAIT_RETRY_PATTERN.sub(r"\1***", text)

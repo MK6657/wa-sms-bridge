@@ -250,31 +250,34 @@ class DatabaseConnection:
         else:
             # 内存库或迁移期回退：与写锁互斥，保证看不到未提交的写事务中间态
             async with self._write_lock:
-                yield self.raw
+                conn = await self._ensure_clean_write_conn_locked()
+                yield conn
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> Optional[dict[str, Any]]:
         if self._read_enabled and not _is_memory_path(self.db_path):
             async with self._read_lock:
                 rconn = await self._ensure_read_conn_locked()
-                cursor = await rconn.execute(sql, params)
+                async with rconn.execute(sql, params) as cursor:
+                    row = await cursor.fetchone()
+                    return dict(row) if row is not None else None
+        async with self._write_lock:
+            conn = await self._ensure_clean_write_conn_locked()
+            async with conn.execute(sql, params) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row is not None else None
-        async with self._write_lock:
-            cursor = await self.raw.execute(sql, params)
-            row = await cursor.fetchone()
-            return dict(row) if row is not None else None
 
     async def fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         if self._read_enabled and not _is_memory_path(self.db_path):
             async with self._read_lock:
                 rconn = await self._ensure_read_conn_locked()
-                cursor = await rconn.execute(sql, params)
+                async with rconn.execute(sql, params) as cursor:
+                    rows = await cursor.fetchall()
+                    return [dict(r) for r in rows]
+        async with self._write_lock:
+            conn = await self._ensure_clean_write_conn_locked()
+            async with conn.execute(sql, params) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
-        async with self._write_lock:
-            cursor = await self.raw.execute(sql, params)
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
 
     async def _ensure_clean_write_conn_locked(self) -> aiosqlite.Connection:
         conn = self.raw
@@ -326,8 +329,8 @@ class DatabaseConnection:
         """Atomic multi-statement write transaction with cancellation-safe rollback."""
         async with self._write_lock:
             conn = await self._ensure_clean_write_conn_locked()
-            await conn.execute("BEGIN IMMEDIATE")
             try:
+                await conn.execute("BEGIN IMMEDIATE")
                 yield conn
                 await conn.commit()
             except BaseException:

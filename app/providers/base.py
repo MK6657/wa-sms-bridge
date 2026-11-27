@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -138,8 +139,11 @@ def parse_cancel_outcome(raw_result: Any) -> CancelOutcome:
     if any(token in normalized for token in ("ACCESS_ACTIVATION", "ACCESS_READY", "COMPLETED", "FINISH")) or normalized == "READY":
         return CancelOutcome(settled=True, status="already_completed", retryable=False, raw=text, refund_confirmed=False)
 
-    # 上游告知激活不存在或已过期（无法确认退款）
-    if any(token in normalized for token in ("NO_ACTIVATION", "EXPIRED", "NOT_FOUND")):
+    # 上游告知激活不存在、已过期或不可重试的致命参数/凭据错误（无法确认退款，也不再死循环重试）
+    if any(
+        token in normalized
+        for token in ("NO_ACTIVATION", "EXPIRED", "NOT_FOUND", "WRONG_ACTIVATION_ID", "BAD_KEY", "BAD_ACTION", "BANNED")
+    ):
         return CancelOutcome(settled=True, status="not_found_or_expired", retryable=False, raw=text, refund_confirmed=False)
 
     # 冷却期拒绝或暂态冲突，可后续重试
@@ -149,11 +153,14 @@ def parse_cancel_outcome(raw_result: Any) -> CancelOutcome:
     return CancelOutcome(settled=False, status="unknown_response", retryable=True, raw=text, refund_confirmed=False)
 
 
-_GOOGLE_OTP_RE = re.compile(r"(?i)\bg-\s*(\d{4,8})\b")
-_WEBOTP_RE = re.compile(r"(?m)@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\s+#(\d{4,8})\b")
-_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_GOOGLE_OTP_RE = re.compile(r"(?i)(?<![A-Za-z0-9/_-])g-\s*(\d{4,8})\b")
+_WEBOTP_RE = re.compile(r"(?m)@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\s+#(\d{2,4}-\d{2,4}|\d{4,8})(?![A-Za-z0-9-])")
+_URL_RE = re.compile(
+    r"(?:https?://\S+|(?<!@)\b[A-Za-z0-9-]+(?:\.[A-Za-z]{2,})+/[^\s<>\"')]+)",
+    re.IGNORECASE,
+)
 _E164_PHONE_RE = re.compile(r"(?<!\d)\+\d{8,15}\b")
-_FORMATTED_PHONE_RE = re.compile(r"(?<!\d)\+?\d{1,3}(?:[\t ()-]+\d{2,4}){2,4}(?!\d)")
+_FORMATTED_PHONE_RE = re.compile(r"(?<!\d)\+?\d{1,3}(?:[\t .-]+\d{2,4}|\(\d{2,4}\)){2,4}(?!\d)")
 _ISO_DATE_RE = re.compile(r"\b(?:19|20)\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\b")
 _CLOCK_TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b")
 _APP_HASH_TAIL_RE = re.compile(r"(?m)(?:^|\s)(?=[A-Za-z0-9+/]{11}\s*$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9+/]{11}\s*$")
@@ -162,43 +169,55 @@ _OTP_KEYWORDS = (
     r"|验证码|驗證碼|校验码|校驗碼|动态码|動態碼|确认码|確認碼|安全码|安全碼|认证码|認證碼|登录码|登錄碼|提取码|代码|代碼"
     r"|コード|코드|код|รหัส)"
 )
+_OTP_TOKEN_PATTERN = (
+    r"(?:\d{3}(?:[-\t ]+|\s+and\s+)\d{3}|\d{2}[-\t ]\d{2}[-\t ]\d{2}|\d{3,4}[-\t ]\d{3,4}|\d{4,8})"
+)
 _KEYWORD_FWD_OTP_RE = re.compile(
-    rf"(?i){_OTP_KEYWORDS}[^\d\n]{{0,24}}?(\d{{3}}(?:[-\t ]+|\s+and\s+)\d{{3}}|\d{{3,4}}[-\t ]\d{{3,4}}|\d{{4,8}})(?!\d)"
+    rf"(?i){_OTP_KEYWORDS}[^\d\n]{{0,24}}?({_OTP_TOKEN_PATTERN})(?!\d)"
 )
 _KEYWORD_REV_OTP_RE = re.compile(
-    rf"(?i)(?<!\d)(\d{{3,4}}[-\t ]\d{{3,4}}|\d{{4,8}})(?!\d)[^\d\n]{{0,24}}?(?:(?<![A-Za-z])(?:is\s+your|for\s+your)(?![A-Za-z])|{_OTP_KEYWORDS})"
+    rf"(?i)(?<!\d)({_OTP_TOKEN_PATTERN})(?!\d)[^\d\n]{{0,24}}?(?:(?<![A-Za-z])(?:is\s+your|for\s+your)(?![A-Za-z])|{_OTP_KEYWORDS})"
 )
 _HYPHEN_OTP_RE = re.compile(r"(?<![A-Za-z0-9-])(\d{3,4}-\d{3,4})(?![A-Za-z0-9-])")
 _STANDALONE_OTP_RE = re.compile(
-    r"(?<![A-Za-z0-9])(\d{4,8})(?![A-Za-z0-9])"
+    r"(?<![A-Za-z0-9._/-])(\d{4,8})(?![A-Za-z0-9._/-])"
     r"(?!\s*(?:(?:min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours|day|days|usd|rub|eur)\b|分钟|分|秒钟|秒|小时|天|年|元))",
     re.IGNORECASE,
 )
 
 
+def _strip_long_formatted_phones(text: str) -> str:
+    def _repl(m: re.Match[str]) -> str:
+        digits = re.sub(r"\D", "", m.group(0))
+        return " " if len(digits) >= 9 else m.group(0)
+
+    return _FORMATTED_PHONE_RE.sub(_repl, text)
+
+
 def extract_otp_code(raw: Any) -> str:
-    """从上游短信文本或预解析码串中精准提取单个验证码，避免把有效分钟数、发送方号码或应用签名哈希拼入验证码。"""
-    text = str(raw or "").strip()[:4096]
+    """从上游短信文本或预解析码串中精准提取单个验证码，避免把有效分钟数、URL 路径、发送方号码或应用签名哈希拼入验证码。"""
+    text = html.unescape(str(raw or "")).strip()[:4096]
     if not text:
         return ""
-    if re.fullmatch(r"\d{3,8}|\d{3,4}[-\t ]\d{3,4}", text):
+    if re.fullmatch(r"\d{3,8}|\d{3,4}[-\t ]\d{3,4}|\d{2}[-\t ]\d{2}[-\t ]\d{2}", text):
         return re.sub(r"\D", "", text)
 
     m_webotp = _WEBOTP_RE.search(text)
     if m_webotp:
-        return m_webotp.group(1)
+        return re.sub(r"\D", "", m_webotp.group(1))
 
-    m_google = _GOOGLE_OTP_RE.search(text)
-    if m_google:
-        return m_google.group(1)
-
+    # 先剔除 URL、国际长号码、日期时间与尾部 11 位签名哈希，防止 URL 路径如 /g-999999 抢占验证码
     cleaned = _URL_RE.sub(" ", text)
     cleaned = _E164_PHONE_RE.sub(" ", cleaned)
     cleaned = _ISO_DATE_RE.sub(" ", cleaned)
     cleaned = _CLOCK_TIME_RE.sub(" ", cleaned)
-    cleaned = _FORMATTED_PHONE_RE.sub(" ", cleaned)
     cleaned = _APP_HASH_TAIL_RE.sub(" ", cleaned)
 
+    m_google = _GOOGLE_OTP_RE.search(cleaned)
+    if m_google:
+        return m_google.group(1)
+
+    # 先执行紧邻验证码关键词的正/反向提取，避免 "Code: 123-456 (valid 10 min)" 被格式化电话正则误吞
     m_fwd = _KEYWORD_FWD_OTP_RE.search(cleaned)
     if m_fwd:
         return re.sub(r"\D", "", m_fwd.group(1))
@@ -206,6 +225,8 @@ def extract_otp_code(raw: Any) -> str:
     m_rev = _KEYWORD_REV_OTP_RE.search(cleaned)
     if m_rev:
         return re.sub(r"\D", "", m_rev.group(1))
+
+    cleaned = _strip_long_formatted_phones(cleaned)
 
     m_hyph = _HYPHEN_OTP_RE.search(cleaned)
     if m_hyph:
@@ -231,6 +252,8 @@ def parse_complete_outcome(raw_result: Any) -> ActionOutcome:
     """严格校验完成激活（status=6）上游应答。"""
     text = str(raw_result or "").strip()
     normalized = text.upper()
+    if any(neg in normalized for neg in ("NOT_FINISH", "UNFINISH", "NOT_COMPLETE", "INCOMPLETE")):
+        return ActionOutcome(ok=False, status="rejected", retryable=False, raw=text)
     if any(token in normalized for token in ("ACCESS_ACTIVATION", "ACCESS_READY", "COMPLETED", "FINISHED", "FINISH")) or normalized == "OK":
         return ActionOutcome(ok=True, status="completed", retryable=False, raw=text)
     if any(token in normalized for token in ("ERROR_SQL", "SQL_ERROR", "INTERNAL_ERROR")):

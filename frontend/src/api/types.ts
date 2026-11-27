@@ -38,6 +38,7 @@ export interface ProviderDescriptor {
     supports_resend: boolean;
     supports_price_lock: boolean;
     supports_custom_service: boolean;
+    supports_exact_price_lock?: boolean;
   };
   note: string;
 }
@@ -121,9 +122,12 @@ export interface SmsOrder {
   settlement_state?: string;
   refund_state?: string;
   latest_code: string;
+  code_received_at?: string;
   code_scrubbed: boolean;
+  code_scrub_version?: number;
   code_count: number;
   max_price: number | null;
+  quoted_max_price?: number | null;
   cost: number | null;
   actual_cost?: number | null;
   cost_status?: string;
@@ -331,6 +335,8 @@ export interface ReconciliationActivationItem {
   state: string;
   actual_cost: number | null;
   estimated_cost: number | null;
+  quoted_max_price?: number | null;
+  refund_amount?: number | null;
   currency: string;
   currency_review_required?: boolean | number;
   last_error: string;

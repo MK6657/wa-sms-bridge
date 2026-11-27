@@ -247,6 +247,18 @@ class OrderService:
             self._idem_locks[key] = entry
         return entry
 
+    _INTERNAL_ORDER_FIELDS = frozenset({
+        "resend_base_code",
+        "resend_base_digest",
+        "request_hash",
+        "request_hash_version",
+        "country_input",
+        "idempotency_http_status",
+        "idempotency_retryable",
+        "idempotency_error_code",
+        "idempotency_error_message",
+    })
+
     def _emit(
         self,
         event: str,
@@ -255,7 +267,7 @@ class OrderService:
         *,
         code_scrub_version: Optional[int] = None,
     ) -> None:
-        payload = dict(order)
+        payload = {k: v for k, v in order.items() if k not in self._INTERNAL_ORDER_FIELDS}
         if extra:
             payload.update(extra)
         eff_ver = code_scrub_version
@@ -348,6 +360,13 @@ class OrderService:
             fields["completed_at"] = _utc_now().isoformat()
 
         scrub_versions: dict[str, int] = {}
+        scrub_notified = False
+
+        def _on_scrub(vers: dict[str, int]) -> None:
+            nonlocal scrub_notified
+            scrub_notified = True
+            self.on_orders_scrubbed(list(vers.keys()), scrub_versions=vers)
+
         updated = await self._db.orders.transition_status(
             order_id,
             expected_statuses=expected_statuses,
@@ -356,10 +375,11 @@ class OrderService:
             tx_hook=activation_tx_hook,
             scrub_in_tx=do_scrub,
             scrub_result=scrub_versions,
+            on_scrub_committed=_on_scrub,
             **fields,
         )
         if updated is not None:
-            if scrub_versions:
+            if scrub_versions and not scrub_notified:
                 self.on_orders_scrubbed(list(scrub_versions.keys()), scrub_versions=scrub_versions)
             if outbox is not None:
                 self._notify_outbox()
@@ -368,9 +388,20 @@ class OrderService:
 
     async def scrub_order_code(self, order_id: str) -> bool:
         """脱敏清理单笔订单的验证码，原子递增脱敏版本并同步清空数据库、Webhook Outbox、在途投递与 SSE 全视图（修复 v6 复核 P0-01）。"""
-        new_version = await self._db.orders.scrub_order_code_with_version(order_id)
+        scrub_notified = False
+
+        def _on_scrub(vers: dict[str, int]) -> None:
+            nonlocal scrub_notified
+            scrub_notified = True
+            self.on_orders_scrubbed(list(vers.keys()), scrub_versions=vers)
+
+        new_version = await self._db.orders.scrub_order_code_with_version(
+            order_id,
+            on_scrub_committed=_on_scrub,
+        )
         if new_version is not None:
-            self.on_orders_scrubbed([order_id], scrub_versions={order_id: new_version})
+            if not scrub_notified:
+                self.on_orders_scrubbed([order_id], scrub_versions={order_id: new_version})
             refreshed = await self._db.orders.get(order_id, include_messages=True, include_activations=True)
             if refreshed is not None:
                 self._emit("order.status_changed", refreshed, code_scrub_version=new_version)
@@ -651,7 +682,9 @@ class OrderService:
             return replay_order
 
         status = str(existing.get("status") or "")
-        if saved_http >= 400 or (saved_http == 0 and status == "failed"):
+        if saved_http >= 400 or (
+            saved_http == 0 and status in {"failed", "cancelling", "cancelled", "expired", "compensation_pending"}
+        ):
             raw_idem_code = str(existing.get("idempotency_error_code") or "")
             raw_cur_code = str(existing.get("error_code") or "")
             non_acquire_codes = {
@@ -670,13 +703,20 @@ class OrderService:
             if raw_idem_code:
                 err_code = raw_idem_code
                 err_msg = str(existing.get("idempotency_error_message") or existing.get("error_message") or "取号失败")
+            elif status in {"cancelling", "cancelled", "expired", "compensation_pending"} and not existing.get("phone_e164"):
+                err_code = raw_cur_code or "USER_CANCELLED"
+                err_msg = str(existing.get("error_message") or "取号过程中订单已被取消")
             elif raw_cur_code and raw_cur_code not in non_acquire_codes:
                 err_code = raw_cur_code
                 err_msg = str(existing.get("error_message") or "取号失败")
             else:
                 err_code = "HISTORICAL_ACQUIRE_ERROR"
                 err_msg = "历史订单初次取号失败（后续已变更状态，请查询订单获取最新结果）"
-            http_status = saved_http if saved_http >= 400 else self._error_status_for_code(err_code)
+            http_status = (
+                saved_http
+                if saved_http >= 400
+                else (409 if err_code == "USER_CANCELLED" else self._error_status_for_code(err_code))
+            )
             raise AppError(
                 err_msg,
                 status_code=http_status,
@@ -820,38 +860,47 @@ class OrderService:
                     continue
 
             new_order_id = f"ord_{_utc_now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:6]}"
-
-            # 原子占位：同项目同幂等键只会由一个协程成功占位并执行购买，其他并发请求安全复用结果！
-            reserved_order, created_new = await self._db.orders.reserve(
-                order_id=new_order_id,
-                provider=provider_key,
-                service=canonical,
-                service_code=service_code,
-                country_id=str(cid),
-                country_input=str(country).strip(),
-                country_label=clabel,
-                project_id=pid,
-                external_ref=external_ref,
-                idempotency_key=clean_idem,
-                request_hash=req_hash_v2,
-                request_hash_version=2,
-                idempotency_http_status=202 if is_async else 0,
-                async_acquire=is_async,
-                max_price=max_price,
-                wait_timeout=max(30, min(int(wait_timeout), 1200)),
-                webhook_url=final_webhook,
-                metadata=metadata,
-                status="acquiring",
-            )
+            # 先注册 _acquire_waiters 再执行 reserve，确保快速路径并发幂等查询拿到已插入行时必定能等待取号结果！
+            w = asyncio.Event()
+            self._acquire_waiters[new_order_id] = w
+            try:
+                reserved_order, created_new = await self._db.orders.reserve(
+                    order_id=new_order_id,
+                    provider=provider_key,
+                    service=canonical,
+                    service_code=service_code,
+                    country_id=str(cid),
+                    country_input=str(country).strip(),
+                    country_label=clabel,
+                    project_id=pid,
+                    external_ref=external_ref,
+                    idempotency_key=clean_idem,
+                    request_hash=req_hash_v2,
+                    request_hash_version=2,
+                    idempotency_http_status=202 if is_async else 0,
+                    async_acquire=is_async,
+                    max_price=max_price,
+                    wait_timeout=max(30, min(int(wait_timeout), 1200)),
+                    webhook_url=final_webhook,
+                    metadata=metadata,
+                    status="acquiring",
+                )
+            except BaseException:
+                self._acquire_waiters.pop(new_order_id, None)
+                w.set()
+                raise
             if not created_new:
+                self._acquire_waiters.pop(new_order_id, None)
+                w.set()
                 return reserved_order, None, False
 
             oid = str(reserved_order["order_id"])
+            if oid != new_order_id:
+                self._acquire_waiters.pop(new_order_id, None)
+                self._acquire_waiters[oid] = w
             self._emit("order.created", reserved_order)
 
             # 补充 P1-01: 同步与异步下单统一交由受管任务执行；客户端断开仅结束等待，任务仍完成落库或补偿交接！
-            w = asyncio.Event()
-            self._acquire_waiters[oid] = w
             self._active_acquiring_orders.add(oid)
             task = asyncio.create_task(
                 self._managed_acquire_and_poll(
@@ -915,6 +964,7 @@ class OrderService:
         refreshed = await self._db.orders.get(order_id, include_messages=True, include_activations=True)
         if refreshed is not None:
             saved_http = int(refreshed.get("idempotency_http_status") or 0)
+            ref_status = str(refreshed.get("status") or "")
             if saved_http >= 400:
                 err_code = str(refreshed.get("idempotency_error_code") or refreshed.get("error_code") or "ORDER_FAILED")
                 err_msg = str(refreshed.get("idempotency_error_message") or refreshed.get("error_message") or "取号失败")
@@ -923,6 +973,16 @@ class OrderService:
                     status_code=saved_http,
                     code=err_code,
                     retryable=bool(refreshed.get("idempotency_retryable")),
+                    details={"order_id": order_id},
+                )
+            if saved_http == 0 and ref_status in {"cancelling", "cancelled", "expired", "compensation_pending", "failed"}:
+                err_code = str(refreshed.get("error_code") or ("ORDER_FAILED" if ref_status == "failed" else "USER_CANCELLED"))
+                err_msg = str(refreshed.get("error_message") or ("取号失败" if ref_status == "failed" else "取号过程中订单已被取消"))
+                raise AppError(
+                    err_msg,
+                    status_code=502 if ref_status == "failed" else 409,
+                    code=err_code,
+                    retryable=False,
                     details={"order_id": order_id},
                 )
             return refreshed
@@ -1123,8 +1183,23 @@ class OrderService:
         terminal_refund_state = "none"
         terminal_settlement_state = "none"
         price_exceeded_pending = False
+        fatal_provider_error = False
+        reusable_intent_row_id: Optional[int] = None
+        last_attempt_emit_mono = 0.0
+        prev_cid_str: Optional[str] = None
+        loop = asyncio.get_running_loop()
+        poll_deadline = (
+            loop.time() + min(3600.0, max(float(wait_timeout) * 4.0, 600.0))
+            if opts.continuous_poll
+            else None
+        )
 
         while opts.continuous_poll or attempts_used < max_attempts:
+            if poll_deadline is not None and attempts_used > 0 and loop.time() >= poll_deadline:
+                last_error_code = "NO_NUMBERS"
+                last_error_msg = "持续轮询抢号已达最大运行时限，自动停止"
+                break
+
             # 确认订单尚未被并发取消
             cur_state = await self._db.orders.get(order_id, include_messages=False)
             if not cur_state or cur_state["status"] != "acquiring":
@@ -1135,15 +1210,26 @@ class OrderService:
             attempts_used += 1
             activation: Optional[Activation] = None
             act_row_id: Optional[int] = None
+            cid_str = str(cid)
 
             upd_attempt = await self._db.orders.update(
                 order_id,
-                country_id=str(cid),
+                country_id=cid_str,
                 country_label=clabel,
                 attempts_used=attempts_used,
+                include_messages=False,
+                include_activations=False,
             )
+            now_mono = loop.time()
             if upd_attempt is not None and attempts_used > 1:
-                self._emit("order.status_changed", upd_attempt)
+                if (
+                    not opts.continuous_poll
+                    or cid_str != prev_cid_str
+                    or (now_mono - last_attempt_emit_mono) >= 2.0
+                ):
+                    self._emit("order.status_changed", upd_attempt)
+                    last_attempt_emit_mono = now_mono
+            prev_cid_str = cid_str
 
             try:
                 if opts.price_lock and opts.target_price is not None:
@@ -1152,15 +1238,17 @@ class OrderService:
                     if not available:
                         raise NoNumbersError(f"锁定价格档位 ${opts.target_price} 暂无库存 (stock={stock})")
 
-                # P1-03: 购买前先持久化购买意图
+                # P1-03: 购买前先持久化购买意图（连续无号尝试安全原地复用同一未购买意图行，杜绝无限膨胀）
                 act_row_id = await self._db.activations.record_intent(
                     order_id=order_id,
                     attempt_no=attempts_used,
                     provider=provider_key,
-                    country_id=str(cid),
+                    country_id=cid_str,
                     service_code=service_code,
                     quoted_max_price=max_price,
+                    reuse_unpurchased_row_id=reusable_intent_row_id,
                 )
+                reusable_intent_row_id = None
 
                 activation = await provider.request_number(cid, service_code, max_price)
 
@@ -1196,7 +1284,7 @@ class OrderService:
                 except asyncio.CancelledError:
                     raise
                 except Exception as bind_exc:
-                    # 买号已成功但本地写库失败：立刻尝试上游止损取消并尽力记录对账证据，绝不静默丢弃 activation_id！
+                    # 买号已成功但本地写库失败：立刻尝试上游止损取消并持久化 activation_id 补偿证据，绝不丢弃激活句柄！
                     logger.error(
                         "[%s] 买号成功 (aid=%s) 但绑定落库失败，尝试立即上游止损取消: %s",
                         order_id,
@@ -1208,17 +1296,43 @@ class OrderService:
                         best_state = (
                             "refund_confirmed"
                             if cancel_out.refund_confirmed
-                            else ("unrefundable" if cancel_out.settled else "uncertain_purchase")
+                            else ("refund_pending" if cancel_out.retryable else "unrefundable")
                         )
+                        try:
+                            await self._db.activations.ensure_activation_state(
+                                order_id,
+                                activation.activation_id,
+                                provider=provider_key,
+                                state=best_state,
+                                last_error=f"绑定落库失败 ({bind_exc})，止损取消结果={cancel_out.status}",
+                                country_id=cid_str,
+                                service_code=service_code,
+                                currency=currency,
+                            )
+                        except Exception:
+                            pass
                         try:
                             await self._db.activations.update_state(
                                 act_row_id,
-                                state=best_state,
+                                state=best_state if cancel_out.refund_confirmed or cancel_out.settled else "uncertain_purchase",
                                 last_error=f"绑定落库失败 ({bind_exc})，止损取消结果={cancel_out.status}",
                             )
                         except Exception:
                             pass
                     except Exception:
+                        try:
+                            await self._db.activations.ensure_activation_state(
+                                order_id,
+                                activation.activation_id,
+                                provider=provider_key,
+                                state="refund_pending",
+                                last_error=f"绑定落库失败且止损取消异常: {bind_exc}",
+                                country_id=cid_str,
+                                service_code=service_code,
+                                currency=currency,
+                            )
+                        except Exception:
+                            pass
                         try:
                             await self._db.activations.update_state(
                                 act_row_id,
@@ -1233,8 +1347,22 @@ class OrderService:
                         self._inflight_binds.pop(order_id, None)
 
                 if not bound_ok:
-                    # 购买意图行在取号期间已被并发取消或人工核销：立即补偿取消上游刚分配的激活
-                    await self._provider_cancel(provider, activation.activation_id)
+                    # 购买意图行在取号期间已被并发取消或人工核销：立即补偿取消上游刚分配的激活，若遇冷却拒绝则持久化待补偿！
+                    cancel_out = await self._provider_cancel(provider, activation.activation_id)
+                    if not cancel_out.refund_confirmed:
+                        try:
+                            await self._db.activations.ensure_activation_state(
+                                order_id,
+                                activation.activation_id,
+                                provider=provider_key,
+                                state="refund_pending" if cancel_out.retryable else "unrefundable",
+                                last_error=f"并发取消后补偿结果={cancel_out.raw or cancel_out.status}",
+                                country_id=cid_str,
+                                service_code=service_code,
+                                currency=currency,
+                            )
+                        except Exception:
+                            logger.warning("[%s] 并发取消后记录激活补偿台账失败", order_id, exc_info=True)
                     return None
 
                 # 复核 P1-03: 对支持精确成交价回报的平台，校验成交价未越过锁定目标价
@@ -1456,6 +1584,7 @@ class OrderService:
             except NoNumbersError as exc:
                 if act_row_id is not None:
                     await self._db.activations.update_state(act_row_id, state="no_numbers", last_error=str(exc))
+                    reusable_intent_row_id = act_row_id
                 last_error_code = "NO_NUMBERS"
                 last_error_msg = str(exc)
                 if sleep_seconds > 0:
@@ -1464,6 +1593,20 @@ class OrderService:
             except SmsProviderError as exc:
                 last_error_code = "PROVIDER_ERROR"
                 last_error_msg = str(exc)
+                upper_err = last_error_msg.upper()
+                is_fatal_err = any(
+                    tok in upper_err
+                    for tok in (
+                        "BAD_KEY",
+                        "BAD_SERVICE",
+                        "BAD_ACTION",
+                        "BANNED",
+                        "WRONG_ACTIVATION_ID",
+                        "API KEY 未配置",
+                        "鉴权失败",
+                        "无效的",
+                    )
+                )
                 if activation is not None and act_row_id is not None:
                     cancel_outcome = await self._provider_cancel(provider, activation.activation_id)
                     act_cost_tmp = None if activation.price_is_estimated else activation.price
@@ -1490,6 +1633,8 @@ class OrderService:
                             actual_cost=None,
                             cost_status="unknown",
                             cost_is_estimated=False,
+                            include_messages=False,
+                            include_activations=False,
                         )
                     elif cancel_outcome.retryable:
                         await self._db.activations.update_state(
@@ -1510,13 +1655,19 @@ class OrderService:
                         break
                 elif act_row_id is not None:
                     await self._db.activations.update_state(act_row_id, state="failed", last_error=str(exc))
+                    reusable_intent_row_id = act_row_id
+                if is_fatal_err:
+                    fatal_provider_error = True
+                    break
                 if not opts.continuous_poll and attempts_used >= max_attempts:
                     break
                 await asyncio.sleep(max(1.0, sleep_seconds))
                 continue
 
         fail_http_status = self._error_status_for_code(last_error_code)
-        fail_retryable = last_error_code in {"NO_NUMBERS", "BLACKLISTED", "PROVIDER_ERROR"}
+        fail_retryable = (last_error_code in {"NO_NUMBERS", "BLACKLISTED"}) or (
+            last_error_code == "PROVIDER_ERROR" and not fatal_provider_error
+        )
         cur_state = await self._db.orders.get(order_id, include_messages=False)
         idem_fail_kw: dict[str, Any] = {} if is_async else {
             "idempotency_http_status": fail_http_status,
@@ -1997,8 +2148,7 @@ class OrderService:
                                 else:
                                     base_digest = str(order.get("resend_base_digest") or "")
                                     if base_digest:
-                                        cand_digest = env.hmac_digest(f"resend:{order_id}", code)
-                                        matches_old = hmac.compare_digest(cand_digest, base_digest)
+                                        matches_old = env.verify_hmac_digest(f"resend:{order_id}", code, base_digest)
                                         is_new_code = (
                                             (seen_wait_since_resend or not matches_old)
                                             and code not in ignored_scrubbed_codes
@@ -2423,37 +2573,41 @@ class OrderService:
             if not getattr(provider.capabilities, "supports_resend", False):
                 raise AppError(f"平台 {order['provider']} 不支持请求重发短信", status_code=400, code="RESEND_UNSUPPORTED")
 
-            outcome = await self._provider_resend(provider, order["activation_id"])
-            if not outcome.ok:
-                raise UpstreamError(
-                    f"上游拒绝或重发失败 ({outcome.status}): {outcome.raw}",
-                    code="RESEND_FAILED",
-                    retryable=outcome.retryable,
-                )
+            async def _exec_resend() -> dict[str, Any]:
+                outcome = await self._provider_resend(provider, order["activation_id"])
+                if not outcome.ok:
+                    raise UpstreamError(
+                        f"上游拒绝或重发失败 ({outcome.status}): {outcome.raw}",
+                        code="RESEND_FAILED",
+                        retryable=outcome.retryable,
+                    )
 
-            previous_code = str(order.get("latest_code") or "")
-            base_digest = (
-                env.hmac_digest(f"resend:{order_id}", previous_code)
-                if previous_code
-                else str(order.get("resend_base_digest") or "")
-            )
-            expires_at = (_utc_now() + timedelta(seconds=int(order.get("wait_timeout") or 180))).isoformat()
-            updated = await self._db.orders.transition_status(
-                order_id,
-                expected_statuses=("code_received",),
-                new_status="waiting_next_code",
-                expires_at=expires_at,
-                resend_base_code=previous_code,
-                resend_base_digest=base_digest,
-                resend_seen_wait=False,
-                error_code="",
-                error_message="",
-            )
-            if updated is None:
-                raise ConflictError("订单状态已变化，无法重发短信", code="ORDER_INVALID_STATE")
-            self._emit("order.status_changed", updated)
-            self._start_code_poller(order_id, previous_code=previous_code, initial_seen_wait=False)
-            return updated
+                previous_code = str(order.get("latest_code") or "")
+                base_digest = (
+                    env.hmac_digest(f"resend:{order_id}", previous_code)
+                    if previous_code
+                    else str(order.get("resend_base_digest") or "")
+                )
+                expires_at = (_utc_now() + timedelta(seconds=int(order.get("wait_timeout") or 180))).isoformat()
+                updated = await self._db.orders.transition_status(
+                    order_id,
+                    expected_statuses=("code_received",),
+                    new_status="waiting_next_code",
+                    expires_at=expires_at,
+                    resend_base_code=previous_code,
+                    resend_base_digest=base_digest,
+                    resend_seen_wait=False,
+                    error_code="",
+                    error_message="",
+                )
+                if updated is None:
+                    raise ConflictError("订单状态已变化，无法重发短信", code="ORDER_INVALID_STATE")
+                self._emit("order.status_changed", updated)
+                self._start_code_poller(order_id, previous_code=previous_code, initial_seen_wait=False)
+                return updated
+
+            resend_task = asyncio.create_task(_exec_resend())
+            return await asyncio.shield(resend_task)
 
     async def complete_order(self, order_id: str) -> dict[str, Any]:
         """CAS 互斥完成订单：先校验平台启用再认领 completing，单事务原子提交终态/激活/即刻脱敏与 Outbox（修复 P1-04 & 审查 Finding 2/6）。"""
@@ -2470,98 +2624,103 @@ class OrderService:
                 )
 
             prev_status = str(order["status"])
-            claimed = await self._db.orders.transition_status(
-                order_id,
-                expected_statuses=("code_received", "waiting_code", "waiting_next_code"),
-                new_status="completing",
-                settlement_state="completing",
-            )
-            if claimed is None:
-                latest = await self.get_order(order_id)
-                if latest["status"] == "completed":
-                    return latest
-                raise ConflictError(
-                    f"订单当前状态为 '{latest['status']}'，无法标记完成（可能正在取消或已结束）",
-                    code="ORDER_INVALID_STATE",
+
+            async def _exec_complete() -> dict[str, Any]:
+                claimed = await self._db.orders.transition_status(
+                    order_id,
+                    expected_statuses=("code_received", "waiting_code", "waiting_next_code"),
+                    new_status="completing",
+                    settlement_state="completing",
                 )
-
-            bg = self._cancel_bg_task(order_id)
-            if bg is not None:
-                await asyncio.gather(bg, return_exceptions=True)
-
-            activation_id = str(claimed.get("activation_id") or "")
-            if activation_id:
-                try:
-                    provider = self._registry.get(claimed["provider"])
-                except ValueError as exc:
-                    rolled_back = await self._db.orders.transition_status(
-                        order_id,
-                        expected_statuses=("completing",),
-                        new_status=prev_status,
-                        settlement_state="none",
-                    )
-                    if rolled_back:
-                        self._emit("order.status_changed", rolled_back)
-                    raise AppError(str(exc), status_code=400, code="PROVIDER_NOT_ACTIVE") from exc
-                outcome = await self._provider_complete(provider, activation_id)
-                if not outcome.ok:
-                    # 上游报错或拒绝：回滚至先前可恢复状态，记录 settlement_state='complete_failed' 并显式抛错！
-                    rolled_back = await self._db.orders.transition_status(
-                        order_id,
-                        expected_statuses=("completing",),
-                        new_status=prev_status,
-                        settlement_state="complete_failed",
-                        error_code="COMPLETE_FAILED",
-                        error_message=f"上游完成确认失败 ({outcome.status}): {outcome.raw}",
-                    )
-                    if rolled_back:
-                        self._emit("order.status_changed", rolled_back)
-                    if prev_status in {"waiting_code", "waiting_next_code"}:
-                        prev_code = (
-                            str(claimed.get("resend_base_code") or "")
-                            if (prev_status == "waiting_next_code" and not claimed.get("code_scrubbed"))
-                            else ""
-                        )
-                        seen_wait = bool(claimed.get("resend_seen_wait")) if prev_status == "waiting_next_code" else True
-                        self._start_code_poller(
-                            order_id,
-                            previous_code=prev_code,
-                            initial_seen_wait=seen_wait,
-                        )
-                    raise UpstreamError(
-                        f"确认完成失败，上游返回异常 ({outcome.status}): {outcome.raw}",
-                        code="COMPLETE_FAILED",
-                        retryable=outcome.retryable,
+                if claimed is None:
+                    latest = await self.get_order(order_id)
+                    if latest["status"] == "completed":
+                        return latest
+                    raise ConflictError(
+                        f"订单当前状态为 '{latest['status']}'，无法标记完成（可能正在取消或已结束）",
+                        code="ORDER_INVALID_STATE",
                     )
 
-            async def _act_complete_tx(raw, now):
+                bg = self._cancel_bg_task(order_id)
+                if bg is not None:
+                    await asyncio.gather(bg, return_exceptions=True)
+
+                activation_id = str(claimed.get("activation_id") or "")
                 if activation_id:
-                    await self._db.activations.ensure_activation_state_in_tx(
-                        raw,
-                        order_id,
-                        activation_id,
-                        provider=str(claimed["provider"]),
-                        state="completed",
-                        now=now,
-                        last_error="订单已完成",
-                        country_id=str(claimed.get("country_id") or ""),
-                        service_code=str(claimed.get("service_code") or ""),
-                        currency=str(claimed.get("currency") or ""),
-                    )
+                    try:
+                        provider = self._registry.get(claimed["provider"])
+                    except ValueError as exc:
+                        rolled_back = await self._db.orders.transition_status(
+                            order_id,
+                            expected_statuses=("completing",),
+                            new_status=prev_status,
+                            settlement_state="none",
+                        )
+                        if rolled_back:
+                            self._emit("order.status_changed", rolled_back)
+                        raise AppError(str(exc), status_code=400, code="PROVIDER_NOT_ACTIVE") from exc
+                    outcome = await self._provider_complete(provider, activation_id)
+                    if not outcome.ok:
+                        # 上游报错或拒绝：回滚至先前可恢复状态，记录 settlement_state='complete_failed' 并显式抛错！
+                        rolled_back = await self._db.orders.transition_status(
+                            order_id,
+                            expected_statuses=("completing",),
+                            new_status=prev_status,
+                            settlement_state="complete_failed",
+                            error_code="COMPLETE_FAILED",
+                            error_message=f"上游完成确认失败 ({outcome.status}): {outcome.raw}",
+                        )
+                        if rolled_back:
+                            self._emit("order.status_changed", rolled_back)
+                        if prev_status in {"waiting_code", "waiting_next_code"}:
+                            prev_code = (
+                                str(claimed.get("resend_base_code") or "")
+                                if (prev_status == "waiting_next_code" and not claimed.get("code_scrubbed"))
+                                else ""
+                            )
+                            seen_wait = bool(claimed.get("resend_seen_wait")) if prev_status == "waiting_next_code" else True
+                            self._start_code_poller(
+                                order_id,
+                                previous_code=prev_code,
+                                initial_seen_wait=seen_wait,
+                            )
+                        raise UpstreamError(
+                            f"确认完成失败，上游返回异常 ({outcome.status}): {outcome.raw}",
+                            code="COMPLETE_FAILED",
+                            retryable=outcome.retryable,
+                        )
 
-            updated = await self._finalize_order_status(
-                order_id,
-                expected_statuses=("completing",),
-                new_status="completed",
-                base_order=claimed,
-                activation_tx_hook=_act_complete_tx,
-                scrub_if_zero_retention=True,
-                settlement_state="completed",
-                error_code="",
-                error_message="",
-            )
-            assert updated is not None
-            return updated
+                async def _act_complete_tx(raw, now):
+                    if activation_id:
+                        await self._db.activations.ensure_activation_state_in_tx(
+                            raw,
+                            order_id,
+                            activation_id,
+                            provider=str(claimed["provider"]),
+                            state="completed",
+                            now=now,
+                            last_error="订单已完成",
+                            country_id=str(claimed.get("country_id") or ""),
+                            service_code=str(claimed.get("service_code") or ""),
+                            currency=str(claimed.get("currency") or ""),
+                        )
+
+                updated = await self._finalize_order_status(
+                    order_id,
+                    expected_statuses=("completing",),
+                    new_status="completed",
+                    base_order=claimed,
+                    activation_tx_hook=_act_complete_tx,
+                    scrub_if_zero_retention=True,
+                    settlement_state="completed",
+                    error_code="",
+                    error_message="",
+                )
+                assert updated is not None
+                return updated
+
+            complete_task = asyncio.create_task(_exec_complete())
+            return await asyncio.shield(complete_task)
 
     async def cancel_order(
         self,
@@ -2588,11 +2747,25 @@ class OrderService:
                         code="PROVIDER_NOT_ACTIVE",
                     )
 
+            initial_sync_cancel_idem_kw: dict[str, Any] = {}
+            if (
+                prev_status == "acquiring"
+                and not order.get("async_acquire")
+                and int(order.get("idempotency_http_status") or 0) == 0
+            ):
+                initial_sync_cancel_idem_kw = {
+                    "idempotency_http_status": 409,
+                    "idempotency_retryable": False,
+                    "idempotency_error_code": "USER_CANCELLED",
+                    "idempotency_error_message": reason or "取号过程中订单已被取消",
+                }
+
             claimed = await self._db.orders.transition_status(
                 order_id,
                 expected_statuses=("acquiring", "waiting_code", "code_received", "waiting_next_code", "compensation_pending"),
                 new_status="cancelling",
                 settlement_state="cancelling",
+                **initial_sync_cancel_idem_kw,
             )
             if claimed is None:
                 latest = await self.get_order(order_id)
@@ -3327,6 +3500,7 @@ class OrderService:
                                     new_status="cancelled",
                                     base_order=parent,
                                     activation_tx_hook=_act_upd_ref_tx,
+                                    scrub_if_zero_retention=True,
                                     refund_state="confirmed",
                                     settlement_state="cancelled",
                                     error_code="COMPENSATED_CANCEL",
@@ -3390,6 +3564,7 @@ class OrderService:
                                     new_status="cancelled",
                                     base_order=parent,
                                     activation_tx_hook=_act_upd_unref_tx,
+                                    scrub_if_zero_retention=True,
                                     refund_state="unrefundable",
                                     settlement_state="cancelled",
                                     error_code="CANCEL_UNREFUNDABLE",
@@ -3576,8 +3751,114 @@ class OrderService:
             await self._handle_provider_inactive_in_recovery(need_inactive_order)
         return True
 
+    async def _recover_stranded_acquiring(
+        self,
+        order: dict[str, Any],
+        *,
+        attempted_activations: Optional[set[tuple[str, str]]] = None,
+    ) -> bool:
+        """周期维护接管无活跃取号任务的孤儿 acquiring 订单。"""
+        order_id = str(order["order_id"])
+        need_reconcile = False
+        async with self._lock_for(order_id):
+            if self._has_live_task(order_id) or order_id in self._active_acquiring_orders:
+                return False
+            fresh = await self._db.orders.get(order_id, include_messages=False)
+            if not fresh or fresh.get("status") != "acquiring":
+                return False
+            acts = await self._db.activations.list_for_order(order_id)
+            live_active = [
+                a for a in acts
+                if str(a.get("activation_id") or "").strip()
+                and str(a.get("state") or "") in {"active", "refund_pending"}
+            ]
+            uncertain_acts = [
+                a for a in acts
+                if str(a.get("state") or "") in {"purchasing", "uncertain_purchase"}
+                and not str(a.get("activation_id") or "").strip()
+            ]
+            known_aid = str(fresh.get("activation_id") or "").strip() or (
+                str(live_active[-1]["activation_id"]) if live_active else ""
+            )
+            idem_kw: dict[str, Any] = {}
+            if not fresh.get("async_acquire") and int(fresh.get("idempotency_http_status") or 0) == 0:
+                idem_kw = {
+                    "idempotency_http_status": 502 if uncertain_acts else 500,
+                    "idempotency_retryable": not bool(uncertain_acts),
+                    "idempotency_error_code": "PURCHASE_UNCERTAIN" if uncertain_acts else "MAINTENANCE_RECOVERY",
+                    "idempotency_error_message": (
+                        "取号任务异常中断且存在未知购买结果，请核对上游账单"
+                        if uncertain_acts
+                        else "滞留取号中订单已由周期维护回收"
+                    ),
+                }
+            if known_aid:
+                for act in live_active:
+                    await self._db.activations.update_state(
+                        int(act["id"]), state="refund_pending", last_error="滞留取号中订单转入退款补偿"
+                    )
+                await self._db.orders.transition_status(
+                    order_id,
+                    expected_statuses=("acquiring",),
+                    new_status="compensation_pending",
+                    activation_id=known_aid,
+                    refund_state="pending",
+                    settlement_state="uncertain" if uncertain_acts else "cancelling",
+                    error_code="ACQUIRE_COMPENSATION_PENDING",
+                    error_message="滞留取号中订单已转入后台补偿",
+                    **idem_kw,
+                )
+                need_reconcile = True
+            elif uncertain_acts:
+                async def _m_acq_unc_tx(raw, now, _uacts=uncertain_acts):
+                    for act in _uacts:
+                        await self._db.activations.update_state_in_tx(
+                            raw,
+                            int(act["id"]),
+                            state="uncertain_purchase",
+                            now=now,
+                            last_error="滞留取号中订单存在未知购买结果，待人工核对",
+                        )
+
+                updated = await self._finalize_order_status(
+                    order_id,
+                    expected_statuses=("acquiring",),
+                    new_status="failed",
+                    base_order=fresh,
+                    activation_tx_hook=_m_acq_unc_tx,
+                    refund_state="unknown",
+                    settlement_state="uncertain",
+                    error_code="PURCHASE_UNCERTAIN",
+                    error_message="滞留取号中订单存在未知购买结果，请核对上游账单",
+                    **idem_kw,
+                )
+                return updated is not None
+            else:
+                updated_dt = _parse_iso(str(fresh.get("updated_at") or fresh.get("created_at") or ""))
+                if updated_dt is not None and (_utc_now() - updated_dt).total_seconds() < 30.0:
+                    return False
+                updated = await self._finalize_order_status(
+                    order_id,
+                    expected_statuses=("acquiring",),
+                    new_status="cancelled",
+                    base_order=fresh,
+                    refund_state="none",
+                    settlement_state="cancelled",
+                    error_code="MAINTENANCE_RECOVERY",
+                    error_message="滞留取号中订单已由周期维护收尾（无激活 ID）",
+                    **idem_kw,
+                )
+                return updated is not None
+
+        if need_reconcile:
+            return await self._reconcile_one_order(
+                await self.get_order(order_id),
+                attempted_activations=attempted_activations,
+            )
+        return False
+
     async def reconcile_pending(self) -> int:
-        """周期维护入口：结清待补偿订单/激活，并接管无活跃任务的在途等码/取消中/完成中订单；单条异常不阻塞其余订单与脱敏。"""
+        """周期维护入口：结清待补偿订单/激活，并接管无活跃任务的在途取号/等码/取消中/完成中订单；单条异常不阻塞其余订单与脱敏。"""
         pending = await self._db.orders.list_recoverable()
         attempted_activations: set[tuple[str, str]] = set()
         reconciled = 0
@@ -3587,6 +3868,15 @@ class OrderService:
             try:
                 if status == "compensation_pending":
                     if await self._reconcile_one_order(order, attempted_activations=attempted_activations):
+                        reconciled += 1
+                elif status == "acquiring":
+                    if (
+                        self._has_live_task(order_id)
+                        or order_id in self._active_acquiring_orders
+                        or self._is_order_locked(order_id)
+                    ):
+                        continue
+                    if await self._recover_stranded_acquiring(order, attempted_activations=attempted_activations):
                         reconciled += 1
                 elif status in {"waiting_code", "waiting_next_code"}:
                     if self._has_live_task(order_id):
@@ -3655,6 +3945,7 @@ class OrderService:
         *,
         state: str,
         note: str = "",
+        actual_cost: Optional[float] = None,
         refund_amount: Optional[float] = None,
         currency: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -3666,6 +3957,12 @@ class OrderService:
         order_id = str(existing["order_id"])
         provider_key = str(existing.get("provider") or "").strip().lower()
         activation_id = str(existing.get("activation_id") or "").strip()
+        scrub_notified = False
+
+        def _on_scrub(vers: dict[str, int]) -> None:
+            nonlocal scrub_notified
+            scrub_notified = True
+            self.on_orders_scrubbed(list(vers.keys()), scrub_versions=vers)
 
         async def _do_resolve() -> tuple[Optional[dict[str, Any]], bool, dict[str, Any], dict[str, int]]:
             parent_snapshot = await self._db.orders.get(order_id, include_messages=False)
@@ -3702,12 +3999,14 @@ class OrderService:
                 activation_row_id,
                 state=state,
                 note=note,
+                actual_cost=actual_cost,
                 refund_amount=refund_amount,
                 currency=currency,
                 outbox_entry_builder=_build_parent_outbox,
                 result_meta=meta,
                 scrub_if_terminal=zero_retention,
                 scrub_result=scrub_vers,
+                on_scrub_committed=_on_scrub,
             )
             return upd, ok, meta, scrub_vers
 
@@ -3730,7 +4029,7 @@ class OrderService:
                 code="ACTIVATION_REFUND_IMMUTABLE",
                 details={"activation_row_id": activation_row_id, "current_state": updated.get("state")},
             )
-        if scrub_vers:
+        if scrub_vers and not scrub_notified:
             self.on_orders_scrubbed(list(scrub_vers.keys()), scrub_versions=scrub_vers)
         if meta.get("outbox_enqueued"):
             self._notify_outbox()

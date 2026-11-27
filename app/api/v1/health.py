@@ -33,14 +33,21 @@ async def _build_readiness_response(
 
     if db_ok:
         try:
-            provider_configured["smsbower"] = bool(await db.config.get("smsbower_api_key", ""))
-            provider_configured["5sim"] = bool(await db.config.get("five_sim_api_key", ""))
-            provider_configured["herosms"] = bool(await db.config.get("hero_sms_api_key", ""))
-            raw_dc = await db.config.get("smsbower_default_country", "")
+            rows = await db.conn.fetchall(
+                "SELECT key, CASE WHEN key='smsbower_default_country' THEN value ELSE '1' END AS val "
+                "FROM config WHERE key IN ('smsbower_api_key', 'five_sim_api_key', 'hero_sms_api_key', 'smsbower_default_country') "
+                "AND value != ''"
+            )
+            kv = {str(r["key"]): str(r["val"]) for r in rows}
+            provider_configured["smsbower"] = "smsbower_api_key" in kv
+            provider_configured["5sim"] = "five_sim_api_key" in kv
+            provider_configured["herosms"] = "hero_sms_api_key" in kv
+            raw_dc = kv.get("smsbower_default_country", "")
             if raw_dc != "":
                 default_country = int(raw_dc)
         except Exception:
-            pass
+            for pid in ("smsbower", "5sim", "herosms"):
+                provider_configured.setdefault(pid, False)
     else:
         for pid in ("smsbower", "5sim", "herosms"):
             provider_configured[pid] = False

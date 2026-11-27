@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -95,7 +96,7 @@ class PluginManager:
                 summary[pid] = {"enabled": False, "started": False, "status": "disabled"}
                 continue
             try:
-                raw_health = await plugin.health()
+                raw_health = await asyncio.wait_for(plugin.health(), timeout=1.5)
                 ok = bool(raw_health.get("ok"))
                 summary[pid] = {
                     "enabled": True,

@@ -5,7 +5,11 @@ from __future__ import annotations
 import json
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class _StrictInputModel(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
 
 
 class ErrorDetailModel(BaseModel):
@@ -77,6 +81,7 @@ class OrderResponse(BaseModel):
     latest_code: str = ""
     code_received_at: str = ""
     code_scrubbed: bool = False
+    code_scrub_version: int = 0
     code_count: int = 0
     max_price: Optional[float] = None
     quoted_max_price: Optional[float] = None
@@ -106,7 +111,7 @@ class OrderListResponse(BaseModel):
     page_size: int = 30
 
 
-class AcquireStrategyRequest(BaseModel):
+class AcquireStrategyRequest(_StrictInputModel):
     target_price: Optional[float] = Field(default=None, gt=0, description="目标价格 ($)，必须大于 0")
     price_max: Optional[float] = Field(
         default=None,
@@ -188,7 +193,7 @@ def _check_json_depth(value: Any, *, max_depth: int = 6, current: int = 0) -> No
             _check_json_depth(item, max_depth=max_depth, current=current + 1)
 
 
-class CreateOrderRequest(BaseModel):
+class CreateOrderRequest(_StrictInputModel):
     provider: str = Field(default="", max_length=32, description="接码平台 ID（省略时自动使用服务端配置的默认平台）")
     service: str = Field(default="whatsapp", min_length=1, max_length=64, description="服务名（如 whatsapp/telegram/google/openai）或原生服务码")
     country: str = Field(..., min_length=1, max_length=64, description="国家名（中/英）、ISO2、区号或平台国家 ID")
@@ -221,12 +226,12 @@ class CreateOrderRequest(BaseModel):
         return meta
 
 
-class CancelOrderRequest(BaseModel):
+class CancelOrderRequest(_StrictInputModel):
     blacklist: bool = Field(default=False, description="取消时是否加入黑名单（管理员写全局，项目密钥写本项目私有黑名单）")
     reason: str = Field(default="", max_length=200, description="取消/拉黑原因")
 
 
-class BlacklistCreateRequest(BaseModel):
+class BlacklistCreateRequest(_StrictInputModel):
     phone: str = Field(..., min_length=3, max_length=32, description="手机号")
     provider: str = Field(default="", max_length=32, description="平台 ID（留空使用服务端默认平台）")
     reason: str = Field(default="", max_length=200, description="加入原因")
@@ -234,13 +239,15 @@ class BlacklistCreateRequest(BaseModel):
         default="auto",
         description="作用范围：管理员默认 global，项目密钥仅允许 project",
     )
+    project_id: Optional[str] = Field(default=None, max_length=48, description="管理员指定写入的私有黑名单项目 ID")
 
 
-class BlacklistBatchRequest(BaseModel):
+class BlacklistBatchRequest(_StrictInputModel):
     phones: list[str] = Field(..., min_length=1, max_length=200, description="手机号列表")
     provider: str = Field(default="", max_length=32, description="平台 ID（留空使用服务端默认平台）")
     reason: str = Field(default="批量加入", max_length=200, description="加入原因")
     scope: Literal["auto", "project", "global"] = Field(default="auto")
+    project_id: Optional[str] = Field(default=None, max_length=48, description="管理员指定写入的私有黑名单项目 ID")
 
     @field_validator("phones")
     @classmethod
@@ -274,11 +281,14 @@ class CreateApiKeyRequest(BaseModel):
         return self
 
 
-class ResolveReconciliationRequest(BaseModel):
+class ResolveReconciliationRequest(_StrictInputModel):
     state: Literal["refund_confirmed", "unrefundable", "completed", "manual_resolved"] = Field(
         ..., description="人工核对后的最终状态"
     )
     note: str = Field(default="", max_length=300, description="人工核对备注/上游账单流水号")
+    actual_cost: Optional[float] = Field(
+        default=None, ge=0, description="可选：人工核实的实际扣费金额（如不确定购买经核实已扣费）"
+    )
     refund_amount: Optional[float] = Field(
         default=None, ge=0, description="可选：经上游账单核实的实际退款金额（未提供时记为未知）"
     )

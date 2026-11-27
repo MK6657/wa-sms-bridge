@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, Query
 
 from app.api.schemas import CreateApiKeyRequest, UpdateApiKeyRequest, WebhookTestRequest
 from app.core.auth_service import AuthService, CallerContext
 from app.core.event_bus import EventBus
-from app.core.url_guard import validate_webhook_url_async
+from app.core.url_guard import normalize_url_hostname, validate_webhook_url_async
 from app.core.webhook_dispatcher import WebhookDispatcher
 from app.db import Database
 from app.dependencies import get_auth_service, get_caller, get_db, get_event_bus, get_webhook_dispatcher
@@ -123,6 +125,23 @@ async def delete_project_key(
     return {"success": True, "project_id": project_id}
 
 
+def _same_webhook_origin(url_a: str, url_b: str) -> bool:
+    if not url_a or not url_b:
+        return False
+    pa, pb = urlparse(url_a.strip()), urlparse(url_b.strip())
+    sa, sb = (pa.scheme or "").lower(), (pb.scheme or "").lower()
+    if sa not in {"http", "https"} or sa != sb:
+        return False
+    try:
+        ha = normalize_url_hostname(pa.hostname or "")
+        hb = normalize_url_hostname(pb.hostname or "")
+        porta = pa.port or (443 if sa == "https" else 80)
+        portb = pb.port or (443 if sb == "https" else 80)
+    except Exception:
+        return False
+    return bool(ha and ha == hb and porta == portb)
+
+
 @router.post("/webhook-test")
 async def test_webhook(
     req: WebhookTestRequest,
@@ -131,6 +150,7 @@ async def test_webhook(
     dispatcher: WebhookDispatcher = Depends(get_webhook_dispatcher),
 ):
     AuthService.ensure_admin(caller, "仅管理员可测试 Webhook 目标")
+    target_url = req.url.strip()
     secret = req.secret.strip()
     if not secret and req.project_id:
         row = await db.api_keys.get(req.project_id, include_secret=True)
@@ -141,8 +161,10 @@ async def test_webhook(
                     status_code=500,
                     code="WEBHOOK_SECRET_DECRYPT_FAILED",
                 )
-            secret = str(row.get("webhook_secret") or "")
-    return await dispatcher.send_test(req.url.strip(), secret=secret, project_id=req.project_id)
+            reg_url = str(row.get("default_webhook_url") or "").strip()
+            if reg_url and _same_webhook_origin(target_url, reg_url):
+                secret = str(row.get("webhook_secret") or "")
+    return await dispatcher.send_test(target_url, secret=secret, project_id=req.project_id)
 
 
 @router.get("/webhooks/deliveries")

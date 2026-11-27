@@ -168,7 +168,7 @@ class ApiKeysRepo:
 
     async def get_by_hash(self, key_hash: str) -> Optional[dict[str, Any]]:
         row = await self._conn.fetchone("SELECT * FROM api_keys WHERE key_hash=?", (key_hash,))
-        return self._hydrate(row, include_secret=True, include_hash=True)
+        return self._hydrate(row, include_secret=False, include_hash=True)
 
     async def list(self, *, project_summaries: Optional[dict[str, dict[str, Any]]] = None) -> list[dict[str, Any]]:
         """列出所有活跃项目密钥，并与统计接口共用同一财务聚合逻辑（修复补充 P1-05）。"""

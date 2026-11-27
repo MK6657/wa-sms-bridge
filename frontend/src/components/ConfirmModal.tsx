@@ -9,7 +9,7 @@ interface ConfirmModalProps {
   confirmLabel?: string;
   danger?: boolean;
   loading?: boolean;
-  onConfirm: () => void;
+  onConfirm: () => void | Promise<unknown>;
   onCancel: () => void;
 }
 
@@ -24,10 +24,30 @@ export function ConfirmModal({
   onCancel,
 }: ConfirmModalProps) {
   const cancelBtnRef = useRef<HTMLButtonElement>(null);
+  const confirmBtnRef = useRef<HTMLButtonElement>(null);
+  const prevFocusRef = useRef<HTMLElement | null>(null);
+  const confirmLockRef = useRef(false);
+
+  useEffect(() => {
+    if (!loading) {
+      confirmLockRef.current = false;
+    }
+  }, [loading, open]);
 
   useEffect(() => {
     if (open) {
+      confirmLockRef.current = false;
+      prevFocusRef.current =
+        typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
       cancelBtnRef.current?.focus();
+      return;
+    }
+    if (prevFocusRef.current) {
+      const target = prevFocusRef.current;
+      prevFocusRef.current = null;
+      target.focus?.();
     }
   }, [open]);
 
@@ -36,6 +56,28 @@ export function ConfirmModal({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !loading) {
         onCancel();
+        return;
+      }
+      if (e.key === "Tab") {
+        const focusables = [cancelBtnRef.current, confirmBtnRef.current].filter(
+          (el): el is HTMLButtonElement => Boolean(el && !el.disabled),
+        );
+        if (focusables.length === 0) {
+          e.preventDefault();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = typeof document !== "undefined" ? document.activeElement : null;
+        if (e.shiftKey) {
+          if (active === first || !focusables.includes(active as HTMLButtonElement)) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else if (active === last || !focusables.includes(active as HTMLButtonElement)) {
+          e.preventDefault();
+          first.focus();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -79,8 +121,15 @@ export function ConfirmModal({
             取消
           </button>
           <button
+            ref={confirmBtnRef}
             type="button"
-            onClick={onConfirm}
+            onClick={() => {
+              if (loading || confirmLockRef.current) return;
+              confirmLockRef.current = true;
+              Promise.resolve(onConfirm()).finally(() => {
+                confirmLockRef.current = false;
+              });
+            }}
             disabled={loading}
             className={`cursor-pointer rounded-xl px-4 py-2 text-sm font-medium text-white transition disabled:opacity-50 ${
               danger ? "bg-rose-600 hover:bg-rose-700" : "bg-slate-900 hover:bg-slate-800"

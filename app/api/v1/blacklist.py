@@ -17,16 +17,24 @@ from app.providers.registry import ProviderRegistry
 router = APIRouter(prefix="/api/v1/blacklist", tags=["blacklist"])
 
 
+_VALID_BLACKLIST_SCOPES = frozenset({"auto", "project", "global", "all"})
+
+
 def _resolve_target_project(caller: CallerContext, scope: str, project_id: Optional[str] = None) -> str:
-    if scope == "global":
+    norm_scope = (scope or "auto").strip().lower()
+    if norm_scope not in _VALID_BLACKLIST_SCOPES:
+        raise AppError(
+            f"无效的 scope '{scope}'，允许值: auto / project / global",
+            status_code=422,
+            code="VALIDATION_ERROR",
+        )
+    if norm_scope == "global":
         if not caller.is_admin and not caller.has_scope("blacklist:global"):
             raise ForbiddenError("写入平台共享全局黑名单仅限管理员或拥有 blacklist:global 权限的密钥")
         return ""
     if caller.is_admin:
         if project_id is not None:
             return project_id.strip()
-        if scope not in {"auto", "project", "all"}:
-            return scope.strip()
         return ""
     return caller.project_id
 
@@ -41,25 +49,32 @@ async def list_blacklist(
     db: Database = Depends(get_db),
 ):
     AuthService.ensure_scope(caller, "blacklist:r")
+    norm_scope = (scope or "auto").strip().lower()
+    if norm_scope not in _VALID_BLACKLIST_SCOPES:
+        raise AppError(
+            f"无效的 scope '{scope}'，允许值: auto / project / global / all",
+            status_code=422,
+            code="VALIDATION_ERROR",
+        )
     project_filter: Optional[str]
     project_only = False
     if caller.is_admin:
         clean_pid = project_id.strip()
         if clean_pid:
             project_filter = clean_pid
-        elif scope == "global":
+        elif norm_scope == "global":
             project_filter = ""
-        elif scope == "project":
+        elif norm_scope == "project":
             project_filter = None
             project_only = True
-        elif scope in {"all", "auto"}:
-            project_filter = None
         else:
-            project_filter = scope.strip()
+            project_filter = None
     else:
-        if scope == "global" and not caller.has_scope("blacklist:global"):
+        if norm_scope == "all":
+            raise ForbiddenError("无权读取跨项目黑名单")
+        if norm_scope == "global" and not caller.has_scope("blacklist:global"):
             raise ForbiddenError("无权读取平台全局黑名单")
-        project_filter = "" if scope == "global" else caller.project_id
+        project_filter = "" if norm_scope == "global" else caller.project_id
 
     entries = await db.blacklist.list(
         provider=provider,
@@ -88,7 +103,7 @@ async def add_blacklist(
         raise AppError("手机号格式无效（至少包含 5 位数字）", status_code=422, code="VALIDATION_ERROR")
     phone = f"+{digits}" if raw_phone.startswith("+") else digits
     provider = (req.provider.strip() or registry.default_provider).lower()
-    target_project = _resolve_target_project(caller, req.scope)
+    target_project = _resolve_target_project(caller, req.scope, project_id=req.project_id)
     inserted = await db.blacklist.add(phone, reason=req.reason.strip(), provider=provider, project_id=target_project)
     return {
         "success": True,
@@ -109,7 +124,7 @@ async def add_blacklist_batch(
 ):
     AuthService.ensure_scope(caller, "blacklist:w")
     provider = (req.provider.strip() or registry.default_provider).lower()
-    target_project = _resolve_target_project(caller, req.scope)
+    target_project = _resolve_target_project(caller, req.scope, project_id=req.project_id)
     normalized_phones: list[str] = []
     for raw in req.phones:
         raw_phone = str(raw or "").strip()

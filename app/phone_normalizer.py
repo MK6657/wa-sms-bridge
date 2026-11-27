@@ -154,6 +154,18 @@ def build_phone_input(
             country_iso2=iso2,
         )
 
+    # 仅在未指定目标国家区号 (not cc) 时，从显式 '+' 前缀自动推断国际区号；
+    # 若已明确指定目标国家 (cc)，严格优先按目标国家归一（保持“国家 ID 优先，不静默切国家”契约）
+    if not cc and raw_text.startswith("+"):
+        try:
+            direct_intl = phonenumbers.parse(f"+{raw_digits}", None)
+            if phonenumbers.is_valid_number(direct_intl):
+                intl_cc = str(direct_intl.country_code)
+                intl_reg = (phonenumbers.region_code_for_number(direct_intl) or "").lower()
+                return _format_parsed(direct_intl, country_calling_code=intl_cc, country_iso2=intl_reg)
+        except phonenumbers.NumberParseException:
+            pass
+
     if cc:
         if raw_digits.startswith(cc):
             after_cc = raw_digits[len(cc):]

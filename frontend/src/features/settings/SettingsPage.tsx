@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   Database,
@@ -41,8 +41,10 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
   const [sbBaseUrl, setSbBaseUrl] = useState("https://smsbower.page/stubs/handler_api.php");
   const [sbDefaultCountry, setSbDefaultCountry] = useState("52");
   const [heroKey, setHeroKey] = useState("");
+  const [showHeroKey, setShowHeroKey] = useState(false);
   const [heroBaseUrl, setHeroBaseUrl] = useState("https://hero-sms.com/stubs/handler_api.php");
   const [fiveSimKey, setFiveSimKey] = useState("");
+  const [showFiveSimKey, setShowFiveSimKey] = useState(false);
   const [retentionHours, setRetentionHours] = useState("24");
   const [maskInHistory, setMaskInHistory] = useState(true);
 
@@ -56,6 +58,7 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
   const [logs, setLogs] = useState<LogsResponse | null>(null);
   const [logLevel, setLogLevel] = useState("");
   const [loadingLogs, setLoadingLogs] = useState(false);
+  const logReqSeqRef = useRef(0);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -73,16 +76,21 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
 
   const loadLogs = useCallback(
     async (manual = false) => {
+      const seq = ++logReqSeqRef.current;
       setLoadingLogs(true);
       try {
         const data = await api.getRecentLogs(160, logLevel);
-        setLogs(data);
+        if (seq === logReqSeqRef.current) {
+          setLogs(data);
+        }
       } catch (err) {
-        if (manual) {
+        if (manual && seq === logReqSeqRef.current) {
           notify(err instanceof Error ? err.message : "读取诊断日志失败", "error");
         }
       } finally {
-        setLoadingLogs(false);
+        if (seq === logReqSeqRef.current) {
+          setLoadingLogs(false);
+        }
       }
     },
     [logLevel, notify],
@@ -389,17 +397,27 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
               <div className="space-y-2.5 border-t border-slate-100 pt-3">
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">HeroSMS API Key（已启用备用平台）</label>
-                  <input
-                    type="password"
-                    value={heroKey}
-                    onChange={(e) => setHeroKey(e.target.value)}
-                    placeholder={
-                      settings.hero_sms_api_key_masked
-                        ? `已保存 (${settings.hero_sms_api_key_masked})，留空保持不变`
-                        : "输入 HeroSMS API Key"
-                    }
-                    className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
-                  />
+                  <div className="relative">
+                    <input
+                      type={showHeroKey ? "text" : "password"}
+                      value={heroKey}
+                      onChange={(e) => setHeroKey(e.target.value)}
+                      placeholder={
+                        settings.hero_sms_api_key_masked
+                          ? `已保存 (${settings.hero_sms_api_key_masked})，留空保持不变`
+                          : "输入 HeroSMS API Key"
+                      }
+                      className="input-surface font-mono-code w-full rounded-xl py-2 pl-3 pr-9 text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowHeroKey((v) => !v)}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 cursor-pointer rounded p-0.5 text-slate-400 hover:text-slate-700"
+                      title={showHeroKey ? "隐藏输入" : "查看输入"}
+                    >
+                      {showHeroKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </button>
+                  </div>
                 </div>
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">HeroSMS Base URL</label>
@@ -416,17 +434,27 @@ export function SettingsPage({ onSettingsUpdated }: SettingsPageProps) {
             {settings?.active_providers.includes("5sim") ? (
               <div className="space-y-2 border-t border-slate-100 pt-3">
                 <label className="block text-xs font-medium text-slate-700">5sim Bearer API Key（已启用备用平台）</label>
-                <input
-                  type="password"
-                  value={fiveSimKey}
-                  onChange={(e) => setFiveSimKey(e.target.value)}
-                  placeholder={
-                    settings.five_sim_api_key_masked
-                      ? `已保存 (${settings.five_sim_api_key_masked})，留空保持不变`
-                      : "输入 5sim JWT Token"
-                  }
-                  className="input-surface font-mono-code w-full rounded-xl px-3 py-2 text-xs"
-                />
+                <div className="relative">
+                  <input
+                    type={showFiveSimKey ? "text" : "password"}
+                    value={fiveSimKey}
+                    onChange={(e) => setFiveSimKey(e.target.value)}
+                    placeholder={
+                      settings.five_sim_api_key_masked
+                        ? `已保存 (${settings.five_sim_api_key_masked})，留空保持不变`
+                        : "输入 5sim JWT Token"
+                    }
+                    className="input-surface font-mono-code w-full rounded-xl py-2 pl-3 pr-9 text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowFiveSimKey((v) => !v)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 cursor-pointer rounded p-0.5 text-slate-400 hover:text-slate-700"
+                    title={showFiveSimKey ? "隐藏输入" : "查看输入"}
+                  >
+                    {showFiveSimKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
               </div>
             ) : null}
 

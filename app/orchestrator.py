@@ -62,58 +62,6 @@ class CompensationOutcome:
         return self.activation_settled and self.account_cleaned
 
 
-def _normalize_smsbower_phone(raw_phone: str, country_id: int) -> PhoneInput:
-    """将 SMSBower 原始号码转为 wa-app PhoneInput。
-
-    SMSBower 返回含国家码前缀的号码字符串。
-    用 phonenumbers 库归一化到 E.164。
-    """
-    # 从 COUNTRIES 取国家区号
-    from app.providers.smsbower import COUNTRIES, COUNTRY_ISO2
-    info = COUNTRIES.get(country_id, {})
-    cc = info.get("cc", "")
-    e164_str = f"+{raw_phone}" if not raw_phone.startswith("+") else raw_phone
-
-    try:
-        parsed = phonenumbers.parse(e164_str, None)
-        if not phonenumbers.is_possible_number(parsed):
-            if cc and not raw_phone.startswith(cc):
-                e164_str = f"+{cc}{raw_phone}"
-                parsed = phonenumbers.parse(e164_str, None)
-    except phonenumbers.NumberParseException:
-        if cc:
-            e164_str = f"+{cc}{raw_phone.lstrip('+')}"
-            try:
-                parsed = phonenumbers.parse(e164_str, None)
-            except phonenumbers.NumberParseException:
-                parsed = None
-        else:
-            parsed = None
-
-    if parsed and phonenumbers.is_valid_number(parsed):
-        return PhoneInput(
-            region=phonenumbers.region_code_for_number(parsed) or "",
-            phone=str(parsed.national_number),
-            e164_number=phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164),
-            country_calling_code=str(parsed.country_code),
-            country_iso2=(phonenumbers.region_code_for_number(parsed) or "").lower(),
-        )
-
-    # 兜底：手动构造（phonenumbers 解析失败时的最后手段）
-    national = raw_phone
-    if cc and raw_phone.startswith(cc):
-        national = raw_phone[len(cc):]
-    iso2 = COUNTRY_ISO2.get(country_id, "")
-    region = iso2.upper() if iso2 else info.get("eng", "")[:3].upper()
-    return PhoneInput(
-        region=region,
-        phone=national,
-        e164_number=f"+{cc}{national}" if cc else national,
-        country_calling_code=cc,
-        country_iso2=iso2,
-    )
-
-
 class RegisterOrchestrator:
     """注册编排器。"""
 
@@ -150,6 +98,14 @@ class RegisterOrchestrator:
             outcome = parse_cancel_outcome(result)
             settled = outcome.settled
             text = str(result or "").strip() or outcome.status
+            if not settled and "BAD_STATUS" in str(result or "").upper():
+                try:
+                    st, _ = await prov.get_sms_code(activation_id)
+                except Exception:
+                    st = ""
+                if st in {"OK", "FINISHED", "CANCEL", "EXPIRED"}:
+                    settled = True
+                    text = f"{result} (getStatus={st})"
             log_method = logger.info if settled else logger.warning
             log_method(
                 "[%s] 补偿取消激活: provider=%s activation=%s reason=%s result=%s settled=%s",
@@ -669,7 +625,8 @@ class RegisterOrchestrator:
             return existing
 
         t = self._tasks.get(task_id)
-        if t and not t.done():
+        was_running = bool(t and not t.done())
+        if was_running and t is not None:
             t.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(t), timeout=15)
@@ -681,7 +638,10 @@ class RegisterOrchestrator:
                 logger.warning("[%s] stop_task: 任务取消期间异常", task_id, exc_info=True)
 
         task = await self._db.get_task(task_id)
-        if task and task.get("status") in {"running", "compensation_pending"}:
+        if task and (
+            task.get("status") == "running"
+            or (not was_running and task.get("status") == "compensation_pending")
+        ):
             commit_state = str(task.get("account_commit_state") or "none")
             account_already_cleaned = bool(task.get("account_compensated"))
             outcome = await self._compensate_task_snapshot(task, reason="手动停止")
@@ -705,7 +665,8 @@ class RegisterOrchestrator:
                     outcome,
                     "手动停止：补偿尚未完成",
                 )
-        self._tasks.pop(task_id, None)
+        if t is None or t.done():
+            self._tasks.pop(task_id, None)
         return await self._db.get_task(task_id)
 
     # ── 核心编排 ────────────────────────────────────────
@@ -888,6 +849,11 @@ class RegisterOrchestrator:
                     )
                     if reg.request_failed or not reg.success or not reg.wa_account_id:
                         final_error = reg.error_message or reg.status or "WA 注册未返回账号"
+                        if reg.failure_reason in {"already_registered", "account_exists"} or (
+                            (reg.registered or reg.login_active) and not reg.verification_request_id
+                        ):
+                            # 保护已有账号，仅取消 SMS 激活，绝不触发 cleanup_failed_account 误删现存账号！
+                            reg = None
                         if not await compensate_attempt("WA 注册请求失败"):
                             return
                         wait_before_next = True

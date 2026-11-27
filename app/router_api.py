@@ -337,7 +337,7 @@ async def api_price_recommendations(service: str = "whatsapp", country: str = ""
         raise HTTPException(503, "Registry 未初始化")
 
     providers = reg.list_providers()
-    targets = [c.strip() for c in countries.split(",") if c.strip()]
+    targets = list(dict.fromkeys(c.strip() for c in countries.split(",") if c.strip()))[:20]
     if country.strip():
         targets = [country.strip()]
     if not targets:
@@ -557,15 +557,15 @@ async def api_update_config(cfg: ConfigUpdate):
         raise HTTPException(e.status_code, e.message) from e
     try:
         if cfg.smsbower_api_key is not None:
-            await db.set_config("smsbower_api_key", cfg.smsbower_api_key, encrypt=True)
+            await db.set_config("smsbower_api_key", cfg.smsbower_api_key.strip(), encrypt=True)
         if cfg.smsbower_base_url is not None:
             await db.set_config("smsbower_base_url", cfg.smsbower_base_url.strip().rstrip("/"))
         if cfg.smsbower_default_country is not None:
             await db.set_config("smsbower_default_country", str(cfg.smsbower_default_country))
         if cfg.five_sim_api_key is not None:
-            await db.set_config("five_sim_api_key", cfg.five_sim_api_key, encrypt=True)
+            await db.set_config("five_sim_api_key", cfg.five_sim_api_key.strip(), encrypt=True)
         if cfg.hero_sms_api_key is not None:
-            await db.set_config("hero_sms_api_key", cfg.hero_sms_api_key, encrypt=True)
+            await db.set_config("hero_sms_api_key", cfg.hero_sms_api_key.strip(), encrypt=True)
         if cfg.hero_sms_base_url is not None:
             await db.set_config("hero_sms_base_url", cfg.hero_sms_base_url.strip().rstrip("/"))
         if cfg.wa_app_url is not None:

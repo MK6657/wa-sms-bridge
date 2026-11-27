@@ -18,7 +18,13 @@ import {
   Smartphone,
   Wallet,
 } from "lucide-react";
-import { api, setUnauthorizedHandler } from "./api/client";
+import { ApiClientError, api, setUnauthorizedHandler } from "./api/client";
+import {
+  mergeActiveOrderSnapshot,
+  recordOrderState,
+  shouldLogoutOnSilentAuthCheck,
+  type TrackedOrderVersion,
+} from "./api/orderSync";
 import type { AuthStatusResponse, HealthResponse, SmsOrder, StatsResponse } from "./api/types";
 import { useOrderStream, type StreamEventMessage } from "./api/useOrderStream";
 import { ToastProvider, useToast } from "./components/ToastProvider";
@@ -87,7 +93,10 @@ function AppShell() {
   const [activeOrders, setActiveOrders] = useState<SmsOrder[]>([]);
   const [maskInHistory, setMaskInHistory] = useState(true);
   const initInFlightRef = useRef<Promise<void> | null>(null);
-  const latestOrderVersionRef = useRef<Map<string, number>>(new Map());
+  const latestOrderVersionRef = useRef<Map<string, TrackedOrderVersion>>(new Map());
+  const localMutationCounterRef = useRef(0);
+  const orderMutationSeqRef = useRef<Map<string, number>>(new Map());
+  const lastNotifiedCodeCountRef = useRef<Map<string, number>>(new Map());
   const [soundEnabled, setSoundEnabled] = useState(() => {
     try {
       return localStorage.getItem("sms-hub.sound") !== "off";
@@ -127,6 +136,31 @@ function AppShell() {
     })();
     initInFlightRef.current = task;
     return task;
+  }, []);
+
+  const verifySessionSilently = useCallback(async () => {
+    try {
+      const status = await api.getAuthStatus();
+      setAuthStatus(status);
+      setAuthCheckError("");
+      if (status.can_bootstrap_local_session && !status.authenticated) {
+        try {
+          await api.bootstrapLocalSession();
+          setIsAdminSession(true);
+          return;
+        } catch {
+          // ignore transient bootstrap failure
+        }
+      }
+      if (shouldLogoutOnSilentAuthCheck({ ok: true, status })) {
+        setIsAdminSession(false);
+      }
+    } catch (err) {
+      const httpStatus = err instanceof ApiClientError ? err.status : undefined;
+      if (shouldLogoutOnSilentAuthCheck({ ok: false, httpStatus })) {
+        setIsAdminSession(false);
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -199,50 +233,30 @@ function AppShell() {
   );
 
   const recordOrderVersion = useCallback((order: SmsOrder): boolean => {
-    const map = latestOrderVersionRef.current;
-    const incomingVer = typeof order.version === "number" ? order.version : undefined;
-    const knownVer = map.get(order.order_id);
-    if (incomingVer !== undefined && knownVer !== undefined && incomingVer < knownVer) {
-      return false;
-    }
-    if (incomingVer !== undefined) {
-      if (map.size >= 1000 && !map.has(order.order_id)) {
-        const firstKey = map.keys().next().value;
-        if (firstKey !== undefined) map.delete(firstKey);
-      }
-      map.set(order.order_id, incomingVer);
-    }
-    return true;
+    return recordOrderState(order, latestOrderVersionRef.current);
   }, []);
 
   const activeOrdersSeqRef = useRef(0);
   const loadActiveOrders = useCallback(async () => {
     const seq = ++activeOrdersSeqRef.current;
+    const snapshotStartMutSeq = localMutationCounterRef.current;
     try {
       const res = await api.listOrders({ active_only: true, page: 1, page_size: 200 });
       if (seq === activeOrdersSeqRef.current) {
-        setActiveOrders((prev) => {
-          const prevById = new Map(prev.map((o) => [o.order_id, o]));
-          const merged: SmsOrder[] = [];
-          for (const item of res.items) {
-            if (!recordOrderVersion(item)) {
-              const newerLocal = prevById.get(item.order_id);
-              if (newerLocal && ACTIVE_STATUSES.has(newerLocal.status)) {
-                merged.push(newerLocal);
-              }
-              continue;
-            }
-            if (ACTIVE_STATUSES.has(item.status)) {
-              merged.push(item);
-            }
-          }
-          return merged;
-        });
+        setActiveOrders((prev) =>
+          mergeActiveOrderSnapshot(
+            prev,
+            res.items,
+            snapshotStartMutSeq,
+            orderMutationSeqRef.current,
+            latestOrderVersionRef.current,
+          ),
+        );
       }
     } catch {
       // ignore initial error
     }
-  }, [recordOrderVersion]);
+  }, []);
 
   const loadStats = useCallback(async () => {
     try {
@@ -267,7 +281,10 @@ function AppShell() {
     const h = await loadHealth();
     const prov = h?.default_provider || "smsbower";
     await Promise.allSettled([loadActiveOrders(), loadStats(), loadHistoryMaskPref()]);
-    if (h?.provider_configured?.[prov] ?? h?.provider_configured?.smsbower) {
+    if (!h?.db && h !== null) {
+      setBalance(null);
+      setBalanceError("数据库暂不可用");
+    } else if (h?.provider_configured?.[prov] ?? h?.provider_configured?.smsbower) {
       await loadBalance(prov);
     } else {
       setBalance(null);
@@ -286,6 +303,12 @@ function AppShell() {
       if (!recordOrderVersion(order)) {
         return;
       }
+      const nextMutSeq = ++localMutationCounterRef.current;
+      if (orderMutationSeqRef.current.size >= 1000 && !orderMutationSeqRef.current.has(order.order_id)) {
+        const oldestKey = orderMutationSeqRef.current.keys().next().value;
+        if (oldestKey !== undefined) orderMutationSeqRef.current.delete(oldestKey);
+      }
+      orderMutationSeqRef.current.set(order.order_id, nextMutSeq);
       setActiveOrders((prev) => {
         const exists = prev.some((o) => o.order_id === order.order_id);
         if (!ACTIVE_STATUSES.has(order.status)) {
@@ -305,7 +328,14 @@ function AppShell() {
       if (!evt?.data?.order_id) return;
       upsertOrder(evt.data);
       if (evt.event === "order.code_received") {
-        if (!evt.data.code_scrubbed && evt.data.latest_code) {
+        const codeSeq = evt.data.code_count || 1;
+        const prevNotified = lastNotifiedCodeCountRef.current.get(evt.data.order_id) || 0;
+        if (!evt.data.code_scrubbed && evt.data.latest_code && codeSeq > prevNotified) {
+          if (lastNotifiedCodeCountRef.current.size >= 500) {
+            const first = lastNotifiedCodeCountRef.current.keys().next().value;
+            if (first !== undefined) lastNotifiedCodeCountRef.current.delete(first);
+          }
+          lastNotifiedCodeCountRef.current.set(evt.data.order_id, codeSeq);
           if (soundEnabled) playCodeChime();
           notify(`收到验证码 ${evt.data.latest_code}（${evt.data.phone_e164 || evt.data.phone_raw}）`, "success");
         }
@@ -338,9 +368,18 @@ function AppShell() {
     onReconnect: handleStreamResync,
     onResyncRequired: handleStreamResync,
     onAuthCheck: () => {
-      initSession();
+      verifySessionSilently();
     },
   });
+
+  // 当 SSE 暂时断连且存在进行中订单时，自动启用 5 秒低频兜底轮询，保证验证码不因网络代理中断而漏显
+  useEffect(() => {
+    if (!isAdminSession || sseConnected || activeOrders.length === 0) return;
+    const timer = window.setInterval(() => {
+      loadActiveOrders();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [isAdminSession, sseConnected, activeOrders.length, loadActiveOrders]);
 
   const toggleSound = () => {
     setSoundEnabled((prev) => {
@@ -689,6 +728,7 @@ function AppShell() {
             <WorkbenchPage
               health={health}
               balance={balance}
+              balanceCurrency={balanceCurrency}
               balanceError={balanceError}
               balanceLoading={balanceLoading}
               onRefreshBalance={() => loadBalance()}

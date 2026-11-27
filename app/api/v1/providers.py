@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Depends, Query
 
 from app.core.auth_service import AuthService, CallerContext
@@ -14,6 +16,8 @@ from app.providers.registry import ProviderRegistry
 from app.service_codes import list_services
 
 router = APIRouter(prefix="/api/v1/providers", tags=["providers"])
+_BALANCE_CACHE: dict[tuple[int, str], tuple[float, float]] = {}
+_NON_ADMIN_BALANCE_TTL = 5.0
 
 
 @router.get("")
@@ -23,9 +27,16 @@ async def list_providers(
     registry: ProviderRegistry = Depends(get_registry),
 ):
     AuthService.ensure_scope(caller, "prices:r")
-    configured: dict[str, bool] = {}
-    for pid, desc in PROVIDER_CATALOG.items():
-        configured[pid] = bool(await db.config.get(desc.api_key_config_key, ""))
+    cfg_keys = [desc.api_key_config_key for desc in PROVIDER_CATALOG.values() if desc.api_key_config_key]
+    present_keys: set[str] = set()
+    if cfg_keys:
+        ph = ",".join("?" for _ in cfg_keys)
+        rows = await db.conn.fetchall(
+            f"SELECT key FROM config WHERE key IN ({ph}) AND value != ''",
+            tuple(cfg_keys),
+        )
+        present_keys = {str(r["key"]) for r in rows}
+    configured = {pid: (desc.api_key_config_key in present_keys) for pid, desc in PROVIDER_CATALOG.items()}
     return {
         "default_provider": registry.default_provider,
         "active": registry.list_providers(),
@@ -44,11 +55,20 @@ async def get_provider_balance(
         prov = registry.get(provider)
     except ValueError as exc:
         raise AppError(str(exc), status_code=400, code="PROVIDER_NOT_ACTIVE") from exc
+    cache_key = (id(prov), prov.provider_id)
+    now = time.monotonic()
+    if not caller.is_admin:
+        cached = _BALANCE_CACHE.get(cache_key)
+        if cached and (now - cached[0]) < _NON_ADMIN_BALANCE_TTL:
+            return {"provider": prov.provider_id, "balance": cached[1], "currency": "USD"}
     try:
-        balance = await prov.get_balance()
+        balance = round(float(await prov.get_balance()), 4)
     except Exception as exc:
         raise UpstreamError(f"获取余额失败: {exc}", code="BALANCE_FETCH_FAILED") from exc
-    return {"provider": prov.provider_id, "balance": round(float(balance), 4), "currency": "USD"}
+    if len(_BALANCE_CACHE) >= 64 and cache_key not in _BALANCE_CACHE:
+        _BALANCE_CACHE.pop(next(iter(_BALANCE_CACHE)), None)
+    _BALANCE_CACHE[cache_key] = (time.monotonic(), balance)
+    return {"provider": prov.provider_id, "balance": balance, "currency": "USD"}
 
 
 @router.get("/{provider}/services")

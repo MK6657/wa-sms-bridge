@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, Request, Response
 
 from app.api.schemas import AdminLoginRequest
 from app.core.auth_service import AuthService, enforce_browser_csrf, is_direct_loopback
-from app.dependencies import get_auth_service
+from app.core.event_bus import EventBus
+from app.dependencies import get_auth_service, get_event_bus
 from app.errors import AuthError, ForbiddenError
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
@@ -90,7 +91,9 @@ async def admin_logout(
     request: Request,
     response: Response,
     auth_service: AuthService = Depends(get_auth_service),
+    event_bus: EventBus = Depends(get_event_bus),
 ):
     enforce_browser_csrf(request)
     await auth_service.revoke_and_clear_admin_cookie(request, response)
+    event_bus.revoke_project_subscribers("__admin__")
     return {"ok": True}

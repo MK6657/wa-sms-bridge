@@ -56,6 +56,8 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
   const [resolvingId, setResolvingId] = useState<number | null>(null);
   const [showAllReconcile, setShowAllReconcile] = useState(false);
   const [manualCurrencyById, setManualCurrencyById] = useState<Record<number, string>>({});
+  const [manualCostById, setManualCostById] = useState<Record<number, string>>({});
+  const [manualRefundById, setManualRefundById] = useState<Record<number, string>>({});
   const [scrubTargetId, setScrubTargetId] = useState<string | null>(null);
   const [scrubbingOne, setScrubbingOne] = useState(false);
   const [revealedIds, setRevealedIds] = useState<Set<string>>(new Set());
@@ -161,15 +163,39 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
   ) => {
     const needsCurrencyConfirm = Boolean(item.currency_review_required) || !item.currency || item.currency === "UNKNOWN";
     const typedCurrency = (manualCurrencyById[item.id] || "").trim().toUpperCase();
-    const verifiedCurrency = needsCurrencyConfirm
-      ? typedCurrency || undefined
-      : item.currency;
+    if (typedCurrency && (!/^[A-Z]{3}$/.test(typedCurrency) || typedCurrency === "UNKNOWN")) {
+      notify("请输入合法的 3 位大写 ISO 币种代码（如 USD / RUB / EUR）", "warn");
+      return;
+    }
+    const rawCost = (manualCostById[item.id] || "").trim();
+    let parsedCost: number | undefined;
+    if (rawCost !== "") {
+      const n = Number(rawCost);
+      if (!Number.isFinite(n) || n < 0) {
+        notify("实扣金额必须是非负有效数字", "warn");
+        return;
+      }
+      parsedCost = n;
+    }
+    const rawRefund = (manualRefundById[item.id] || "").trim();
+    let parsedRefund: number | undefined;
+    if (rawRefund !== "") {
+      const n = Number(rawRefund);
+      if (!Number.isFinite(n) || n < 0) {
+        notify("实退金额必须是非负有效数字", "warn");
+        return;
+      }
+      parsedRefund = n;
+    }
+
     setResolvingId(item.id);
     try {
       await api.resolveReconciliation(item.id, {
         state: nextState,
         note: "控制台人工核销",
-        currency: verifiedCurrency,
+        actual_cost: parsedCost,
+        refund_amount: parsedRefund,
+        currency: needsCurrencyConfirm && typedCurrency ? typedCurrency : undefined,
       });
       notify(`已将激活记录 #${item.id} 人工核销为 ${nextState}`, "success");
       await Promise.allSettled([load(), loadReconciliation()]);
@@ -185,6 +211,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
     setExporting(true);
     try {
       const allItems: SmsOrder[] = [];
+      let remoteTotal = total;
       for (let p = 1; p <= 5; p += 1) {
         const res = await api.listOrders({
           status,
@@ -194,6 +221,7 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
           page: p,
           page_size: 200,
         });
+        remoteTotal = res.total;
         allItems.push(...res.items);
         if (allItems.length >= res.total || res.items.length < 200) break;
       }
@@ -249,7 +277,14 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
       a.download = `sms-orders-${new Date().toISOString().slice(0, 10)}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-      notify(`已导出 ${source.length} 条订单记录`, "success");
+      if (remoteTotal > source.length) {
+        notify(
+          `已导出最近 ${source.length} 条记录（匹配共 ${remoteTotal} 条，单次上限 1000 条，请按项目/状态筛选后分批导出）`,
+          "warn",
+        );
+      } else {
+        notify(`已导出 ${source.length} 条订单记录`, "success");
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : "导出 CSV 失败", "error");
     } finally {
@@ -329,6 +364,38 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                     </div>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5">
+                    {act.state === "uncertain_purchase" || act.actual_cost === null ? (
+                      <input
+                        type="number"
+                        step="0.0001"
+                        min="0"
+                        value={manualCostById[act.id] ?? ""}
+                        onChange={(e) =>
+                          setManualCostById((prev) => ({
+                            ...prev,
+                            [act.id]: e.target.value,
+                          }))
+                        }
+                        placeholder="实扣额(可选)"
+                        className="input-surface font-mono-code w-24 rounded-lg px-2 py-1 text-[11px]"
+                        title="如上游实际已扣费，可填写核实后的扣款金额"
+                      />
+                    ) : null}
+                    <input
+                      type="number"
+                      step="0.0001"
+                      min="0"
+                      value={manualRefundById[act.id] ?? ""}
+                      onChange={(e) =>
+                        setManualRefundById((prev) => ({
+                          ...prev,
+                          [act.id]: e.target.value,
+                        }))
+                      }
+                      placeholder="实退额(可选)"
+                      className="input-surface font-mono-code w-24 rounded-lg px-2 py-1 text-[11px]"
+                      title="确认已退款时可填写上游实际退回金额（留空默认按扣款额或待确认处理）"
+                    />
                     {needsCurrencyConfirm ? (
                       <input
                         type="text"
@@ -344,6 +411,26 @@ export function OrdersPage({ stats, maskInHistory, onOrdersChanged }: OrdersPage
                         className="input-surface font-mono-code w-28 rounded-lg px-2 py-1 text-[11px]"
                         title="核实币种后填写（留空则保持币种待核实，绝不自动覆盖未验证币种）"
                       />
+                    ) : null}
+                    {needsCurrencyConfirm &&
+                    (act.state === "refund_confirmed" ||
+                      act.state === "unrefundable" ||
+                      act.state === "completed" ||
+                      act.state === "manual_resolved") ? (
+                      <button
+                        type="button"
+                        disabled={resolvingId === act.id || !(manualCurrencyById[act.id] || "").trim()}
+                        onClick={() =>
+                          handleResolveActivation(
+                            act,
+                            act.state as "refund_confirmed" | "unrefundable" | "completed" | "manual_resolved",
+                          )
+                        }
+                        className="cursor-pointer rounded-lg border border-teal-200 bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-800 hover:bg-teal-100 disabled:opacity-50"
+                        title="保持当前结算终态不变，仅提交核实后的币种与金额"
+                      >
+                        仅确认币种
+                      </button>
                     ) : null}
                     <button
                       type="button"
